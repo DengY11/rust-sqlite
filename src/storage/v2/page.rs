@@ -52,7 +52,8 @@ impl MetaPage {
     pub fn encode(&self) -> Vec<u8> {
         let mut page = empty_page(PageKind::Meta);
         page[PAYLOAD_OFFSET..PAYLOAD_OFFSET + 4].copy_from_slice(&self.page_size.to_le_bytes());
-        page[PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 8].copy_from_slice(&self.page_count.to_le_bytes());
+        page[PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 8]
+            .copy_from_slice(&self.page_count.to_le_bytes());
         page[PAYLOAD_OFFSET + 8..PAYLOAD_OFFSET + 12]
             .copy_from_slice(&self.catalog_page_id.0.to_le_bytes());
         page[PAYLOAD_OFFSET + 12..PAYLOAD_OFFSET + 20]
@@ -67,7 +68,9 @@ impl MetaPage {
         }
 
         Ok(Self {
-            page_size: u32::from_le_bytes(page[PAYLOAD_OFFSET..PAYLOAD_OFFSET + 4].try_into().unwrap()),
+            page_size: u32::from_le_bytes(
+                page[PAYLOAD_OFFSET..PAYLOAD_OFFSET + 4].try_into().unwrap(),
+            ),
             page_count: u32::from_le_bytes(
                 page[PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 8]
                     .try_into()

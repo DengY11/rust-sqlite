@@ -6,3 +6,15 @@ pub mod plan;
 pub mod planner;
 
 pub use parser::parse_sql;
+
+#[cfg(test)]
+mod tests {
+    use super::ast::Statement;
+    use super::parse_sql;
+
+    #[test]
+    fn sql_module_reexports_parse_sql() {
+        let statements = parse_sql("BEGIN;").unwrap();
+        assert_eq!(statements, vec![Statement::Begin]);
+    }
+}

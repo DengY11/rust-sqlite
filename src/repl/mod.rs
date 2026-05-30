@@ -77,9 +77,11 @@ where
 }
 
 fn infer_headers(statements: &[Statement], row_width: usize) -> Vec<String> {
-    let Some(Statement::Select { columns, .. }) = statements.last() else {
+    let Some(Statement::Select(select)) = statements.last() else {
         return generic_headers(row_width);
     };
+
+    let columns = &select.columns;
 
     if columns.len() == 1 && matches!(columns.first(), Some(SelectItem::Wildcard)) {
         return generic_headers(row_width);
@@ -90,6 +92,23 @@ fn infer_headers(statements: &[Statement], row_width: usize) -> Vec<String> {
         .map(|column| match column {
             SelectItem::Wildcard => "*".to_string(),
             SelectItem::Column(name) => name.clone(),
+            SelectItem::AliasedColumn { alias, .. } => alias.clone(),
+            SelectItem::Aggregate { func, arg, alias } => alias.clone().unwrap_or_else(|| {
+                format!(
+                    "{}({})",
+                    match func {
+                        crate::sql::ast::AggregateFunc::Count => "COUNT",
+                        crate::sql::ast::AggregateFunc::Sum => "SUM",
+                        crate::sql::ast::AggregateFunc::Avg => "AVG",
+                        crate::sql::ast::AggregateFunc::Min => "MIN",
+                        crate::sql::ast::AggregateFunc::Max => "MAX",
+                    },
+                    match arg {
+                        crate::sql::ast::AggregateArg::Wildcard => "*".to_string(),
+                        crate::sql::ast::AggregateArg::Column(name) => name.clone(),
+                    }
+                )
+            }),
         })
         .collect()
 }

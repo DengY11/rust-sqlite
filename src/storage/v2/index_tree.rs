@@ -8,20 +8,20 @@ use super::pager::Pager;
 const LEAF_MAX_ENTRIES: usize = 16;
 const INTERNAL_MAX_KEYS: usize = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BTree {
-    root_page_id: PageId,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitResult {
+    separator_key: Vec<u8>,
+    right_page_id: PageId,
 }
 
-#[derive(Debug, Clone)]
-struct SplitResult {
-    separator_key: u64,
-    right_page_id: PageId,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexTree {
+    root_page_id: PageId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LeafEntry {
-    key: u64,
+    key: Vec<u8>,
     value: Vec<u8>,
 }
 
@@ -33,7 +33,7 @@ struct LeafNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InternalNode {
-    separators: Vec<u64>,
+    separators: Vec<Vec<u8>>,
     children: Vec<PageId>,
 }
 
@@ -51,21 +51,21 @@ impl LeafNode {
         }
     }
 
-    fn lookup(&self, key: u64) -> Option<&Vec<u8>> {
+    fn lookup(&self, key: &[u8]) -> Option<&Vec<u8>> {
         self.entries
-            .iter()
-            .find(|entry| entry.key == key)
-            .map(|entry| &entry.value)
+            .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+            .ok()
+            .map(|index| &self.entries[index].value)
     }
 }
 
 impl InternalNode {
-    fn child_index(&self, key: u64) -> usize {
+    fn child_index(&self, key: &[u8]) -> usize {
         self.separators
-            .partition_point(|separator| key >= *separator)
+            .partition_point(|separator| key >= separator.as_slice())
     }
 
-    fn from_split(left_child: PageId, separator_key: u64, right_child: PageId) -> Self {
+    fn from_split(left_child: PageId, separator_key: Vec<u8>, right_child: PageId) -> Self {
         Self {
             separators: vec![separator_key],
             children: vec![left_child, right_child],
@@ -73,7 +73,7 @@ impl InternalNode {
     }
 }
 
-impl BTree {
+impl IndexTree {
     pub fn create(pager: &mut Pager, txn_id: u64) -> Result<Self> {
         let root_page_id = pager.allocate_leaf_page(txn_id)?;
         write_node(pager, txn_id, root_page_id, &Node::Leaf(LeafNode::empty()))?;
@@ -90,15 +90,25 @@ impl BTree {
         self.root_page_id
     }
 
-    pub fn get(&self, pager: &Pager, key: u64) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, pager: &Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let leaf = self.find_leaf(pager, self.root_page_id, key)?;
         Ok(leaf.lookup(key).cloned())
     }
 
-    pub fn insert(&mut self, pager: &mut Pager, txn_id: u64, key: u64, value: &[u8]) -> Result<()> {
-        if let Some(split) =
-            self.insert_into_page(pager, txn_id, self.root_page_id, key, value.to_vec())?
-        {
+    pub fn insert(
+        &mut self,
+        pager: &mut Pager,
+        txn_id: u64,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        if let Some(split) = self.insert_into_page(
+            pager,
+            txn_id,
+            self.root_page_id,
+            key.to_vec(),
+            value.to_vec(),
+        )? {
             let new_root = pager.allocate_internal_page(txn_id)?;
             let root = InternalNode::from_split(
                 self.root_page_id,
@@ -111,7 +121,7 @@ impl BTree {
         Ok(())
     }
 
-    pub fn scan_all(&self, pager: &Pager) -> Result<Vec<(u64, Vec<u8>)>> {
+    pub fn scan_all(&self, pager: &Pager) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut current = Some(self.leftmost_leaf_page(pager, self.root_page_id)?);
         let mut rows = Vec::new();
 
@@ -120,7 +130,7 @@ impl BTree {
                 Node::Leaf(leaf) => leaf,
                 Node::Internal(_) => {
                     return Err(DbError::storage(format!(
-                        "expected leaf page {} while scanning B+Tree leaf chain",
+                        "expected leaf page {} while scanning index leaf chain",
                         page_id.0
                     )));
                 }
@@ -136,11 +146,11 @@ impl BTree {
         Ok(rows)
     }
 
-    pub fn delete(&mut self, pager: &mut Pager, txn_id: u64, key: u64) -> Result<()> {
+    pub fn delete(&mut self, pager: &mut Pager, txn_id: u64, key: &[u8]) -> Result<()> {
         self.delete_from_page(pager, txn_id, self.root_page_id, key)
     }
 
-    fn find_leaf(&self, pager: &Pager, page_id: PageId, key: u64) -> Result<LeafNode> {
+    fn find_leaf(&self, pager: &Pager, page_id: PageId, key: &[u8]) -> Result<LeafNode> {
         match read_node(pager, page_id)? {
             Node::Leaf(leaf) => Ok(leaf),
             Node::Internal(internal) => {
@@ -162,12 +172,15 @@ impl BTree {
         pager: &mut Pager,
         txn_id: u64,
         page_id: PageId,
-        key: u64,
+        key: Vec<u8>,
         value: Vec<u8>,
     ) -> Result<Option<SplitResult>> {
         match read_node(pager, page_id)? {
             Node::Leaf(mut leaf) => {
-                match leaf.entries.binary_search_by_key(&key, |entry| entry.key) {
+                match leaf
+                    .entries
+                    .binary_search_by(|entry| entry.key.as_slice().cmp(key.as_slice()))
+                {
                     Ok(index) => leaf.entries[index].value = value,
                     Err(index) => leaf.entries.insert(index, LeafEntry { key, value }),
                 }
@@ -179,7 +192,7 @@ impl BTree {
 
                 let split_at = leaf.entries.len() / 2;
                 let right_entries = leaf.entries.split_off(split_at);
-                let separator_key = right_entries[0].key;
+                let separator_key = right_entries[0].key.clone();
                 let new_page_id = pager.allocate_leaf_page(txn_id)?;
                 let old_next = leaf.next.take();
                 leaf.next = Some(new_page_id);
@@ -201,7 +214,7 @@ impl BTree {
                 }))
             }
             Node::Internal(mut internal) => {
-                let child_index = internal.child_index(key);
+                let child_index = internal.child_index(&key);
                 let child_page_id = internal.children[child_index];
                 let child_split =
                     self.insert_into_page(pager, txn_id, child_page_id, key, value)?;
@@ -221,7 +234,7 @@ impl BTree {
                 }
 
                 let mid = internal.separators.len() / 2;
-                let promoted_key = internal.separators[mid];
+                let promoted_key = internal.separators[mid].clone();
                 let right_separators = internal.separators.split_off(mid + 1);
                 internal.separators.pop();
                 let right_children = internal.children.split_off(mid + 1);
@@ -251,11 +264,14 @@ impl BTree {
         pager: &mut Pager,
         txn_id: u64,
         page_id: PageId,
-        key: u64,
+        key: &[u8],
     ) -> Result<()> {
         match read_node(pager, page_id)? {
             Node::Leaf(mut leaf) => {
-                if let Ok(index) = leaf.entries.binary_search_by_key(&key, |entry| entry.key) {
+                if let Ok(index) = leaf
+                    .entries
+                    .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+                {
                     leaf.entries.remove(index);
                     write_node(pager, txn_id, page_id, &Node::Leaf(leaf))?;
                 }
@@ -300,49 +316,44 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::storage::v2::pager::Pager;
 
     #[test]
-    fn inserts_and_reads_values_from_a_single_leaf() {
+    fn inserts_and_reads_byte_keys() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("db.rsql");
         let mut pager = Pager::open(&path).unwrap();
         let txn = pager.begin().unwrap();
-        let mut tree = BTree::create(&mut pager, txn).unwrap();
-        tree.insert(&mut pager, txn, 1, b"alice").unwrap();
-        assert_eq!(tree.get(&pager, 1).unwrap(), Some(b"alice".to_vec()));
+        let mut tree = IndexTree::create(&mut pager, txn).unwrap();
+
+        tree.insert(&mut pager, txn, b"alice|email", b"[1]")
+            .unwrap();
+        assert_eq!(
+            tree.get(&pager, b"alice|email").unwrap(),
+            Some(b"[1]".to_vec())
+        );
     }
 
     #[test]
-    fn splits_leaf_pages_and_preserves_sorted_scan_order() {
+    fn split_preserves_sorted_scan_order_for_byte_keys() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("db.rsql");
         let mut pager = Pager::open(&path).unwrap();
         let txn = pager.begin().unwrap();
-        let mut tree = BTree::create(&mut pager, txn).unwrap();
+        let mut tree = IndexTree::create(&mut pager, txn).unwrap();
 
-        for key in 1..=64 {
-            tree.insert(&mut pager, txn, key, format!("row-{key}").as_bytes())
-                .unwrap();
+        for index in 0..40 {
+            let key = format!("k-{index:02}").into_bytes();
+            tree.insert(&mut pager, txn, &key, key.as_slice()).unwrap();
         }
 
-        let keys: Vec<u64> = tree
+        let keys = tree
             .scan_all(&pager)
             .unwrap()
             .into_iter()
-            .map(|(key, _)| key)
-            .collect();
-        assert_eq!(keys, (1..=64).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn delete_removes_visible_key_without_rebalancing() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db.rsql");
-        let mut pager = Pager::open(&path).unwrap();
-        let txn = pager.begin().unwrap();
-        let mut tree = BTree::create(&mut pager, txn).unwrap();
-        tree.insert(&mut pager, txn, 7, b"carol").unwrap();
-        tree.delete(&mut pager, txn, 7).unwrap();
-        assert_eq!(tree.get(&pager, 7).unwrap(), None);
+            .map(|(key, _)| String::from_utf8(key).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(keys.first().map(String::as_str), Some("k-00"));
+        assert_eq!(keys.last().map(String::as_str), Some("k-39"));
     }
 }

@@ -16,12 +16,33 @@ pub enum TokenKind {
     Into,
     Values,
     Select,
+    Delete,
+    Update,
+    Set,
     From,
     Where,
+    Group,
+    Having,
+    Order,
+    By,
+    Limit,
+    As,
+    Inner,
+    Left,
+    Outer,
+    Join,
+    Asc,
+    Desc,
+    And,
+    Or,
     Begin,
     Commit,
     Rollback,
     Not,
+    In,
+    Is,
+    Exists,
+    Distinct,
     Primary,
     Key,
     IntegerType,
@@ -39,8 +60,13 @@ pub enum TokenKind {
     LParen,
     RParen,
     Eq,
+    Ne,
     Gt,
+    Gte,
     Lt,
+    Lte,
+    Minus,
+    Dot,
     Eof,
 }
 
@@ -82,6 +108,10 @@ impl<'a> Lexer<'a> {
                     self.advance_char();
                     TokenKind::Comma
                 }
+                '.' => {
+                    self.advance_char();
+                    TokenKind::Dot
+                }
                 '*' => {
                     self.advance_char();
                     TokenKind::Star
@@ -94,13 +124,41 @@ impl<'a> Lexer<'a> {
                     self.advance_char();
                     TokenKind::Eq
                 }
+                '!' if self.peek_next() == Some('=') => {
+                    self.advance_char();
+                    self.advance_char();
+                    TokenKind::Ne
+                }
+                '!' => {
+                    return Err(DbError::sql(format!(
+                        "unexpected character '{}' at position {}",
+                        ch, position
+                    )));
+                }
                 '>' => {
                     self.advance_char();
-                    TokenKind::Gt
+                    if self.peek() == Some('=') {
+                        self.advance_char();
+                        TokenKind::Gte
+                    } else {
+                        TokenKind::Gt
+                    }
                 }
                 '<' => {
                     self.advance_char();
-                    TokenKind::Lt
+                    if self.peek() == Some('=') {
+                        self.advance_char();
+                        TokenKind::Lte
+                    } else if self.peek() == Some('>') {
+                        self.advance_char();
+                        TokenKind::Ne
+                    } else {
+                        TokenKind::Lt
+                    }
+                }
+                '-' => {
+                    self.advance_char();
+                    TokenKind::Minus
                 }
                 '\'' => self.lex_string()?,
                 '0'..='9' => self.lex_integer()?,
@@ -125,6 +183,12 @@ impl<'a> Lexer<'a> {
 
     fn peek(&self) -> Option<char> {
         self.input[self.offset..].chars().next()
+    }
+
+    fn peek_next(&self) -> Option<char> {
+        let mut chars = self.input[self.offset..].chars();
+        chars.next()?;
+        chars.next()
     }
 
     fn advance_char(&mut self) -> Option<char> {
@@ -180,12 +244,33 @@ impl<'a> Lexer<'a> {
             "INTO" => TokenKind::Into,
             "VALUES" => TokenKind::Values,
             "SELECT" => TokenKind::Select,
+            "DELETE" => TokenKind::Delete,
+            "UPDATE" => TokenKind::Update,
+            "SET" => TokenKind::Set,
             "FROM" => TokenKind::From,
             "WHERE" => TokenKind::Where,
+            "GROUP" => TokenKind::Group,
+            "HAVING" => TokenKind::Having,
+            "ORDER" => TokenKind::Order,
+            "BY" => TokenKind::By,
+            "LIMIT" => TokenKind::Limit,
+            "AS" => TokenKind::As,
+            "INNER" => TokenKind::Inner,
+            "LEFT" => TokenKind::Left,
+            "OUTER" => TokenKind::Outer,
+            "JOIN" => TokenKind::Join,
+            "ASC" => TokenKind::Asc,
+            "DESC" => TokenKind::Desc,
+            "AND" => TokenKind::And,
+            "OR" => TokenKind::Or,
             "BEGIN" => TokenKind::Begin,
             "COMMIT" => TokenKind::Commit,
             "ROLLBACK" => TokenKind::Rollback,
             "NOT" => TokenKind::Not,
+            "IN" => TokenKind::In,
+            "IS" => TokenKind::Is,
+            "EXISTS" => TokenKind::Exists,
+            "DISTINCT" => TokenKind::Distinct,
             "PRIMARY" => TokenKind::Primary,
             "KEY" => TokenKind::Key,
             "INTEGER" => TokenKind::IntegerType,

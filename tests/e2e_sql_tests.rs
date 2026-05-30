@@ -210,3 +210,157 @@ fn database_open_reports_constraint_violations() {
             .contains("duplicate primary key value for column 'id'")
     );
 }
+
+#[test]
+fn database_supports_insert_column_list_delete_update_order_by_limit_and_aliases() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN, email TEXT);
+         INSERT INTO users (id, name) VALUES (1, 'alice');
+         INSERT INTO users (id, name, active, email) VALUES (2, 'bob', true, 'b@example.com');
+         INSERT INTO users VALUES (3, 'carol', true, 'c@example.com');
+         UPDATE users AS u SET name = 'bobby', email = 'bb@example.com' WHERE u.id = 2;
+         DELETE FROM users u WHERE u.id = 1;",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT u.name AS username, u.id user_id FROM users AS u WHERE u.active = TRUE ORDER BY username DESC, u.id ASC LIMIT 1;",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::from("carol"), Value::Integer(3)]]);
+
+    let all_rows = db.query("SELECT * FROM users ORDER BY id ASC;").unwrap();
+    assert_eq!(
+        all_rows,
+        vec![
+            vec![
+                Value::Integer(2),
+                Value::from("bobby"),
+                Value::Boolean(true),
+                Value::from("bb@example.com"),
+            ],
+            vec![
+                Value::Integer(3),
+                Value::from("carol"),
+                Value::Boolean(true),
+                Value::from("c@example.com"),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn database_supports_group_by_join_and_subqueries() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL);
+         INSERT INTO users VALUES (1, 'alice', true);
+         INSERT INTO users VALUES (2, 'bob', false);
+         INSERT INTO users VALUES (3, 'carol', true);
+         INSERT INTO orders VALUES (1, 1, 40);
+         INSERT INTO orders VALUES (2, 1, 120);
+         INSERT INTO orders VALUES (3, 3, 200);
+         INSERT INTO orders VALUES (4, 2, 5);",
+    )
+    .unwrap();
+
+    let grouped = db
+        .query("SELECT active, COUNT(*) AS total FROM users GROUP BY active ORDER BY active ASC;")
+        .unwrap();
+    assert_eq!(
+        grouped,
+        vec![
+            vec![Value::Boolean(false), Value::Integer(1)],
+            vec![Value::Boolean(true), Value::Integer(2)],
+        ]
+    );
+
+    let joined = db
+        .query(
+            "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 10 ORDER BY u.name ASC, o.amount ASC;",
+        )
+        .unwrap();
+    assert_eq!(
+        joined,
+        vec![
+            vec![Value::from("alice"), Value::Integer(40)],
+            vec![Value::from("alice"), Value::Integer(120)],
+            vec![Value::from("carol"), Value::Integer(200)],
+        ]
+    );
+
+    let in_subquery = db
+        .query(
+            "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount >= 100) ORDER BY name ASC;",
+        )
+        .unwrap();
+    assert_eq!(
+        in_subquery,
+        vec![vec![Value::from("alice")], vec![Value::from("carol")]]
+    );
+
+    let scalar_subquery = db
+        .query("SELECT name FROM users WHERE id = (SELECT user_id FROM orders WHERE id = 4);")
+        .unwrap();
+    assert_eq!(scalar_subquery, vec![vec![Value::from("bob")]]);
+}
+
+#[test]
+fn database_supports_having_left_join_and_distinct() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL);
+         INSERT INTO users VALUES (1, 'alice', true);
+         INSERT INTO users VALUES (2, 'bob', false);
+         INSERT INTO users VALUES (3, 'carol', true);
+         INSERT INTO orders VALUES (1, 1, 40);
+         INSERT INTO orders VALUES (2, 1, 120);
+         INSERT INTO orders VALUES (3, 3, 200);
+         INSERT INTO orders VALUES (4, 2, 5);",
+    )
+    .unwrap();
+
+    // HAVING filters group rows after aggregation.
+    let having = db
+        .query(
+            "SELECT user_id, COUNT(*) AS total FROM orders GROUP BY user_id HAVING total > 1 ORDER BY user_id ASC;",
+        )
+        .unwrap();
+    assert_eq!(having, vec![vec![Value::Integer(1), Value::Integer(2)]]);
+
+    // LEFT JOIN preserves left rows without matches and pads with NULL.
+    let left_joined = db
+        .query(
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount >= 100 ORDER BY u.name ASC, o.amount ASC;",
+        )
+        .unwrap();
+    assert_eq!(
+        left_joined,
+        vec![
+            vec![Value::from("alice"), Value::Integer(120)],
+            vec![Value::from("bob"), Value::Null],
+            vec![Value::from("carol"), Value::Integer(200)],
+        ]
+    );
+
+    // DISTINCT removes duplicate result rows.
+    let distinct = db
+        .query("SELECT DISTINCT user_id FROM orders ORDER BY user_id ASC;")
+        .unwrap();
+    assert_eq!(
+        distinct,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ]
+    );
+}

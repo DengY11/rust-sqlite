@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::cmp::max;
+use std::cmp::{Ordering, max};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::common::error::{DbError, Result};
@@ -8,6 +8,7 @@ use crate::engine::traits::{
     CatalogStore, IndexStore, PlanningStorageEngine, TableStore, TransactionManager,
 };
 use crate::engine::txn::TransactionId;
+use crate::sql::ast::CompareOp;
 use crate::sql::planner::PlanningContext;
 
 #[derive(Debug, Default)]
@@ -111,6 +112,22 @@ impl PlanningStorageEngine for MemoryStorage {
 }
 
 impl MemoryStorageInner {
+    fn project_index_key(schema: &Schema, index: &IndexMeta, row: &Row) -> Result<Vec<Value>> {
+        index
+            .columns
+            .iter()
+            .map(|column| {
+                let position = Self::column_position(schema, column)?;
+                row.get(position).cloned().ok_or_else(|| {
+                    DbError::storage(format!(
+                        "row for table {} is missing column {column}",
+                        schema.name
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn validate_transaction(&self, transaction_id: TransactionId) -> Result<()> {
         match &self.active_txn {
             Some(active) if active.id == transaction_id => Ok(()),
@@ -176,11 +193,7 @@ impl MemoryStorageInner {
         };
 
         for index in indexes.values_mut() {
-            let column = index.meta.columns.first().ok_or_else(|| {
-                DbError::storage(format!("index {} has no columns", index.meta.name))
-            })?;
-            let position = Self::column_position(&schema, column)?;
-            let key = vec![row[position].clone()];
+            let key = Self::project_index_key(&schema, &index.meta, row)?;
             index.entries.entry(key).or_default().insert(row_id);
         }
 
@@ -199,11 +212,7 @@ impl MemoryStorageInner {
         };
 
         for index in indexes.values_mut() {
-            let column = index.meta.columns.first().ok_or_else(|| {
-                DbError::storage(format!("index {} has no columns", index.meta.name))
-            })?;
-            let position = Self::column_position(&schema, column)?;
-            let key = vec![row[position].clone()];
+            let key = Self::project_index_key(&schema, &index.meta, row)?;
 
             if let Some(row_ids) = index.entries.get_mut(&key) {
                 row_ids.remove(&row_id);
@@ -417,13 +426,6 @@ impl IndexStore for MemoryStorage {
         inner.validate_transaction(transaction_id)?;
 
         let schema = inner.require_schema(schema_name)?.clone();
-        if index.columns.len() != 1 {
-            return Err(DbError::storage(format!(
-                "memory backend only supports single-column indexes: {}",
-                index.name
-            )));
-        }
-
         let already_exists = inner
             .indexes
             .get(schema_name)
@@ -434,17 +436,17 @@ impl IndexStore for MemoryStorage {
                 index.name
             )));
         }
-
-        let column = index
-            .columns
-            .first()
-            .ok_or_else(|| DbError::storage(format!("index {} has no columns", index.name)))?;
-        let position = MemoryStorageInner::column_position(&schema, column)?;
+        if index.columns.is_empty() {
+            return Err(DbError::storage(format!(
+                "index {} has no columns",
+                index.name
+            )));
+        }
 
         let mut entries = BTreeMap::new();
         if let Some(rows) = inner.rows.get(schema_name) {
             for (row_id, row) in rows {
-                let key = vec![row[position].clone()];
+                let key = MemoryStorageInner::project_index_key(&schema, &index, row)?;
                 entries
                     .entry(key)
                     .or_insert_with(BTreeSet::new)
@@ -522,6 +524,123 @@ impl IndexStore for MemoryStorage {
             .get(key)
             .map(|row_ids| row_ids.iter().copied().collect())
             .unwrap_or_default())
+    }
+
+    fn scan_index_prefix(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
+        key_prefix: &[Value],
+    ) -> Result<Vec<RowId>> {
+        let inner = self.inner.borrow();
+        inner.validate_transaction(transaction_id)?;
+
+        let index = inner
+            .indexes
+            .get(schema_name)
+            .and_then(|indexes| indexes.get(index_name))
+            .ok_or_else(|| {
+                DbError::storage(format!("unknown index {index_name} on table {schema_name}"))
+            })?;
+
+        if key_prefix.len() > index.meta.columns.len() {
+            return Err(DbError::storage(format!(
+                "index {} expected at most {} key values but got {}",
+                index.meta.name,
+                index.meta.columns.len(),
+                key_prefix.len()
+            )));
+        }
+
+        let mut row_ids = BTreeSet::new();
+        for (key, matches) in &index.entries {
+            if key.starts_with(key_prefix) {
+                row_ids.extend(matches.iter().copied());
+            }
+        }
+        Ok(row_ids.into_iter().collect())
+    }
+
+    fn scan_index_range(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
+        key_prefix: &[Value],
+        lower: Option<(CompareOp, &Value)>,
+        upper: Option<(CompareOp, &Value)>,
+    ) -> Result<Vec<RowId>> {
+        let inner = self.inner.borrow();
+        inner.validate_transaction(transaction_id)?;
+
+        let index = inner
+            .indexes
+            .get(schema_name)
+            .and_then(|indexes| indexes.get(index_name))
+            .ok_or_else(|| {
+                DbError::storage(format!("unknown index {index_name} on table {schema_name}"))
+            })?;
+
+        if key_prefix.len() >= index.meta.columns.len() {
+            return Err(DbError::storage(format!(
+                "index {} has no range column after prefix of length {}",
+                index.meta.name,
+                key_prefix.len()
+            )));
+        }
+
+        let mut row_ids = BTreeSet::new();
+        for (key, matches) in &index.entries {
+            if !key.starts_with(key_prefix) {
+                continue;
+            }
+
+            let Some(candidate) = key.get(key_prefix.len()) else {
+                continue;
+            };
+            if matches_bounds(candidate, lower, upper) {
+                row_ids.extend(matches.iter().copied());
+            }
+        }
+
+        Ok(row_ids.into_iter().collect())
+    }
+}
+
+fn matches_bounds(
+    candidate: &Value,
+    lower: Option<(CompareOp, &Value)>,
+    upper: Option<(CompareOp, &Value)>,
+) -> bool {
+    lower.is_none_or(|(op, value)| matches_compare(candidate, op, value))
+        && upper.is_none_or(|(op, value)| matches_compare(candidate, op, value))
+}
+
+fn matches_compare(left: &Value, op: CompareOp, right: &Value) -> bool {
+    match op {
+        CompareOp::Eq => left == right,
+        CompareOp::Ne => left != right,
+        CompareOp::Gt => compare_values(left, right) == Some(Ordering::Greater),
+        CompareOp::Gte => matches!(
+            compare_values(left, right),
+            Some(Ordering::Greater | Ordering::Equal)
+        ),
+        CompareOp::Lt => compare_values(left, right) == Some(Ordering::Less),
+        CompareOp::Lte => matches!(
+            compare_values(left, right),
+            Some(Ordering::Less | Ordering::Equal)
+        ),
+    }
+}
+
+fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
+    match (left, right) {
+        (Value::Null, Value::Null) => Some(Ordering::Equal),
+        (Value::Boolean(left), Value::Boolean(right)) => Some(left.cmp(right)),
+        (Value::Integer(left), Value::Integer(right)) => Some(left.cmp(right)),
+        (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
+        _ => None,
     }
 }
 

@@ -153,6 +153,15 @@ impl Schema {
     }
 
     pub fn validate_row_values(&self, row: &Row) -> Result<()> {
+        if row.len() != self.columns.len() {
+            return Err(DbError::storage(format!(
+                "insert into {} expected {} values but got {}",
+                self.name,
+                self.columns.len(),
+                row.len()
+            )));
+        }
+
         for (column, value) in self.columns.iter().zip(row.iter()) {
             if matches!(value, Value::Null) {
                 if column.primary_key {
@@ -204,5 +213,122 @@ impl Schema {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ColumnDef, ColumnType, Schema, Value};
+
+    fn user_schema() -> Schema {
+        Schema::new(
+            "users",
+            vec![
+                ColumnDef::primary_key("id", ColumnType::Integer),
+                ColumnDef::new("name", ColumnType::Text).nullable(false),
+                ColumnDef::new("active", ColumnType::Boolean),
+            ],
+        )
+    }
+
+    #[test]
+    fn validate_row_values_accepts_matching_types_and_nullable_columns() {
+        let schema = user_schema();
+        let row = vec![Value::Integer(1), Value::from("alice"), Value::Null];
+        assert!(schema.validate_row_values(&row).is_ok());
+    }
+
+    #[test]
+    fn validate_row_values_rejects_too_few_or_too_many_values() {
+        let schema = user_schema();
+
+        let too_few = schema
+            .validate_row_values(&vec![Value::Integer(1), Value::from("alice")])
+            .unwrap_err();
+        assert!(too_few.to_string().contains("expected 3 values but got 2"));
+
+        let too_many = schema
+            .validate_row_values(&vec![
+                Value::Integer(1),
+                Value::from("alice"),
+                Value::Boolean(true),
+                Value::Null,
+            ])
+            .unwrap_err();
+        assert!(too_many.to_string().contains("expected 3 values but got 4"));
+    }
+
+    #[test]
+    fn validate_row_values_rejects_null_primary_key_and_type_mismatch() {
+        let schema = user_schema();
+
+        let null_primary_key = schema
+            .validate_row_values(&vec![
+                Value::Null,
+                Value::from("alice"),
+                Value::Boolean(true),
+            ])
+            .unwrap_err();
+        assert!(
+            null_primary_key
+                .to_string()
+                .contains("primary key column 'id' cannot be NULL")
+        );
+
+        let type_mismatch = schema
+            .validate_row_values(&vec![
+                Value::Integer(1),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ])
+            .unwrap_err();
+        assert!(
+            type_mismatch
+                .to_string()
+                .contains("column 'name' expected TEXT but got BOOLEAN")
+        );
+    }
+
+    #[test]
+    fn validate_primary_key_uniqueness_accepts_new_key_and_rejects_duplicate() {
+        let schema = user_schema();
+        let existing = [
+            vec![
+                Value::Integer(1),
+                Value::from("alice"),
+                Value::Boolean(true),
+            ],
+            vec![Value::Integer(2), Value::from("bob"), Value::Boolean(false)],
+        ];
+        let refs = existing.iter().collect::<Vec<_>>();
+
+        assert!(
+            schema
+                .validate_primary_key_uniqueness(
+                    &vec![
+                        Value::Integer(3),
+                        Value::from("carol"),
+                        Value::Boolean(true)
+                    ],
+                    &refs,
+                )
+                .is_ok()
+        );
+
+        let duplicate = schema
+            .validate_primary_key_uniqueness(
+                &vec![
+                    Value::Integer(2),
+                    Value::from("carol"),
+                    Value::Boolean(true),
+                ],
+                &refs,
+            )
+            .unwrap_err();
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate primary key value for column 'id': 2")
+        );
     }
 }

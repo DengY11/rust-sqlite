@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::common::error::{DbError, Result};
@@ -8,16 +9,22 @@ use crate::engine::traits::{
     CatalogStore, IndexStore, PlanningStorageEngine, TableStore, TransactionManager,
 };
 use crate::engine::txn::TransactionId;
+use crate::sql::ast::CompareOp;
 use crate::sql::planner::PlanningContext;
 
 use self::btree::BTree;
 use self::catalog::{CatalogState, load_catalog, store_catalog};
-use self::codec::{decode_row, encode_row};
+use self::codec::{
+    decode_index_key, decode_row, decode_row_ids, encode_index_key, encode_row, encode_row_ids,
+    project_index_key,
+};
+use self::index_tree::IndexTree;
 use self::pager::Pager;
 
 pub mod btree;
 pub mod catalog;
 pub mod codec;
+pub mod index_tree;
 pub mod page;
 pub mod pager;
 pub mod wal;
@@ -71,13 +78,135 @@ impl FileStorage {
 
     fn table_schema_and_root(&self, table: &str) -> Result<(Schema, page::PageId)> {
         let catalog = self.catalog.borrow();
-        let schema = catalog.schemas.get(table).cloned().ok_or_else(|| {
-            DbError::storage(format!("unknown table: {table}"))
-        })?;
-        let root = catalog.table_roots.get(table).copied().ok_or_else(|| {
-            DbError::storage(format!("missing table root for {table}"))
-        })?;
+        let schema = catalog
+            .schemas
+            .get(table)
+            .cloned()
+            .ok_or_else(|| DbError::storage(format!("unknown table: {table}")))?;
+        let root = catalog
+            .table_roots
+            .get(table)
+            .copied()
+            .ok_or_else(|| DbError::storage(format!("missing table root for {table}")))?;
         Ok((schema, root))
+    }
+
+    fn index_meta_and_root(
+        &self,
+        table: &str,
+        index_name: &str,
+    ) -> Result<(IndexMeta, page::PageId)> {
+        let catalog = self.catalog.borrow();
+        let index = catalog
+            .indexes
+            .get(table)
+            .and_then(|entry| entry.get(index_name))
+            .cloned()
+            .ok_or_else(|| {
+                DbError::storage(format!("unknown index {index_name} on table {table}"))
+            })?;
+        let root = catalog
+            .index_roots
+            .get(table)
+            .and_then(|entry| entry.get(index_name))
+            .copied()
+            .ok_or_else(|| {
+                DbError::storage(format!(
+                    "missing index root for {index_name} on table {table}"
+                ))
+            })?;
+        Ok((index, root))
+    }
+
+    fn indexes_for_table(&self, table: &str) -> Result<Vec<(String, IndexMeta, page::PageId)>> {
+        let catalog = self.catalog.borrow();
+        let Some(indexes) = catalog.indexes.get(table) else {
+            return Ok(Vec::new());
+        };
+        indexes
+            .iter()
+            .map(|(name, meta)| {
+                let root = catalog
+                    .index_roots
+                    .get(table)
+                    .and_then(|entry| entry.get(name))
+                    .copied()
+                    .ok_or_else(|| {
+                        DbError::storage(format!("missing index root for {name} on table {table}"))
+                    })?;
+                Ok((name.clone(), meta.clone(), root))
+            })
+            .collect()
+    }
+
+    fn validate_new_index(
+        schema: &Schema,
+        indexes: Option<&BTreeMap<String, IndexMeta>>,
+        index: &IndexMeta,
+    ) -> Result<()> {
+        if index.columns.is_empty() {
+            return Err(DbError::storage("index must define at least one column"));
+        }
+
+        let mut seen = BTreeSet::new();
+        for column in &index.columns {
+            if !schema.columns.iter().any(|entry| entry.name == *column) {
+                return Err(DbError::storage(format!(
+                    "unknown column {column} on table {}",
+                    schema.name
+                )));
+            }
+            if !seen.insert(column.clone()) {
+                return Err(DbError::storage(format!("duplicate index column {column}")));
+            }
+        }
+
+        if indexes.is_some_and(|by_name| by_name.contains_key(&index.name)) {
+            return Err(DbError::storage(format!(
+                "index {} already exists",
+                index.name
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn upsert_index_entry(
+        tree: &mut IndexTree,
+        pager: &mut Pager,
+        txn_id: u64,
+        encoded_key: &[u8],
+        row_id: RowId,
+    ) -> Result<()> {
+        let mut row_ids = tree
+            .get(&*pager, encoded_key)?
+            .map(|bytes| decode_row_ids(&bytes))
+            .transpose()?
+            .unwrap_or_default();
+        if !row_ids.contains(&row_id) {
+            row_ids.push(row_id);
+            row_ids.sort_by_key(|value| value.0);
+        }
+        tree.insert(pager, txn_id, encoded_key, &encode_row_ids(&row_ids)?)
+    }
+
+    fn remove_index_entry(
+        tree: &mut IndexTree,
+        pager: &mut Pager,
+        txn_id: u64,
+        encoded_key: &[u8],
+        row_id: RowId,
+    ) -> Result<()> {
+        let Some(bytes) = tree.get(&*pager, encoded_key)? else {
+            return Ok(());
+        };
+        let mut row_ids = decode_row_ids(&bytes)?;
+        row_ids.retain(|candidate| *candidate != row_id);
+        if row_ids.is_empty() {
+            tree.delete(pager, txn_id, encoded_key)
+        } else {
+            tree.insert(pager, txn_id, encoded_key, &encode_row_ids(&row_ids)?)
+        }
     }
 }
 
@@ -89,11 +218,15 @@ impl PlanningStorageEngine for FileStorage {
         self.validate_snapshot_transaction(transaction_id)?;
 
         let catalog = self.catalog.borrow();
-        let schemas = catalog.schemas.clone().into_iter().collect::<HashMap<_, _>>();
-        let indexes = catalog
+        let schemas = catalog
             .schemas
-            .keys()
-            .map(|table| (table.clone(), Vec::new()))
+            .clone()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let indexes = catalog
+            .indexes
+            .iter()
+            .map(|(table, by_name)| (table.clone(), by_name.values().cloned().collect::<Vec<_>>()))
             .collect::<HashMap<_, _>>();
 
         Ok(PlanningContext::new(schemas, indexes))
@@ -156,7 +289,9 @@ impl CatalogStore for FileStorage {
         let table_name = schema.name.clone();
         let tree = BTree::create(&mut pager, transaction_id.0)?;
         catalog.schemas.insert(table_name.clone(), schema);
-        catalog.table_roots.insert(table_name.clone(), tree.root_page_id());
+        catalog
+            .table_roots
+            .insert(table_name.clone(), tree.root_page_id());
         catalog.next_row_ids.entry(table_name).or_insert(1);
         Ok(())
     }
@@ -219,6 +354,27 @@ impl TableStore for FileStorage {
                 .insert(schema_name.to_string(), tree.root_page_id());
         }
 
+        for (index_name, index_meta, root_page_id) in self.indexes_for_table(schema_name)? {
+            let key_values = project_index_key(&schema, &index_meta, &row)?;
+            let encoded_key = encode_index_key(&key_values)?;
+            let mut tree = IndexTree::from_root(root_page_id);
+            Self::upsert_index_entry(
+                &mut tree,
+                &mut pager,
+                transaction_id.0,
+                &encoded_key,
+                row_id,
+            )?;
+            if tree.root_page_id() != root_page_id {
+                self.catalog
+                    .borrow_mut()
+                    .index_roots
+                    .entry(schema_name.to_string())
+                    .or_default()
+                    .insert(index_name, tree.root_page_id());
+            }
+        }
+
         Ok(row_id)
     }
 
@@ -272,7 +428,42 @@ impl TableStore for FileStorage {
             return Ok(());
         };
 
+        let existing_row = {
+            let pager = self.pager.borrow();
+            let tree = BTree::from_root(root_page_id);
+            tree.get(&pager, row_id.0)?
+                .map(|bytes| decode_row(&bytes))
+                .transpose()?
+        };
+
+        let Some(existing_row) = existing_row else {
+            return Ok(());
+        };
+
+        let (schema, _) = self.table_schema_and_root(schema_name)?;
+
         let mut pager = self.pager.borrow_mut();
+        for (index_name, index_meta, index_root_page_id) in self.indexes_for_table(schema_name)? {
+            let key_values = project_index_key(&schema, &index_meta, &existing_row)?;
+            let encoded_key = encode_index_key(&key_values)?;
+            let mut tree = IndexTree::from_root(index_root_page_id);
+            Self::remove_index_entry(
+                &mut tree,
+                &mut pager,
+                transaction_id.0,
+                &encoded_key,
+                row_id,
+            )?;
+            if tree.root_page_id() != index_root_page_id {
+                self.catalog
+                    .borrow_mut()
+                    .index_roots
+                    .entry(schema_name.to_string())
+                    .or_default()
+                    .insert(index_name, tree.root_page_id());
+            }
+        }
+
         let mut tree = BTree::from_root(root_page_id);
         tree.delete(&mut pager, transaction_id.0, row_id.0)?;
         if tree.root_page_id() != root_page_id {
@@ -289,44 +480,227 @@ impl IndexStore for FileStorage {
     fn create_index(
         &self,
         transaction_id: TransactionId,
-        _schema_name: &str,
-        _index: IndexMeta,
+        schema_name: &str,
+        index: IndexMeta,
     ) -> Result<()> {
         self.validate_transaction(transaction_id)?;
-        Err(DbError::storage(
-            "storage_v2 does not implement secondary indexes yet",
-        ))
+
+        let (schema, table_root_page_id) = self.table_schema_and_root(schema_name)?;
+        {
+            let catalog = self.catalog.borrow();
+            Self::validate_new_index(&schema, catalog.indexes.get(schema_name), &index)?;
+        }
+
+        let existing_rows = {
+            let pager = self.pager.borrow();
+            let tree = BTree::from_root(table_root_page_id);
+            tree.scan_all(&pager)?
+        };
+
+        let mut pager = self.pager.borrow_mut();
+        let mut tree = IndexTree::create(&mut pager, transaction_id.0)?;
+        let initial_root_page_id = tree.root_page_id();
+
+        {
+            let mut catalog = self.catalog.borrow_mut();
+            catalog
+                .indexes
+                .entry(schema_name.to_string())
+                .or_default()
+                .insert(index.name.clone(), index.clone());
+            catalog
+                .index_roots
+                .entry(schema_name.to_string())
+                .or_default()
+                .insert(index.name.clone(), initial_root_page_id);
+        }
+
+        for (row_id, bytes) in existing_rows {
+            let row = decode_row(&bytes)?;
+            let key_values = project_index_key(&schema, &index, &row)?;
+            let encoded_key = encode_index_key(&key_values)?;
+            Self::upsert_index_entry(
+                &mut tree,
+                &mut pager,
+                transaction_id.0,
+                &encoded_key,
+                RowId(row_id),
+            )?;
+        }
+
+        if tree.root_page_id() != initial_root_page_id {
+            self.catalog
+                .borrow_mut()
+                .index_roots
+                .entry(schema_name.to_string())
+                .or_default()
+                .insert(index.name.clone(), tree.root_page_id());
+        }
+
+        Ok(())
     }
 
     fn get_index(
         &self,
         transaction_id: TransactionId,
-        _schema_name: &str,
-        _index_name: &str,
+        schema_name: &str,
+        index_name: &str,
     ) -> Result<Option<IndexMeta>> {
         self.validate_transaction(transaction_id)?;
-        Ok(None)
+        Ok(self
+            .catalog
+            .borrow()
+            .indexes
+            .get(schema_name)
+            .and_then(|entry| entry.get(index_name))
+            .cloned())
     }
 
     fn list_indexes(
         &self,
         transaction_id: TransactionId,
-        _schema_name: &str,
+        schema_name: &str,
     ) -> Result<Vec<IndexMeta>> {
         self.validate_transaction(transaction_id)?;
-        Ok(Vec::new())
+        Ok(self
+            .catalog
+            .borrow()
+            .indexes
+            .get(schema_name)
+            .map(|entry| entry.values().cloned().collect())
+            .unwrap_or_default())
     }
 
     fn lookup_index(
         &self,
         transaction_id: TransactionId,
-        _schema_name: &str,
-        _index_name: &str,
-        _key: &[Value],
+        schema_name: &str,
+        index_name: &str,
+        key: &[Value],
     ) -> Result<Vec<RowId>> {
         self.validate_transaction(transaction_id)?;
-        Err(DbError::storage(
-            "storage_v2 does not implement secondary indexes yet",
-        ))
+        let (index, root_page_id) = self.index_meta_and_root(schema_name, index_name)?;
+        if key.len() != index.columns.len() {
+            return Err(DbError::storage(format!(
+                "index {} expected {} key values but got {}",
+                index.name,
+                index.columns.len(),
+                key.len()
+            )));
+        }
+        let encoded_key = encode_index_key(key)?;
+        let pager = self.pager.borrow();
+        let tree = IndexTree::from_root(root_page_id);
+        Ok(tree
+            .get(&pager, &encoded_key)?
+            .map(|bytes| decode_row_ids(&bytes))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    fn scan_index_prefix(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
+        key_prefix: &[Value],
+    ) -> Result<Vec<RowId>> {
+        self.validate_transaction(transaction_id)?;
+        let (index, root_page_id) = self.index_meta_and_root(schema_name, index_name)?;
+        if key_prefix.len() > index.columns.len() {
+            return Err(DbError::storage(format!(
+                "index {} expected at most {} key values but got {}",
+                index.name,
+                index.columns.len(),
+                key_prefix.len()
+            )));
+        }
+
+        let pager = self.pager.borrow();
+        let tree = IndexTree::from_root(root_page_id);
+        let mut row_ids = BTreeSet::new();
+        for (encoded_key, encoded_row_ids) in tree.scan_all(&pager)? {
+            let decoded_key = decode_index_key(&encoded_key)?;
+            if decoded_key.starts_with(key_prefix) {
+                row_ids.extend(decode_row_ids(&encoded_row_ids)?);
+            }
+        }
+
+        Ok(row_ids.into_iter().collect())
+    }
+
+    fn scan_index_range(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
+        key_prefix: &[Value],
+        lower: Option<(CompareOp, &Value)>,
+        upper: Option<(CompareOp, &Value)>,
+    ) -> Result<Vec<RowId>> {
+        self.validate_transaction(transaction_id)?;
+        let (index, root_page_id) = self.index_meta_and_root(schema_name, index_name)?;
+        if key_prefix.len() >= index.columns.len() {
+            return Err(DbError::storage(format!(
+                "index {} has no range column after prefix of length {}",
+                index.name,
+                key_prefix.len()
+            )));
+        }
+
+        let pager = self.pager.borrow();
+        let tree = IndexTree::from_root(root_page_id);
+        let mut row_ids = BTreeSet::new();
+        for (encoded_key, encoded_row_ids) in tree.scan_all(&pager)? {
+            let decoded_key = decode_index_key(&encoded_key)?;
+            if !decoded_key.starts_with(key_prefix) {
+                continue;
+            }
+
+            let Some(candidate) = decoded_key.get(key_prefix.len()) else {
+                continue;
+            };
+            if matches_bounds(candidate, lower, upper) {
+                row_ids.extend(decode_row_ids(&encoded_row_ids)?);
+            }
+        }
+
+        Ok(row_ids.into_iter().collect())
+    }
+}
+
+fn matches_bounds(
+    candidate: &Value,
+    lower: Option<(CompareOp, &Value)>,
+    upper: Option<(CompareOp, &Value)>,
+) -> bool {
+    lower.is_none_or(|(op, value)| matches_compare(candidate, op, value))
+        && upper.is_none_or(|(op, value)| matches_compare(candidate, op, value))
+}
+
+fn matches_compare(left: &Value, op: CompareOp, right: &Value) -> bool {
+    match op {
+        CompareOp::Eq => left == right,
+        CompareOp::Ne => left != right,
+        CompareOp::Gt => compare_values(left, right) == Some(Ordering::Greater),
+        CompareOp::Gte => matches!(
+            compare_values(left, right),
+            Some(Ordering::Greater | Ordering::Equal)
+        ),
+        CompareOp::Lt => compare_values(left, right) == Some(Ordering::Less),
+        CompareOp::Lte => matches!(
+            compare_values(left, right),
+            Some(Ordering::Less | Ordering::Equal)
+        ),
+    }
+}
+
+fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
+    match (left, right) {
+        (Value::Null, Value::Null) => Some(Ordering::Equal),
+        (Value::Boolean(left), Value::Boolean(right)) => Some(left.cmp(right)),
+        (Value::Integer(left), Value::Integer(right)) => Some(left.cmp(right)),
+        (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
+        _ => None,
     }
 }

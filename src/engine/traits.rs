@@ -3,6 +3,7 @@
 use crate::common::error::Result;
 use crate::common::types::{IndexMeta, Row, RowId, Schema, Value};
 use crate::engine::txn::TransactionId;
+use crate::sql::ast::CompareOp;
 use crate::sql::planner::PlanningContext;
 
 pub trait CatalogStore {
@@ -61,6 +62,22 @@ pub trait IndexStore {
         schema_name: &str,
         index_name: &str,
         key: &[Value],
+    ) -> Result<Vec<RowId>>;
+    fn scan_index_prefix(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
+        key_prefix: &[Value],
+    ) -> Result<Vec<RowId>>;
+    fn scan_index_range(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
+        key_prefix: &[Value],
+        lower: Option<(CompareOp, &Value)>,
+        upper: Option<(CompareOp, &Value)>,
     ) -> Result<Vec<RowId>>;
 }
 

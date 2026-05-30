@@ -1,1 +1,40 @@
+# Rust build artifacts
 target/
+
+# Rust tooling / profiling outputs
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+
+# Local editor / IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS / system files
+.DS_Store
+Thumbs.db
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# Local planning/spec scratch files
+docs/superpowers/plans/
+docs/superpowers/specs/
+
+# Local database/runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.wal
+*.lock

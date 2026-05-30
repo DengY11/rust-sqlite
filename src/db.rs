@@ -78,7 +78,7 @@ impl<S: PlanningStorageEngine> Database<S> {
     pub(crate) fn classify_batch(statements: &[Statement]) -> StatementBatchKind {
         if statements
             .iter()
-            .all(|statement| matches!(statement, Statement::Select { .. }))
+            .all(|statement| matches!(statement, Statement::Select(_)))
         {
             StatementBatchKind::Query
         } else {
@@ -89,7 +89,7 @@ impl<S: PlanningStorageEngine> Database<S> {
     fn validate_execute_batch(&self, statements: &[Statement]) -> Result<()> {
         if statements
             .iter()
-            .any(|statement| matches!(statement, Statement::Select { .. }))
+            .any(|statement| matches!(statement, Statement::Select(_)))
         {
             return Err(DbError::sql("SELECT statements must use Database::query"));
         }

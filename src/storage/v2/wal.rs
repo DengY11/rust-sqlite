@@ -59,8 +59,8 @@ pub fn recover_frames(bytes: &[u8]) -> Result<Vec<WalFrame>> {
                     bytes[offset..offset + 4].try_into().unwrap(),
                 ));
                 offset += 4;
-                let page_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-                    as usize;
+                let page_len =
+                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
 
                 if bytes.len().saturating_sub(offset) < page_len {
@@ -92,10 +92,10 @@ pub fn recover_frames(bytes: &[u8]) -> Result<Vec<WalFrame>> {
                     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
 
-                if let Some(frames) = pending.remove(&txn_id) {
-                    if frames.len() == frame_count {
-                        committed.extend(frames);
-                    }
+                if let Some(frames) = pending.remove(&txn_id)
+                    && frames.len() == frame_count
+                {
+                    committed.extend(frames);
                 }
             }
             other => {

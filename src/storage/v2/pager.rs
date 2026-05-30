@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{DbError, Result};
 
-use super::page::{
-    MetaPage, PAGE_SIZE, PageId, PageKind, empty_page, encode_payload_page,
-};
+use super::page::{MetaPage, PAGE_SIZE, PageId, PageKind, empty_page, encode_payload_page};
 use super::wal::{recover_frames, write_commit, write_frame};
 
 #[derive(Debug)]
@@ -199,6 +197,7 @@ impl Pager {
 fn open_rw(path: &Path) -> Result<File> {
     Ok(OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)?)
@@ -256,7 +255,9 @@ mod tests {
         let mut pager = Pager::open(&path).unwrap();
         let txn = pager.begin().unwrap();
         let page_id = pager.allocate_page(txn).unwrap();
-        pager.write_page(txn, page_id, vec![9_u8; PAGE_SIZE]).unwrap();
+        pager
+            .write_page(txn, page_id, vec![9_u8; PAGE_SIZE])
+            .unwrap();
         pager.rollback(txn).unwrap();
 
         let reopened = Pager::open(&path).unwrap();
@@ -270,7 +271,9 @@ mod tests {
         let mut pager = Pager::open(&path).unwrap();
         let txn = pager.begin().unwrap();
         let page_id = pager.allocate_page(txn).unwrap();
-        pager.write_page(txn, page_id, vec![5_u8; PAGE_SIZE]).unwrap();
+        pager
+            .write_page(txn, page_id, vec![5_u8; PAGE_SIZE])
+            .unwrap();
         pager.commit(txn).unwrap();
 
         let reopened = Pager::open(&path).unwrap();

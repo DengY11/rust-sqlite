@@ -75,3 +75,51 @@ impl From<serde_json::Error> for DbError {
         Self::Serde(value.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::io;
+
+    use super::DbError;
+
+    #[test]
+    fn constructors_and_display_prefixes_match_error_kind() {
+        assert_eq!(
+            DbError::sql("bad query").to_string(),
+            "sql error: bad query"
+        );
+        assert_eq!(
+            DbError::plan("bad plan").to_string(),
+            "plan error: bad plan"
+        );
+        assert_eq!(
+            DbError::storage("bad storage").to_string(),
+            "storage error: bad storage"
+        );
+        assert_eq!(
+            DbError::txn("bad txn").to_string(),
+            "transaction error: bad txn"
+        );
+        assert_eq!(
+            DbError::serde("bad serde").to_string(),
+            "serde error: bad serde"
+        );
+    }
+
+    #[test]
+    fn io_errors_preserve_source() {
+        let io_error = io::Error::other("disk failure");
+        let error = DbError::from(io_error);
+        assert!(error.source().is_some());
+        assert!(error.to_string().contains("io error: disk failure"));
+    }
+
+    #[test]
+    fn serde_json_errors_convert_into_serde_variant() {
+        let error = serde_json::from_str::<Vec<i32>>("not-json").unwrap_err();
+        let db_error = DbError::from(error);
+        assert!(matches!(db_error, DbError::Serde(_)));
+        assert!(db_error.to_string().starts_with("serde error:"));
+    }
+}
