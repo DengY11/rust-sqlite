@@ -6,7 +6,8 @@ use crate::common::error::{DbError, Result};
 use crate::common::types::{IndexMeta, Row, RowId, Schema, Value};
 use crate::engine::{PlanningStorageEngine, TransactionId};
 use crate::sql::ast::{
-    AggregateArg, AggregateFunc, CompareOp, Expr, JoinKind, OrderBy, SelectItem, Statement,
+    AggregateArg, AggregateFunc, CompareOp, Expr, JoinKind, OrderBy, OrderByExpr, SelectItem,
+    Statement,
 };
 use crate::sql::plan::{IndexScanSpec, JoinPlan, Plan};
 use crate::sql::planner::Planner;
@@ -28,8 +29,11 @@ struct RowSet {
 #[derive(Debug, Clone)]
 enum AggregateState {
     Count(i64),
+    CountDistinct(BTreeSet<Value>),
     Sum { sum: i128, seen: bool },
+    SumDistinct(BTreeSet<Value>),
     Avg { sum: i128, count: i64 },
+    AvgDistinct(BTreeSet<Value>),
     Min(Option<Value>),
     Max(Option<Value>),
 }
@@ -130,6 +134,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         unique: false,
                     },
                 )?;
+                Ok(Vec::new())
+            }
+            Plan::DropTable { name } => {
+                self.storage.drop_schema(transaction_id, &name)?;
+                Ok(Vec::new())
+            }
+            Plan::DropIndex { table, name } => {
+                self.storage.drop_index(transaction_id, &table, &name)?;
                 Ok(Vec::new())
             }
             Plan::Insert { table, values } => {
@@ -590,15 +602,24 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         columns
             .iter()
             .filter_map(|item| match item {
-                SelectItem::Aggregate { func, .. } => Some(match func {
-                    AggregateFunc::Count => AggregateState::Count(0),
-                    AggregateFunc::Sum => AggregateState::Sum {
+                SelectItem::Aggregate { func, arg, .. } => Some(match (func, arg) {
+                    (AggregateFunc::Count, AggregateArg::Column { distinct: true, .. }) => {
+                        AggregateState::CountDistinct(BTreeSet::new())
+                    }
+                    (AggregateFunc::Count, _) => AggregateState::Count(0),
+                    (AggregateFunc::Sum, AggregateArg::Column { distinct: true, .. }) => {
+                        AggregateState::SumDistinct(BTreeSet::new())
+                    }
+                    (AggregateFunc::Sum, _) => AggregateState::Sum {
                         sum: 0,
                         seen: false,
                     },
-                    AggregateFunc::Avg => AggregateState::Avg { sum: 0, count: 0 },
-                    AggregateFunc::Min => AggregateState::Min(None),
-                    AggregateFunc::Max => AggregateState::Max(None),
+                    (AggregateFunc::Avg, AggregateArg::Column { distinct: true, .. }) => {
+                        AggregateState::AvgDistinct(BTreeSet::new())
+                    }
+                    (AggregateFunc::Avg, _) => AggregateState::Avg { sum: 0, count: 0 },
+                    (AggregateFunc::Min, _) => AggregateState::Min(None),
+                    (AggregateFunc::Max, _) => AggregateState::Max(None),
                 }),
                 _ => None,
             })
@@ -625,15 +646,25 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 (
                     AggregateState::Count(count),
                     AggregateFunc::Count,
-                    AggregateArg::Column(column),
+                    AggregateArg::Column { name: column, .. },
                 ) if self.lookup_value(&source.columns, row, column)? != &Value::Null => {
                     *count += 1;
                 }
-                (AggregateState::Count(_), AggregateFunc::Count, AggregateArg::Column(_)) => {}
+                (
+                    AggregateState::CountDistinct(values),
+                    AggregateFunc::Count,
+                    AggregateArg::Column { name: column, .. },
+                ) => {
+                    let value = self.lookup_value(&source.columns, row, column)?;
+                    if value != &Value::Null {
+                        values.insert(value.clone());
+                    }
+                }
+                (AggregateState::Count(_), AggregateFunc::Count, AggregateArg::Column { .. }) => {}
                 (
                     AggregateState::Sum { sum, seen },
                     AggregateFunc::Sum,
-                    AggregateArg::Column(column),
+                    AggregateArg::Column { name: column, .. },
                 ) => {
                     if let Value::Integer(value) =
                         self.lookup_value(&source.columns, row, column)?
@@ -643,9 +674,19 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     }
                 }
                 (
+                    AggregateState::SumDistinct(values),
+                    AggregateFunc::Sum,
+                    AggregateArg::Column { name: column, .. },
+                ) => {
+                    let value = self.lookup_value(&source.columns, row, column)?;
+                    if matches!(value, Value::Integer(_)) {
+                        values.insert(value.clone());
+                    }
+                }
+                (
                     AggregateState::Avg { sum, count },
                     AggregateFunc::Avg,
-                    AggregateArg::Column(column),
+                    AggregateArg::Column { name: column, .. },
                 ) => {
                     if let Value::Integer(value) =
                         self.lookup_value(&source.columns, row, column)?
@@ -655,9 +696,19 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     }
                 }
                 (
+                    AggregateState::AvgDistinct(values),
+                    AggregateFunc::Avg,
+                    AggregateArg::Column { name: column, .. },
+                ) => {
+                    let value = self.lookup_value(&source.columns, row, column)?;
+                    if matches!(value, Value::Integer(_)) {
+                        values.insert(value.clone());
+                    }
+                }
+                (
                     AggregateState::Min(current),
                     AggregateFunc::Min,
-                    AggregateArg::Column(column),
+                    AggregateArg::Column { name: column, .. },
                 ) => {
                     let value = self.lookup_value(&source.columns, row, column)?;
                     if value != &Value::Null {
@@ -675,7 +726,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 (
                     AggregateState::Max(current),
                     AggregateFunc::Max,
-                    AggregateArg::Column(column),
+                    AggregateArg::Column { name: column, .. },
                 ) => {
                     let value = self.lookup_value(&source.columns, row, column)?;
                     if value != &Value::Null {
@@ -731,6 +782,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     fn aggregate_state_value(&self, state: &AggregateState) -> Result<Value> {
         Ok(match state {
             AggregateState::Count(count) => Value::Integer(*count),
+            AggregateState::CountDistinct(values) => Value::Integer(
+                i64::try_from(values.len()).map_err(|_| DbError::plan("COUNT overflowed i64"))?,
+            ),
             AggregateState::Sum { sum, seen } => {
                 if *seen {
                     Value::Integer(
@@ -740,12 +794,41 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     Value::Null
                 }
             }
+            AggregateState::SumDistinct(values) => {
+                if values.is_empty() {
+                    Value::Null
+                } else {
+                    let sum = values.iter().try_fold(0_i128, |sum, value| match value {
+                        Value::Integer(value) => Ok(sum + i128::from(*value)),
+                        _ => Err(DbError::plan("SUM only supports INTEGER columns")),
+                    })?;
+                    Value::Integer(
+                        i64::try_from(sum).map_err(|_| DbError::plan("SUM overflowed i64"))?,
+                    )
+                }
+            }
             AggregateState::Avg { sum, count } => {
                 if *count == 0 {
                     Value::Null
                 } else {
                     Value::Integer(
                         i64::try_from(*sum / i128::from(*count))
+                            .map_err(|_| DbError::plan("AVG overflowed i64"))?,
+                    )
+                }
+            }
+            AggregateState::AvgDistinct(values) => {
+                if values.is_empty() {
+                    Value::Null
+                } else {
+                    let sum = values.iter().try_fold(0_i128, |sum, value| match value {
+                        Value::Integer(value) => Ok(sum + i128::from(*value)),
+                        _ => Err(DbError::plan("AVG only supports INTEGER columns")),
+                    })?;
+                    let count = i128::try_from(values.len())
+                        .map_err(|_| DbError::plan("AVG overflowed i64"))?;
+                    Value::Integer(
+                        i64::try_from(sum / count)
                             .map_err(|_| DbError::plan("AVG overflowed i64"))?,
                     )
                 }
@@ -822,14 +905,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 left_projected,
                 full_columns,
                 left_full,
-                &item.column,
+                &item.expr,
             );
             let right_value = self.resolve_order_value(
                 projected_columns,
                 right_projected,
                 full_columns,
                 right_full,
-                &item.column,
+                &item.expr,
             );
             let ordering = match (left_value, right_value) {
                 (Some(left), Some(right)) => self
@@ -858,16 +941,41 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     ) -> Ordering {
         for item in order_by {
             let mut ordering = Ordering::Equal;
+            if let OrderByExpr::Position(position) = item.expr {
+                let index = position.saturating_sub(1);
+                ordering = match (left.get(index), right.get(index)) {
+                    (Some(left), Some(right)) => self
+                        .compare(left, right)
+                        .unwrap_or(None)
+                        .unwrap_or(Ordering::Equal),
+                    _ => Ordering::Equal,
+                };
+                if ordering != Ordering::Equal {
+                    return if item.descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                }
+                continue;
+            }
+            let OrderByExpr::Column(order_column) = &item.expr else {
+                unreachable!();
+            };
             for (index, select_item) in columns.iter().enumerate() {
                 let output_name = self.output_name(select_item);
                 let matches = match select_item {
-                    SelectItem::Column(name) => name == &item.column || output_name == item.column,
+                    SelectItem::Column(name) => {
+                        name == order_column || output_name == *order_column
+                    }
                     SelectItem::AliasedColumn { name, alias } => {
-                        name == &item.column || alias == &item.column || output_name == item.column
+                        name == order_column
+                            || alias == order_column
+                            || output_name == *order_column
                     }
                     SelectItem::Aggregate { alias, .. } => {
-                        alias.as_ref().is_some_and(|alias| alias == &item.column)
-                            || output_name == item.column
+                        alias.as_ref().is_some_and(|alias| alias == order_column)
+                            || output_name == *order_column
                     }
                     SelectItem::Wildcard => false,
                 };
@@ -975,10 +1083,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         projected: &'b Row,
         full_columns: &[ColumnMeta],
         full: &'b Row,
-        column: &str,
+        expr: &OrderByExpr,
     ) -> Option<&'b Value> {
-        self.try_lookup_value(projected_columns, projected, column)
-            .or_else(|| self.try_lookup_value(full_columns, full, column))
+        match expr {
+            OrderByExpr::Column(column) => self
+                .try_lookup_value(projected_columns, projected, column)
+                .or_else(|| self.try_lookup_value(full_columns, full, column)),
+            OrderByExpr::Position(position) => projected.get(position.saturating_sub(1)),
+        }
     }
 
     fn matches_filter(
@@ -1020,6 +1132,33 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 let left = self.lookup_value(&rowset.columns, row, column)?;
                 let right = self.scalar_subquery_value(transaction_id, query)?;
                 self.compare_with_operator(left, op, &right)
+            }
+            Expr::Like {
+                column,
+                pattern,
+                negated,
+            } => {
+                let Value::Text(value) = self.lookup_value(&rowset.columns, row, column)? else {
+                    return Ok(false);
+                };
+                Ok(Self::matches_like_pattern(value, pattern) ^ *negated)
+            }
+            Expr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => {
+                let value = self.lookup_value(&rowset.columns, row, column)?;
+                let Some(low_cmp) = self.compare(value, low)? else {
+                    return Ok(false);
+                };
+                let Some(high_cmp) = self.compare(value, high)? else {
+                    return Ok(false);
+                };
+                let matches = matches!(low_cmp, Ordering::Greater | Ordering::Equal)
+                    && matches!(high_cmp, Ordering::Less | Ordering::Equal);
+                Ok(matches ^ *negated)
             }
             Expr::Not(expr) => {
                 Ok(!self.matches_filter(transaction_id, rowset, row, Some(expr.as_ref()))?)
@@ -1158,6 +1297,28 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         Ok(ordering)
     }
 
+    fn matches_like_pattern(value: &str, pattern: &str) -> bool {
+        let value = value.chars().collect::<Vec<_>>();
+        let pattern = pattern.chars().collect::<Vec<_>>();
+        let mut dp = vec![vec![false; pattern.len() + 1]; value.len() + 1];
+        dp[0][0] = true;
+        for pattern_index in 1..=pattern.len() {
+            if pattern[pattern_index - 1] == '%' {
+                dp[0][pattern_index] = dp[0][pattern_index - 1];
+            }
+        }
+        for value_index in 1..=value.len() {
+            for pattern_index in 1..=pattern.len() {
+                dp[value_index][pattern_index] = match pattern[pattern_index - 1] {
+                    '%' => dp[value_index][pattern_index - 1] || dp[value_index - 1][pattern_index],
+                    '_' => dp[value_index - 1][pattern_index - 1],
+                    ch => dp[value_index - 1][pattern_index - 1] && value[value_index - 1] == ch,
+                };
+            }
+        }
+        dp[value.len()][pattern.len()]
+    }
+
     fn output_name(&self, item: &SelectItem) -> String {
         match item {
             SelectItem::Wildcard => "*".to_string(),
@@ -1175,7 +1336,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     },
                     match arg {
                         AggregateArg::Wildcard => "*".to_string(),
-                        AggregateArg::Column(name) => name.clone(),
+                        AggregateArg::Column { name, distinct } => {
+                            if *distinct {
+                                format!("DISTINCT {name}")
+                            } else {
+                                name.clone()
+                            }
+                        }
                     }
                 )
             }),

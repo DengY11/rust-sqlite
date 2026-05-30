@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::common::error::{DbError, Result};
 use crate::common::types::{IndexMeta, Schema, Value};
 use crate::sql::ast::{
-    AggregateArg, AggregateFunc, Assignment, CompareOp, Expr, OrderBy, SelectItem, SelectStatement,
-    Statement,
+    AggregateArg, AggregateFunc, Assignment, CompareOp, Expr, OrderBy, OrderByExpr, SelectItem,
+    SelectStatement, Statement,
 };
 use crate::sql::plan::{IndexBound, IndexRange, IndexScanSpec, JoinPlan, Plan};
 
@@ -80,6 +80,17 @@ impl Planner {
                     columns: columns.clone(),
                 })
             }
+            Statement::DropTable { name } => {
+                self.require_schema(context, name)?;
+                Ok(Plan::DropTable { name: name.clone() })
+            }
+            Statement::DropIndex { name } => {
+                let table = self.resolve_index_table(context, name)?;
+                Ok(Plan::DropIndex {
+                    table,
+                    name: name.clone(),
+                })
+            }
             Statement::Insert {
                 table,
                 columns,
@@ -116,6 +127,21 @@ impl Planner {
             table: table.to_string(),
             values: row,
         })
+    }
+
+    fn resolve_index_table(&self, context: &PlanningContext, index_name: &str) -> Result<String> {
+        let matches = context
+            .indexes
+            .iter()
+            .filter(|(_, indexes)| indexes.iter().any(|index| index.name == index_name))
+            .map(|(table, _)| table.clone())
+            .collect::<Vec<_>>();
+
+        match matches.as_slice() {
+            [table] => Ok(table.clone()),
+            [] => Err(DbError::plan(format!("unknown index: {index_name}"))),
+            _ => Err(DbError::plan(format!("ambiguous index name: {index_name}"))),
+        }
     }
 
     fn plan_delete(
@@ -471,9 +497,10 @@ impl Planner {
                 func: *func,
                 arg: match arg {
                     AggregateArg::Wildcard => AggregateArg::Wildcard,
-                    AggregateArg::Column(name) => AggregateArg::Column(
-                        self.normalize_column_reference(schema, table, table_alias, name)?,
-                    ),
+                    AggregateArg::Column { name, distinct } => AggregateArg::Column {
+                        name: self.normalize_column_reference(schema, table, table_alias, name)?,
+                        distinct: *distinct,
+                    },
                 },
                 alias: alias.clone(),
             },
@@ -488,15 +515,23 @@ impl Planner {
         columns: &[SelectItem],
         item: &OrderBy,
     ) -> Result<OrderBy> {
+        let OrderByExpr::Column(column) = &item.expr else {
+            return Ok(item.clone());
+        };
         if self
             .select_aliases(columns)
             .iter()
-            .any(|alias| alias == &item.column)
+            .any(|alias| alias == column)
         {
             return Ok(item.clone());
         }
         Ok(OrderBy {
-            column: self.normalize_column_reference(schema, table, table_alias, &item.column)?,
+            expr: OrderByExpr::Column(self.normalize_column_reference(
+                schema,
+                table,
+                table_alias,
+                column,
+            )?),
             descending: item.descending,
         })
     }
@@ -549,6 +584,26 @@ impl Planner {
                 column: self.normalize_column_reference(schema, table, table_alias, column)?,
                 op: *op,
                 query: query.clone(),
+            },
+            Expr::Like {
+                column,
+                pattern,
+                negated,
+            } => Expr::Like {
+                column: self.normalize_column_reference(schema, table, table_alias, column)?,
+                pattern: pattern.clone(),
+                negated: *negated,
+            },
+            Expr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                column: self.normalize_column_reference(schema, table, table_alias, column)?,
+                low: low.clone(),
+                high: high.clone(),
+                negated: *negated,
             },
             Expr::Not(expr) => Expr::Not(Box::new(self.normalize_expr(
                 schema,
@@ -606,7 +661,7 @@ impl Planner {
                         ))
                     }
                 }
-                AggregateArg::Column(name) => self.require_column(schema, name),
+                AggregateArg::Column { name, .. } => self.require_column(schema, name),
             },
         }
     }
@@ -686,7 +741,7 @@ impl Planner {
                 }
                 SelectItem::Aggregate { func, arg, .. } => {
                     if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg)
-                        && matches!(arg, AggregateArg::Column(column) if !schema.columns.iter().any(|entry| entry.name == *column && matches!(entry.column_type, crate::common::types::ColumnType::Integer)))
+                        && matches!(arg, AggregateArg::Column { name: column, .. } if !schema.columns.iter().any(|entry| entry.name == *column && matches!(entry.column_type, crate::common::types::ColumnType::Integer)))
                     {
                         return Err(DbError::plan(format!(
                             "{} only supports INTEGER columns",
@@ -721,7 +776,9 @@ impl Planner {
             }
             Expr::CompareColumns { .. }
             | Expr::InSubquery { .. }
-            | Expr::CompareSubquery { .. } => false,
+            | Expr::CompareSubquery { .. }
+            | Expr::Like { .. }
+            | Expr::Between { .. } => false,
         }
     }
 
@@ -762,7 +819,9 @@ impl Planner {
                         ))
                     }
                 }
-                AggregateArg::Column(name) => self.resolve_column_in_scope(scope, name).map(|_| ()),
+                AggregateArg::Column { name, .. } => {
+                    self.resolve_column_in_scope(scope, name).map(|_| ())
+                }
             },
         }
     }
@@ -773,15 +832,17 @@ impl Planner {
         columns: &[SelectItem],
         item: &OrderBy,
     ) -> Result<()> {
+        let OrderByExpr::Column(column) = &item.expr else {
+            return Ok(());
+        };
         if self
             .select_aliases(columns)
             .iter()
-            .any(|alias| alias == &item.column)
+            .any(|alias| alias == column)
         {
             return Ok(());
         }
-        self.resolve_column_in_scope(scope, &item.column)
-            .map(|_| ())
+        self.resolve_column_in_scope(scope, column).map(|_| ())
     }
 
     fn require_scope_columns(&self, scope: &QueryScope, filter: &Expr) -> Result<()> {
@@ -789,7 +850,9 @@ impl Planner {
             Expr::Compare { column, .. }
             | Expr::IsNull { column, .. }
             | Expr::InSubquery { column, .. }
-            | Expr::CompareSubquery { column, .. } => {
+            | Expr::CompareSubquery { column, .. }
+            | Expr::Like { column, .. }
+            | Expr::Between { column, .. } => {
                 self.resolve_column_in_scope(scope, column).map(|_| ())
             }
             Expr::CompareColumns { left, right, .. } => {
@@ -814,7 +877,11 @@ impl Planner {
                 self.validate_subqueries(left, context)?;
                 self.validate_subqueries(right, context)
             }
-            Expr::Compare { .. } | Expr::CompareColumns { .. } | Expr::IsNull { .. } => Ok(()),
+            Expr::Compare { .. }
+            | Expr::CompareColumns { .. }
+            | Expr::IsNull { .. }
+            | Expr::Like { .. }
+            | Expr::Between { .. } => Ok(()),
         }
     }
 
@@ -976,7 +1043,9 @@ impl Planner {
             }
             Expr::CompareColumns { .. }
             | Expr::InSubquery { .. }
-            | Expr::CompareSubquery { .. } => false,
+            | Expr::CompareSubquery { .. }
+            | Expr::Like { .. }
+            | Expr::Between { .. } => false,
             Expr::IsNull { .. } => true,
             Expr::Not(_) => false,
             Expr::Or(_, _) => false,
@@ -1070,9 +1139,10 @@ impl Planner {
                 self.require_column(schema, right)
             }
             Expr::IsNull { column, .. } => self.require_column(schema, column),
-            Expr::InSubquery { column, .. } | Expr::CompareSubquery { column, .. } => {
-                self.require_column(schema, column)
-            }
+            Expr::InSubquery { column, .. }
+            | Expr::CompareSubquery { column, .. }
+            | Expr::Like { column, .. }
+            | Expr::Between { column, .. } => self.require_column(schema, column),
             Expr::Not(expr) => self.require_filter_columns(schema, expr),
             Expr::And(left, right) | Expr::Or(left, right) => {
                 self.require_filter_columns(schema, left)?;

@@ -36,8 +36,14 @@ pub struct Assignment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderBy {
-    pub column: String,
+    pub expr: OrderByExpr,
     pub descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderByExpr {
+    Column(String),
+    Position(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +58,7 @@ pub enum AggregateFunc {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArg {
     Wildcard,
-    Column(String),
+    Column { name: String, distinct: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +71,12 @@ pub enum Statement {
         name: String,
         table: String,
         columns: Vec<String>,
+    },
+    DropTable {
+        name: String,
+    },
+    DropIndex {
+        name: String,
     },
     Insert {
         table: String,
@@ -128,6 +140,17 @@ pub enum Expr {
         column: String,
         op: CompareOp,
         query: Box<SelectStatement>,
+    },
+    Like {
+        column: String,
+        pattern: String,
+        negated: bool,
+    },
+    Between {
+        column: String,
+        low: Value,
+        high: Value,
+        negated: bool,
     },
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),

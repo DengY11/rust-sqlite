@@ -1,3 +1,6 @@
+use std::io::Write;
+use std::process::{Command, Stdio};
+
 use rustsql::common::types::Value;
 use rustsql::db::Database;
 use tempfile::tempdir;
@@ -143,6 +146,99 @@ fn database_open_runs_persistent_sql_pipeline_across_reopen() {
             .unwrap(),
         Vec::<Vec<Value>>::new()
     );
+}
+
+#[test]
+fn binary_repl_uses_database_path_for_persistent_file_mode() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cli.db");
+
+    run_rustsql_binary(
+        &path,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n\
+         INSERT INTO users VALUES (1, 'alice');\n\
+         .quit\n",
+    );
+
+    let output = run_rustsql_binary(&path, "SELECT id, name FROM users;\n.quit\n");
+    assert!(output.contains("id | name"));
+    assert!(output.contains("1 | alice"));
+}
+
+#[test]
+fn binary_repl_can_select_experimental_v2_storage_engine() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cli-v2.db");
+
+    run_rustsql_binary_with_args(
+        &["--engine", "v2", path.to_str().unwrap()],
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n\
+         CREATE INDEX idx_users_name ON users (name);\n\
+         INSERT INTO users VALUES (1, 'alice');\n\
+         .quit\n",
+    );
+
+    let output = run_rustsql_binary_with_args(
+        &["--engine", "v2", path.to_str().unwrap()],
+        "SELECT id, name FROM users WHERE name = 'alice';\n.schema\n.quit\n",
+    );
+    assert!(output.contains("id | name"));
+    assert!(output.contains("1 | alice"));
+    assert!(output.contains("CREATE INDEX idx_users_name ON users (name);"));
+}
+
+#[test]
+fn database_supports_drop_index_and_drop_table() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE INDEX idx_users_name ON users (name);
+         INSERT INTO users VALUES (1, 'alice');",
+    )
+    .unwrap();
+
+    db.execute("DROP INDEX idx_users_name;").unwrap();
+    assert_eq!(db.list_indexes("users").unwrap(), Vec::new());
+    assert_eq!(
+        db.query("SELECT id FROM users WHERE name = 'alice';")
+            .unwrap(),
+        vec![vec![Value::Integer(1)]]
+    );
+
+    db.execute("DROP TABLE users;").unwrap();
+    assert_eq!(db.list_schemas().unwrap(), Vec::new());
+    let error = db.query("SELECT * FROM users;").unwrap_err();
+    assert!(error.to_string().contains("unknown table: users"));
+}
+
+fn run_rustsql_binary(path: &std::path::Path, input: &str) -> String {
+    run_rustsql_binary_with_args(&[path.to_str().unwrap()], input)
+}
+
+fn run_rustsql_binary_with_args(args: &[&str], input: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustsql"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "rustsql failed with stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
 }
 
 #[test]
@@ -363,4 +459,56 @@ fn database_supports_having_left_join_and_distinct() {
             vec![Value::Integer(3)],
         ]
     );
+}
+
+#[test]
+fn database_supports_common_sql_predicates_order_positions_and_distinct_aggregates() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, active BOOLEAN);
+         INSERT INTO users VALUES (1, 'alice', 30, true);
+         INSERT INTO users VALUES (2, 'alicia', 24, true);
+         INSERT INTO users VALUES (3, 'bob', 19, false);
+         INSERT INTO users VALUES (4, 'carol', 41, true);
+         INSERT INTO users VALUES (5, 'dave', NULL, false);",
+    )
+    .unwrap();
+
+    let like_rows = db
+        .query("SELECT name FROM users WHERE name LIKE 'ali%' ORDER BY 1 ASC;")
+        .unwrap();
+    assert_eq!(
+        like_rows,
+        vec![vec![Value::from("alice")], vec![Value::from("alicia")]]
+    );
+
+    let not_like_rows = db
+        .query("SELECT name FROM users WHERE name NOT LIKE '%a%' ORDER BY name ASC;")
+        .unwrap();
+    assert_eq!(not_like_rows, vec![vec![Value::from("bob")]]);
+
+    let between_rows = db
+        .query("SELECT name, age FROM users WHERE age BETWEEN 20 AND 40 ORDER BY 2 DESC;")
+        .unwrap();
+    assert_eq!(
+        between_rows,
+        vec![
+            vec![Value::from("alice"), Value::Integer(30)],
+            vec![Value::from("alicia"), Value::Integer(24)],
+        ]
+    );
+
+    let not_between_rows = db
+        .query("SELECT name FROM users WHERE age NOT BETWEEN 20 AND 40 ORDER BY 1 ASC;")
+        .unwrap();
+    assert_eq!(
+        not_between_rows,
+        vec![vec![Value::from("bob")], vec![Value::from("carol")]]
+    );
+
+    let distinct_count = db
+        .query("SELECT COUNT(DISTINCT active) AS active_values FROM users;")
+        .unwrap();
+    assert_eq!(distinct_count, vec![vec![Value::Integer(2)]]);
 }

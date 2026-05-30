@@ -9,6 +9,7 @@ pub struct Token {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
     Create,
+    Drop,
     Table,
     Index,
     On,
@@ -35,6 +36,8 @@ pub enum TokenKind {
     Desc,
     And,
     Or,
+    Like,
+    Between,
     Begin,
     Commit,
     Rollback,
@@ -237,6 +240,7 @@ impl<'a> Lexer<'a> {
         let text = &self.input[start..self.offset];
         match text.to_ascii_uppercase().as_str() {
             "CREATE" => TokenKind::Create,
+            "DROP" => TokenKind::Drop,
             "TABLE" => TokenKind::Table,
             "INDEX" => TokenKind::Index,
             "ON" => TokenKind::On,
@@ -263,6 +267,8 @@ impl<'a> Lexer<'a> {
             "DESC" => TokenKind::Desc,
             "AND" => TokenKind::And,
             "OR" => TokenKind::Or,
+            "LIKE" => TokenKind::Like,
+            "BETWEEN" => TokenKind::Between,
             "BEGIN" => TokenKind::Begin,
             "COMMIT" => TokenKind::Commit,
             "ROLLBACK" => TokenKind::Rollback,

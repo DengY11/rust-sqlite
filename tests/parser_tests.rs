@@ -1,7 +1,7 @@
 use rustsql::common::types::{ColumnDef, ColumnType, Value};
 use rustsql::sql::ast::{
     AggregateArg, AggregateFunc, Assignment, CompareOp, Expr, JoinClause, JoinKind, OrderBy,
-    SelectItem, SelectStatement, Statement,
+    OrderByExpr, SelectItem, SelectStatement, Statement,
 };
 use rustsql::sql::lexer::{TokenKind, lex};
 use rustsql::sql::parser::parse_sql;
@@ -101,6 +101,23 @@ fn parses_three_column_create_index_statement() {
             table: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
         }]
+    );
+}
+
+#[test]
+fn parses_drop_table_and_drop_index_statements() {
+    let statements = parse_sql("DROP INDEX idx_users_name; DROP TABLE users;").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![
+            Statement::DropIndex {
+                name: "idx_users_name".to_string(),
+            },
+            Statement::DropTable {
+                name: "users".to_string(),
+            },
+        ]
     );
 }
 
@@ -225,11 +242,11 @@ fn parses_delete_update_order_by_limit_and_aliases() {
                 group_by: vec![],
                 order_by: vec![
                     OrderBy {
-                        column: "username".to_string(),
+                        expr: OrderByExpr::Column("username".to_string()),
                         descending: true,
                     },
                     OrderBy {
-                        column: "u.id".to_string(),
+                        expr: OrderByExpr::Column("u.id".to_string()),
                         descending: false,
                     },
                 ],
@@ -663,7 +680,7 @@ fn parses_group_by_join_and_subquery_forms() {
                 group_by: vec!["active".to_string()],
                 having: None,
                 order_by: vec![OrderBy {
-                    column: "total".to_string(),
+                    expr: OrderByExpr::Column("total".to_string()),
                     descending: true,
                 }],
                 limit: None,
@@ -694,7 +711,7 @@ fn parses_group_by_join_and_subquery_forms() {
                 group_by: vec![],
                 having: None,
                 order_by: vec![OrderBy {
-                    column: "u.name".to_string(),
+                    expr: OrderByExpr::Column("u.name".to_string()),
                     descending: false,
                 }],
                 limit: None,

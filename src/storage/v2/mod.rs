@@ -296,6 +296,20 @@ impl CatalogStore for FileStorage {
         Ok(())
     }
 
+    fn drop_schema(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
+        self.validate_transaction(transaction_id)?;
+
+        let mut catalog = self.catalog.borrow_mut();
+        if catalog.schemas.remove(name).is_none() {
+            return Err(DbError::storage(format!("unknown table: {name}")));
+        }
+        catalog.table_roots.remove(name);
+        catalog.indexes.remove(name);
+        catalog.index_roots.remove(name);
+        catalog.next_row_ids.remove(name);
+        Ok(())
+    }
+
     fn get_schema(&self, transaction_id: TransactionId, name: &str) -> Result<Option<Schema>> {
         self.validate_transaction(transaction_id)?;
         Ok(self.catalog.borrow().schemas.get(name).cloned())
@@ -537,6 +551,30 @@ impl IndexStore for FileStorage {
                 .insert(index.name.clone(), tree.root_page_id());
         }
 
+        Ok(())
+    }
+
+    fn drop_index(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
+    ) -> Result<()> {
+        self.validate_transaction(transaction_id)?;
+
+        let mut catalog = self.catalog.borrow_mut();
+        let removed = catalog
+            .indexes
+            .get_mut(schema_name)
+            .and_then(|indexes| indexes.remove(index_name));
+        if removed.is_none() {
+            return Err(DbError::storage(format!(
+                "unknown index {index_name} on table {schema_name}"
+            )));
+        }
+        if let Some(roots) = catalog.index_roots.get_mut(schema_name) {
+            roots.remove(index_name);
+        }
         Ok(())
     }
 

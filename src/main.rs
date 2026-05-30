@@ -1,5 +1,5 @@
 fn main() -> rustsql::common::error::Result<()> {
-    rustsql::repl::run_memory_repl()
+    rustsql::repl::run_from_args(std::env::args_os())
 }
 
 #[cfg(test)]

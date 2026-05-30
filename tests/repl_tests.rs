@@ -39,6 +39,32 @@ fn repl_runs_basic_commands_and_quits() {
 }
 
 #[test]
+fn repl_accepts_multiline_sql_until_statement_terminator() {
+    let db = Database::memory();
+    let input = Cursor::new(
+        "CREATE TABLE users (\n\
+             id INTEGER PRIMARY KEY,\n\
+             name TEXT NOT NULL\n\
+         );\n\
+         INSERT INTO users VALUES (1, 'alice');\n\
+         SELECT id,\n\
+                name\n\
+         FROM users;\n\
+         .quit\n",
+    );
+    let mut output = Vec::new();
+
+    run_with_io(&db, input, &mut output).unwrap();
+
+    let rendered = String::from_utf8(output).unwrap();
+    assert!(rendered.contains("...> "));
+    assert_eq!(rendered.matches("ok").count(), 2);
+    assert!(rendered.contains("id | name"));
+    assert!(rendered.contains("1 | alice"));
+    assert!(!rendered.contains("sql error:"));
+}
+
+#[test]
 fn repl_ignores_empty_lines_and_reprompts() {
     let db = Database::memory();
     let input = Cursor::new("\n.quit\n");
@@ -61,6 +87,44 @@ fn repl_exit_command_quits() {
 
     let rendered = String::from_utf8(output).unwrap();
     assert_eq!(rendered.matches("rustsql> ").count(), 1);
+}
+
+#[test]
+fn repl_prints_help_tables_and_schema_meta_commands() {
+    let db = Database::memory();
+    let input = Cursor::new(
+        ".help\n\
+         CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n\
+         CREATE INDEX idx_users_name ON users (name);\n\
+         .tables\n\
+         .schema\n\
+         .quit\n",
+    );
+    let mut output = Vec::new();
+
+    run_with_io(&db, input, &mut output).unwrap();
+
+    let rendered = String::from_utf8(output).unwrap();
+    assert!(rendered.contains(".help      Show this help message"));
+    assert!(rendered.contains(".tables    List tables"));
+    assert!(rendered.contains("users"));
+    assert!(rendered.contains("CREATE TABLE users"));
+    assert!(rendered.contains("id INTEGER PRIMARY KEY"));
+    assert!(rendered.contains("name TEXT NOT NULL"));
+    assert!(rendered.contains("CREATE INDEX idx_users_name ON users (name);"));
+}
+
+#[test]
+fn repl_reports_no_tables_for_empty_database() {
+    let db = Database::memory();
+    let input = Cursor::new(".tables\n.schema\n.quit\n");
+    let mut output = Vec::new();
+
+    run_with_io(&db, input, &mut output).unwrap();
+
+    let rendered = String::from_utf8(output).unwrap();
+    assert!(rendered.contains("(no tables)"));
+    assert!(rendered.contains("(no schema)"));
 }
 
 #[test]

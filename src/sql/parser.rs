@@ -2,7 +2,7 @@ use crate::common::error::{DbError, Result};
 use crate::common::types::{ColumnDef, ColumnType, Value};
 use crate::sql::ast::{
     AggregateArg, AggregateFunc, Assignment, CompareOp, Expr, JoinClause, JoinKind, OrderBy,
-    SelectItem, SelectStatement, Statement,
+    OrderByExpr, SelectItem, SelectStatement, Statement,
 };
 use crate::sql::lexer::{Token, TokenKind, lex};
 
@@ -46,6 +46,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.peek_kind() {
             TokenKind::Create => self.parse_create(),
+            TokenKind::Drop => self.parse_drop(),
             TokenKind::Insert => self.parse_insert(),
             TokenKind::Select => Ok(Statement::Select(self.parse_select_statement()?)),
             TokenKind::Delete => self.parse_delete(),
@@ -109,6 +110,27 @@ impl Parser {
             table,
             columns,
         })
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Drop)?;
+        match self.peek_kind() {
+            TokenKind::Table => {
+                self.advance();
+                Ok(Statement::DropTable {
+                    name: self.parse_simple_identifier()?,
+                })
+            }
+            TokenKind::Index => {
+                self.advance();
+                Ok(Statement::DropIndex {
+                    name: self.parse_simple_identifier()?,
+                })
+            }
+            token => {
+                Err(self.error_expected(&format!("TABLE or INDEX, found {}", display_token(token))))
+            }
+        }
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -291,7 +313,11 @@ impl Parser {
         let arg = if self.matches(&TokenKind::Star) {
             AggregateArg::Wildcard
         } else {
-            AggregateArg::Column(self.parse_identifier()?)
+            let distinct = self.matches(&TokenKind::Distinct);
+            AggregateArg::Column {
+                name: self.parse_identifier()?,
+                distinct,
+            }
         };
         self.expect_symbol(TokenKind::RParen)?;
         Ok(SelectItem::Aggregate {
@@ -354,6 +380,24 @@ impl Parser {
             return Ok(Expr::IsNull { column, negated });
         }
         if self.matches(&TokenKind::Not) {
+            if self.matches(&TokenKind::Like) {
+                return Ok(Expr::Like {
+                    column,
+                    pattern: self.parse_string_literal()?,
+                    negated: true,
+                });
+            }
+            if self.matches(&TokenKind::Between) {
+                let low = self.parse_literal()?;
+                self.expect_keyword(TokenKind::And)?;
+                let high = self.parse_literal()?;
+                return Ok(Expr::Between {
+                    column,
+                    low,
+                    high,
+                    negated: true,
+                });
+            }
             self.expect_keyword(TokenKind::In)?;
             let query = self.parse_subquery()?;
             return Ok(Expr::InSubquery {
@@ -367,6 +411,24 @@ impl Parser {
             return Ok(Expr::InSubquery {
                 column,
                 query: Box::new(query),
+                negated: false,
+            });
+        }
+        if self.matches(&TokenKind::Like) {
+            return Ok(Expr::Like {
+                column,
+                pattern: self.parse_string_literal()?,
+                negated: false,
+            });
+        }
+        if self.matches(&TokenKind::Between) {
+            let low = self.parse_literal()?;
+            self.expect_keyword(TokenKind::And)?;
+            let high = self.parse_literal()?;
+            return Ok(Expr::Between {
+                column,
+                low,
+                high,
                 negated: false,
             });
         }
@@ -495,14 +557,22 @@ impl Parser {
     fn parse_order_by_items(&mut self) -> Result<Vec<OrderBy>> {
         let mut items = Vec::new();
         loop {
-            let column = self.parse_identifier()?;
+            let expr = match self.peek_kind() {
+                TokenKind::Integer(value) if *value > 0 => {
+                    let position = usize::try_from(*value)
+                        .map_err(|_| DbError::sql("ORDER BY position is too large"))?;
+                    self.advance();
+                    OrderByExpr::Position(position)
+                }
+                _ => OrderByExpr::Column(self.parse_identifier()?),
+            };
             let descending = if self.matches(&TokenKind::Desc) {
                 true
             } else {
                 self.matches(&TokenKind::Asc);
                 false
             };
-            items.push(OrderBy { column, descending });
+            items.push(OrderBy { expr, descending });
             if !self.matches(&TokenKind::Comma) {
                 break;
             }
@@ -631,6 +701,16 @@ impl Parser {
         }
     }
 
+    fn parse_string_literal(&mut self) -> Result<String> {
+        match self.parse_literal()? {
+            Value::Text(value) => Ok(value),
+            value => Err(DbError::sql(format!(
+                "expected string literal, found {}",
+                value.type_name()
+            ))),
+        }
+    }
+
     fn parse_identifier(&mut self) -> Result<String> {
         let mut identifier = self.parse_simple_identifier()?;
         while self.matches(&TokenKind::Dot) {
@@ -724,6 +804,7 @@ fn same_variant(left: &TokenKind, right: &TokenKind) -> bool {
 fn display_token(token: &TokenKind) -> String {
     match token {
         TokenKind::Create => "CREATE".to_string(),
+        TokenKind::Drop => "DROP".to_string(),
         TokenKind::Table => "TABLE".to_string(),
         TokenKind::Index => "INDEX".to_string(),
         TokenKind::On => "ON".to_string(),
@@ -751,6 +832,8 @@ fn display_token(token: &TokenKind) -> String {
         TokenKind::Desc => "DESC".to_string(),
         TokenKind::And => "AND".to_string(),
         TokenKind::Or => "OR".to_string(),
+        TokenKind::Like => "LIKE".to_string(),
+        TokenKind::Between => "BETWEEN".to_string(),
         TokenKind::Begin => "BEGIN".to_string(),
         TokenKind::Commit => "COMMIT".to_string(),
         TokenKind::Rollback => "ROLLBACK".to_string(),

@@ -47,6 +47,17 @@ enum UndoOp {
         schema_name: String,
         index_name: String,
     },
+    RestoreTable {
+        schema: Schema,
+        rows: BTreeMap<RowId, Row>,
+        indexes: BTreeMap<String, IndexState>,
+        next_row_id: Option<u64>,
+    },
+    RestoreIndex {
+        schema_name: String,
+        index_name: String,
+        index: IndexState,
+    },
     DeleteRow {
         schema_name: String,
         row_id: RowId,
@@ -243,6 +254,32 @@ impl MemoryStorageInner {
                 }
                 Ok(())
             }
+            UndoOp::RestoreTable {
+                schema,
+                rows,
+                indexes,
+                next_row_id,
+            } => {
+                let schema_name = schema.name.clone();
+                self.schemas.insert(schema_name.clone(), schema);
+                self.rows.insert(schema_name.clone(), rows);
+                self.indexes.insert(schema_name.clone(), indexes);
+                if let Some(next_row_id) = next_row_id {
+                    self.next_row_ids.insert(schema_name, next_row_id);
+                }
+                Ok(())
+            }
+            UndoOp::RestoreIndex {
+                schema_name,
+                index_name,
+                index,
+            } => {
+                self.indexes
+                    .entry(schema_name)
+                    .or_default()
+                    .insert(index_name, index);
+                Ok(())
+            }
             UndoOp::DeleteRow {
                 schema_name,
                 row_id,
@@ -296,6 +333,27 @@ impl CatalogStore for MemoryStorage {
         inner.rows.entry(schema.name.clone()).or_default();
         inner.indexes.entry(schema.name.clone()).or_default();
         inner.next_row_ids.entry(schema.name).or_insert(1);
+        Ok(())
+    }
+
+    fn drop_schema(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+
+        let schema = inner
+            .schemas
+            .remove(name)
+            .ok_or_else(|| DbError::storage(format!("unknown table: {name}")))?;
+        let rows = inner.rows.remove(name).unwrap_or_default();
+        let indexes = inner.indexes.remove(name).unwrap_or_default();
+        let next_row_id = inner.next_row_ids.remove(name);
+
+        inner.record_undo(UndoOp::RestoreTable {
+            schema,
+            rows,
+            indexes,
+            next_row_id,
+        });
         Ok(())
     }
 
@@ -469,6 +527,30 @@ impl IndexStore for MemoryStorage {
                     entries,
                 },
             );
+        Ok(())
+    }
+
+    fn drop_index(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
+    ) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+
+        let removed = inner
+            .indexes
+            .get_mut(schema_name)
+            .and_then(|indexes| indexes.remove(index_name))
+            .ok_or_else(|| {
+                DbError::storage(format!("unknown index {index_name} on table {schema_name}"))
+            })?;
+        inner.record_undo(UndoOp::RestoreIndex {
+            schema_name: schema_name.to_string(),
+            index_name: index_name.to_string(),
+            index: removed,
+        });
         Ok(())
     }
 

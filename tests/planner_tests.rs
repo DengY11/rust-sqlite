@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use rustsql::common::types::{ColumnDef, ColumnType, IndexMeta, Schema, Value};
 use rustsql::sql::ast::{
-    AggregateArg, AggregateFunc, CompareOp, Expr, JoinClause, JoinKind, OrderBy, SelectItem,
-    SelectStatement, Statement,
+    AggregateArg, AggregateFunc, CompareOp, Expr, JoinClause, JoinKind, OrderBy, OrderByExpr,
+    SelectItem, SelectStatement, Statement,
 };
 use rustsql::sql::plan::{IndexBound, IndexRange, IndexScanSpec, JoinPlan, Plan};
 use rustsql::sql::planner::{Planner, PlanningContext};
@@ -867,7 +867,7 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
         filter: None,
         group_by: vec!["active".to_string()],
         order_by: vec![OrderBy {
-            column: "total".to_string(),
+            expr: OrderByExpr::Column("total".to_string()),
             descending: true,
         }],
         limit: Some(2),
@@ -899,7 +899,7 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
             ],
             group_by: vec!["active".to_string()],
             order_by: vec![OrderBy {
-                column: "total".to_string(),
+                expr: OrderByExpr::Column("total".to_string()),
                 descending: true,
             }],
             limit: Some(2),
@@ -952,7 +952,7 @@ fn plans_join_query_as_nested_loop_join() {
         }),
         group_by: vec![],
         order_by: vec![OrderBy {
-            column: "u.name".to_string(),
+            expr: OrderByExpr::Column("u.name".to_string()),
             descending: false,
         }],
         limit: Some(5),
@@ -987,7 +987,7 @@ fn plans_join_query_as_nested_loop_join() {
                 value: Value::Integer(10),
             }),
             order_by: vec![OrderBy {
-                column: "u.name".to_string(),
+                expr: OrderByExpr::Column("u.name".to_string()),
                 descending: false,
             }],
             limit: Some(5),

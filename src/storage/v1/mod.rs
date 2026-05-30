@@ -251,6 +251,19 @@ impl CatalogStore for FileStorage {
         Ok(())
     }
 
+    fn drop_schema(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+
+        if inner.state.schemas.remove(name).is_none() {
+            return Err(DbError::storage(format!("unknown table: {name}")));
+        }
+        inner.state.rows.remove(name);
+        inner.state.indexes.remove(name);
+        inner.state.next_row_ids.remove(name);
+        Ok(())
+    }
+
     fn get_schema(&self, transaction_id: TransactionId, name: &str) -> Result<Option<Schema>> {
         let inner = self.inner.borrow();
         inner.validate_transaction(transaction_id)?;
@@ -416,6 +429,28 @@ impl IndexStore for FileStorage {
                     entries,
                 },
             );
+        Ok(())
+    }
+
+    fn drop_index(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
+    ) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+
+        let removed = inner
+            .state
+            .indexes
+            .get_mut(schema_name)
+            .and_then(|indexes| indexes.remove(index_name));
+        if removed.is_none() {
+            return Err(DbError::storage(format!(
+                "unknown index {index_name} on table {schema_name}"
+            )));
+        }
         Ok(())
     }
 

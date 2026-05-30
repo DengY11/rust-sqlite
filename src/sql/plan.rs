@@ -40,6 +40,13 @@ pub enum Plan {
         table: String,
         columns: Vec<String>,
     },
+    DropTable {
+        name: String,
+    },
+    DropIndex {
+        table: String,
+        name: String,
+    },
     Insert {
         table: String,
         values: Vec<Value>,

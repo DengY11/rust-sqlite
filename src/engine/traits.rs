@@ -8,6 +8,7 @@ use crate::sql::planner::PlanningContext;
 
 pub trait CatalogStore {
     fn create_schema(&self, transaction_id: TransactionId, schema: Schema) -> Result<()>;
+    fn drop_schema(&self, transaction_id: TransactionId, name: &str) -> Result<()>;
     fn get_schema(&self, transaction_id: TransactionId, name: &str) -> Result<Option<Schema>>;
     fn list_schemas(&self, transaction_id: TransactionId) -> Result<Vec<Schema>>;
 }
@@ -44,6 +45,12 @@ pub trait IndexStore {
         transaction_id: TransactionId,
         schema_name: &str,
         index: IndexMeta,
+    ) -> Result<()>;
+    fn drop_index(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        index_name: &str,
     ) -> Result<()>;
     fn get_index(
         &self,

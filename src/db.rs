@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::path::Path;
 
 use crate::common::error::{DbError, Result};
-use crate::common::types::Row;
+use crate::common::types::{IndexMeta, Row, Schema};
 use crate::engine::{PlanningStorageEngine, TransactionId};
 use crate::sql::ast::Statement;
 use crate::sql::executor::Executor;
@@ -47,6 +47,16 @@ impl<S: PlanningStorageEngine> Database<S> {
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
         let statements = parse_sql(sql)?;
         self.query_parsed(&statements)
+    }
+
+    pub fn list_schemas(&self) -> Result<Vec<Schema>> {
+        self.with_metadata_transaction(|transaction_id| self.storage.list_schemas(transaction_id))
+    }
+
+    pub fn list_indexes(&self, table: &str) -> Result<Vec<IndexMeta>> {
+        self.with_metadata_transaction(|transaction_id| {
+            self.storage.list_indexes(transaction_id, table)
+        })
     }
 
     pub(crate) fn execute_parsed(&self, statements: &[Statement]) -> Result<()> {
@@ -112,6 +122,25 @@ impl<S: PlanningStorageEngine> Database<S> {
             .storage
             .planning_context_snapshot(self.current_txn.get())?;
         self.planner.plan_statement(statement, &context)
+    }
+
+    fn with_metadata_transaction<T>(
+        &self,
+        f: impl FnOnce(TransactionId) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(transaction_id) = self.current_txn.get() {
+            return f(transaction_id);
+        }
+
+        let transaction_id = self.storage.begin()?;
+        let result = f(transaction_id);
+        let rollback_result = self.storage.rollback(transaction_id);
+
+        match (result, rollback_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 }
 
