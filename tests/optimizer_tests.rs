@@ -206,6 +206,54 @@ fn optimizer_uses_indexable_and_term_with_scalar_residual_filter() {
 }
 
 #[test]
+fn optimizer_does_not_rewrite_scalar_is_null_filter_to_index_scan() {
+    let optimizer = Optimizer::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            rustsql::common::types::Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("nickname", ColumnType::Text),
+                    ColumnDef::new("name", ColumnType::Text),
+                ],
+            ),
+        )]),
+        HashMap::from([(
+            "users".to_string(),
+            vec![rustsql::common::types::IndexMeta {
+                name: "idx_users_name".to_string(),
+                columns: vec!["name".to_string()],
+                unique: false,
+            }],
+        )]),
+    );
+    let plan = Plan::SeqScan {
+        table: "users".to_string(),
+        table_alias: None,
+        columns: vec![SelectItem::Column("id".to_string())],
+        filter: Some(Expr::IsNullScalar {
+            expr: ScalarExpr::Binary {
+                left: Box::new(ScalarExpr::Column("nickname".to_string())),
+                op: ScalarBinaryOp::Concat,
+                right: Box::new(ScalarExpr::Column("name".to_string())),
+            },
+            negated: false,
+        }),
+        order_by: vec![],
+        limit: None,
+        distinct: false,
+    };
+
+    let optimized = optimizer
+        .optimize_with_context(plan.clone(), &context)
+        .unwrap();
+
+    assert_eq!(optimized, plan);
+}
+
+#[test]
 fn optimizer_rewrites_between_filter_to_index_range_scan() {
     let optimizer = Optimizer::new();
     let context = PlanningContext::new(

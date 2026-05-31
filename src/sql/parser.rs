@@ -599,11 +599,6 @@ impl Parser {
             None
         };
         if self.matches(&TokenKind::Is) {
-            let Some(column) = column else {
-                return Err(DbError::sql(
-                    "IS NULL currently requires a column reference",
-                ));
-            };
             let negated = self.matches(&TokenKind::Not);
             if !self.matches(&TokenKind::Null) {
                 return Err(self.error_expected(&format!(
@@ -611,7 +606,13 @@ impl Parser {
                     display_token(self.peek_kind())
                 )));
             }
-            return Ok(Expr::IsNull { column, negated });
+            return match column {
+                Some(column) => Ok(Expr::IsNull { column, negated }),
+                None => Ok(Expr::IsNullScalar {
+                    expr: left_expr,
+                    negated,
+                }),
+            };
         }
         if self.matches(&TokenKind::Not) {
             if self.matches(&TokenKind::Like) {

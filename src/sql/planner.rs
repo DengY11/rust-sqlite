@@ -646,6 +646,10 @@ impl Planner {
                 column: self.normalize_column_reference(schema, table, table_alias, column)?,
                 negated: *negated,
             },
+            Expr::IsNullScalar { expr, negated } => Expr::IsNullScalar {
+                expr: self.normalize_scalar_expr(schema, table, table_alias, expr)?,
+                negated: *negated,
+            },
             Expr::InSubquery {
                 column,
                 query,
@@ -1035,6 +1039,9 @@ impl Planner {
                 self.resolve_column_in_scope_chain(scope, outer_scope, right)
                     .map(|_| ())
             }
+            Expr::IsNullScalar { expr, .. } => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
+            }
             Expr::CompareScalar { left, right, .. } => {
                 self.require_scalar_expr_scope_chain(scope, outer_scope, left)?;
                 self.require_scalar_expr_scope_chain(scope, outer_scope, right)
@@ -1068,6 +1075,7 @@ impl Planner {
             | Expr::CompareColumns { .. }
             | Expr::CompareScalar { .. }
             | Expr::IsNull { .. }
+            | Expr::IsNullScalar { .. }
             | Expr::Like { .. }
             | Expr::Between { .. } => Ok(()),
         }

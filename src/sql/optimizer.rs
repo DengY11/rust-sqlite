@@ -117,6 +117,7 @@ impl IndexSelectionPass {
             } => !negated && Self::prefix_like_bounds(pattern).is_some(),
             Expr::CompareColumns { .. }
             | Expr::CompareScalar { .. }
+            | Expr::IsNullScalar { .. }
             | Expr::InSubquery { .. }
             | Expr::CompareSubquery { .. }
             | Expr::ExistsSubquery { .. } => false,
@@ -269,6 +270,7 @@ impl IndexSelectionPass {
             }
             Expr::CompareColumns { .. }
             | Expr::CompareScalar { .. }
+            | Expr::IsNullScalar { .. }
             | Expr::InSubquery { .. }
             | Expr::CompareSubquery { .. }
             | Expr::ExistsSubquery { .. }

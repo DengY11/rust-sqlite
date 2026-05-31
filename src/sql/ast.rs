@@ -203,6 +203,10 @@ pub enum Expr {
         column: String,
         negated: bool,
     },
+    IsNullScalar {
+        expr: ScalarExpr,
+        negated: bool,
+    },
     InSubquery {
         column: String,
         query: Box<SelectStatement>,

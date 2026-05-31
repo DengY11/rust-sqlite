@@ -1425,6 +1425,39 @@ fn database_filters_with_scalar_expression_comparisons() {
 }
 
 #[test]
+fn database_filters_with_scalar_expression_is_null() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, nickname TEXT);
+         INSERT INTO users VALUES (1, 'alice', NULL);
+         INSERT INTO users VALUES (2, NULL, NULL);
+         INSERT INTO users VALUES (3, 'carol', 'c');",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT id
+             FROM users
+             WHERE COALESCE(nickname, name) IS NOT NULL
+             ORDER BY id ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
+
+    let null_rows = db
+        .query(
+            "SELECT id
+             FROM users
+             WHERE LENGTH(COALESCE(nickname, name)) IS NULL;",
+        )
+        .unwrap();
+
+    assert_eq!(null_rows, vec![vec![Value::Integer(2)]]);
+}
+
+#[test]
 fn database_supports_exists_and_not_exists_subqueries() {
     let db = Database::memory();
 

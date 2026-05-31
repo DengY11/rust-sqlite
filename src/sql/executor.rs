@@ -1723,6 +1723,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 let left = self.lookup_filter_value(rowset, row, outer, column)?;
                 Ok((left == Value::Null) ^ *negated)
             }
+            Expr::IsNullScalar { expr, negated } => {
+                let value = self.evaluate_filter_scalar_expr(rowset, row, outer, expr)?;
+                Ok((value == Value::Null) ^ *negated)
+            }
             Expr::InSubquery {
                 column,
                 query,

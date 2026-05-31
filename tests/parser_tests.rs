@@ -624,6 +624,44 @@ fn parses_where_scalar_expression_comparisons() {
 }
 
 #[test]
+fn parses_where_scalar_expression_is_null() {
+    let statements = parse_sql(
+        "SELECT name FROM users WHERE COALESCE(nickname, name) IS NOT NULL AND LENGTH(name) IS NOT NULL;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            Some(Expr::And(
+                Box::new(Expr::IsNullScalar {
+                    expr: ScalarExpr::Function {
+                        func: ScalarFunc::Coalesce,
+                        args: vec![
+                            ScalarExpr::Column("nickname".to_string()),
+                            ScalarExpr::Column("name".to_string()),
+                        ],
+                    },
+                    negated: true,
+                }),
+                Box::new(Expr::IsNullScalar {
+                    expr: ScalarExpr::Function {
+                        func: ScalarFunc::Length,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    },
+                    negated: true,
+                }),
+            )),
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
 fn parses_boolean_where_expression_with_precedence_and_parentheses() {
     let statements = parse_sql(
         "SELECT id FROM users WHERE name = 'alice' OR active = TRUE AND (id = 1 OR id = 2);",
