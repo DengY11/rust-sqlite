@@ -156,6 +156,10 @@ pub enum ScalarExpr {
         op: ScalarBinaryOp,
         right: Box<ScalarExpr>,
     },
+    Function {
+        func: ScalarFunc,
+        args: Vec<ScalarExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +169,16 @@ pub enum ScalarBinaryOp {
     Multiply,
     Divide,
     Concat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunc {
+    Length,
+    Lower,
+    Upper,
+    Abs,
+    Coalesce,
+    IfNull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

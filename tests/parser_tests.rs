@@ -1,7 +1,8 @@
 use rustsql::common::types::{ColumnDef, ColumnType, Value};
 use rustsql::sql::ast::{
     AggregateArg, AggregateFunc, AlterTableAction, Assignment, CompareOp, Expr, JoinClause,
-    JoinKind, NullOrder, OrderBy, OrderByExpr, SelectItem, SelectStatement, Statement,
+    JoinKind, NullOrder, OrderBy, OrderByExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, SelectItem,
+    SelectStatement, Statement,
 };
 use rustsql::sql::lexer::{TokenKind, lex};
 use rustsql::sql::parser::parse_sql;
@@ -439,6 +440,81 @@ fn parses_null_ordering_words_as_identifiers() {
                 None,
             ),
         ]
+    );
+}
+
+#[test]
+fn parses_scalar_function_expressions() {
+    let statements = parse_sql(
+        "SELECT LENGTH(name) AS name_len,
+                UPPER(LOWER(name)) AS normalized,
+                ABS(delta) + 1 AS shifted,
+                COALESCE(nickname, name, 'anonymous') AS display_name,
+                IFNULL(nickname, name) AS fallback
+         FROM users;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![
+                SelectItem::Expr {
+                    expr: ScalarExpr::Function {
+                        func: ScalarFunc::Length,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    },
+                    alias: Some("name_len".to_string()),
+                },
+                SelectItem::Expr {
+                    expr: ScalarExpr::Function {
+                        func: ScalarFunc::Upper,
+                        args: vec![ScalarExpr::Function {
+                            func: ScalarFunc::Lower,
+                            args: vec![ScalarExpr::Column("name".to_string())],
+                        }],
+                    },
+                    alias: Some("normalized".to_string()),
+                },
+                SelectItem::Expr {
+                    expr: ScalarExpr::Binary {
+                        left: Box::new(ScalarExpr::Function {
+                            func: ScalarFunc::Abs,
+                            args: vec![ScalarExpr::Column("delta".to_string())],
+                        }),
+                        op: ScalarBinaryOp::Add,
+                        right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                    },
+                    alias: Some("shifted".to_string()),
+                },
+                SelectItem::Expr {
+                    expr: ScalarExpr::Function {
+                        func: ScalarFunc::Coalesce,
+                        args: vec![
+                            ScalarExpr::Column("nickname".to_string()),
+                            ScalarExpr::Column("name".to_string()),
+                            ScalarExpr::Literal(Value::from("anonymous")),
+                        ],
+                    },
+                    alias: Some("display_name".to_string()),
+                },
+                SelectItem::Expr {
+                    expr: ScalarExpr::Function {
+                        func: ScalarFunc::IfNull,
+                        args: vec![
+                            ScalarExpr::Column("nickname".to_string()),
+                            ScalarExpr::Column("name".to_string()),
+                        ],
+                    },
+                    alias: Some("fallback".to_string()),
+                },
+            ],
+            "users",
+            None,
+            None,
+            vec![],
+            None,
+        )]
     );
 }
 

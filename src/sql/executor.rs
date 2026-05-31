@@ -7,7 +7,7 @@ use crate::common::types::{ColumnDef, IndexMeta, Row, RowId, Schema, Value};
 use crate::engine::{PlanningStorageEngine, TransactionId};
 use crate::sql::ast::{
     AggregateArg, AggregateFunc, AlterTableAction, CompareOp, Expr, JoinKind, NullOrder, OrderBy,
-    OrderByExpr, ScalarBinaryOp, ScalarExpr, SelectItem, Statement, TableConstraint,
+    OrderByExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, SelectItem, Statement, TableConstraint,
 };
 use crate::sql::optimizer::Optimizer;
 use crate::sql::plan::{IndexScanMode, IndexScanSpec, JoinPlan, Plan};
@@ -1910,7 +1910,135 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 let right = self.evaluate_scalar_expr(source, row, right)?;
                 self.evaluate_binary_scalar(*op, left, right)?
             }
+            ScalarExpr::Function { func, args } => {
+                if matches!(func, ScalarFunc::Coalesce | ScalarFunc::IfNull) {
+                    return self.evaluate_short_circuit_scalar_function(source, row, *func, args);
+                }
+                let args = args
+                    .iter()
+                    .map(|arg| self.evaluate_scalar_expr(source, row, arg))
+                    .collect::<Result<Vec<_>>>()?;
+                self.evaluate_scalar_function(*func, args)?
+            }
         })
+    }
+
+    fn evaluate_short_circuit_scalar_function(
+        &self,
+        source: &RowSet,
+        row: &Row,
+        func: ScalarFunc,
+        args: &[ScalarExpr],
+    ) -> Result<Value> {
+        match func {
+            ScalarFunc::Coalesce => {
+                if args.is_empty() {
+                    return Err(DbError::plan("COALESCE expects at least 1 argument"));
+                }
+                for arg in args {
+                    let value = self.evaluate_scalar_expr(source, row, arg)?;
+                    if !matches!(value, Value::Null) {
+                        return Ok(value);
+                    }
+                }
+                Ok(Value::Null)
+            }
+            ScalarFunc::IfNull => {
+                if args.len() != 2 {
+                    return Err(DbError::plan(format!(
+                        "IFNULL expects 2 arguments but got {}",
+                        args.len()
+                    )));
+                }
+                let first = self.evaluate_scalar_expr(source, row, &args[0])?;
+                if matches!(first, Value::Null) {
+                    self.evaluate_scalar_expr(source, row, &args[1])
+                } else {
+                    Ok(first)
+                }
+            }
+            _ => unreachable!("non-short-circuit scalar function"),
+        }
+    }
+
+    fn evaluate_scalar_function(&self, func: ScalarFunc, args: Vec<Value>) -> Result<Value> {
+        match func {
+            ScalarFunc::Length => {
+                Self::expect_arity("LENGTH", &args, 1)?;
+                match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::Text(value) => Ok(Value::Integer(value.chars().count() as i64)),
+                    value => Err(DbError::plan(format!(
+                        "LENGTH expects TEXT but got {}",
+                        value.type_name()
+                    ))),
+                }
+            }
+            ScalarFunc::Lower => {
+                Self::expect_arity("LOWER", &args, 1)?;
+                match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::Text(value) => Ok(Value::Text(value.to_lowercase())),
+                    value => Err(DbError::plan(format!(
+                        "LOWER expects TEXT but got {}",
+                        value.type_name()
+                    ))),
+                }
+            }
+            ScalarFunc::Upper => {
+                Self::expect_arity("UPPER", &args, 1)?;
+                match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::Text(value) => Ok(Value::Text(value.to_uppercase())),
+                    value => Err(DbError::plan(format!(
+                        "UPPER expects TEXT but got {}",
+                        value.type_name()
+                    ))),
+                }
+            }
+            ScalarFunc::Abs => {
+                Self::expect_arity("ABS", &args, 1)?;
+                match args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::Integer(value) => value
+                        .checked_abs()
+                        .map(Value::Integer)
+                        .ok_or_else(|| DbError::plan("ABS overflowed i64")),
+                    ref value => Err(DbError::plan(format!(
+                        "ABS expects INTEGER but got {}",
+                        value.type_name()
+                    ))),
+                }
+            }
+            ScalarFunc::Coalesce => {
+                if args.is_empty() {
+                    return Err(DbError::plan("COALESCE expects at least 1 argument"));
+                }
+                Ok(args
+                    .into_iter()
+                    .find(|value| !matches!(value, Value::Null))
+                    .unwrap_or(Value::Null))
+            }
+            ScalarFunc::IfNull => {
+                Self::expect_arity("IFNULL", &args, 2)?;
+                if matches!(args[0], Value::Null) {
+                    Ok(args[1].clone())
+                } else {
+                    Ok(args[0].clone())
+                }
+            }
+        }
+    }
+
+    fn expect_arity(function_name: &str, args: &[Value], expected: usize) -> Result<()> {
+        if args.len() == expected {
+            Ok(())
+        } else {
+            Err(DbError::plan(format!(
+                "{function_name} expects {expected} arguments but got {}",
+                args.len()
+            )))
+        }
     }
 
     fn evaluate_binary_scalar(
@@ -2048,6 +2176,25 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 },
                 self.scalar_expr_name(right)
             ),
+            ScalarExpr::Function { func, args } => format!(
+                "{}({})",
+                Self::scalar_function_name(*func),
+                args.iter()
+                    .map(|arg| self.scalar_expr_name(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    fn scalar_function_name(func: ScalarFunc) -> &'static str {
+        match func {
+            ScalarFunc::Length => "LENGTH",
+            ScalarFunc::Lower => "LOWER",
+            ScalarFunc::Upper => "UPPER",
+            ScalarFunc::Abs => "ABS",
+            ScalarFunc::Coalesce => "COALESCE",
+            ScalarFunc::IfNull => "IFNULL",
         }
     }
 }

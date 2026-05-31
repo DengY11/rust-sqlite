@@ -4,7 +4,7 @@ use crate::common::types::{
 };
 use crate::sql::ast::{
     AggregateArg, AggregateFunc, AlterTableAction, Assignment, CompareOp, Expr, JoinClause,
-    JoinKind, NullOrder, OrderBy, OrderByExpr, ScalarBinaryOp, ScalarExpr, SelectItem,
+    JoinKind, NullOrder, OrderBy, OrderByExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, SelectItem,
     SelectStatement, Statement, TableConstraint,
 };
 use crate::sql::lexer::{Token, TokenKind, lex};
@@ -333,7 +333,9 @@ impl Parser {
             && matches!(
                 self.tokens.get(self.index + 1).map(|token| &token.kind),
                 Some(TokenKind::LParen)
-            ) {
+            )
+            && is_aggregate_function_name(name)
+        {
             let name = name.clone();
             self.advance();
             self.parse_aggregate_item(name)?
@@ -440,7 +442,14 @@ impl Parser {
             return Ok(expr);
         }
         match self.peek_kind() {
-            token if is_identifier_token(token) => Ok(ScalarExpr::Column(self.parse_identifier()?)),
+            token if is_identifier_token(token) => {
+                let name = self.parse_identifier()?;
+                if self.matches(&TokenKind::LParen) {
+                    self.parse_scalar_function(name)
+                } else {
+                    Ok(ScalarExpr::Column(name))
+                }
+            }
             TokenKind::Integer(_)
             | TokenKind::String(_)
             | TokenKind::True
@@ -451,6 +460,36 @@ impl Parser {
                 display_token(token)
             ))),
         }
+    }
+
+    fn parse_scalar_function(&mut self, function_name: String) -> Result<ScalarExpr> {
+        let func = match function_name.to_ascii_uppercase().as_str() {
+            "LENGTH" => ScalarFunc::Length,
+            "LOWER" => ScalarFunc::Lower,
+            "UPPER" => ScalarFunc::Upper,
+            "ABS" => ScalarFunc::Abs,
+            "COALESCE" => ScalarFunc::Coalesce,
+            "IFNULL" => ScalarFunc::IfNull,
+            _ => {
+                return Err(DbError::sql(format!(
+                    "unsupported scalar function: {function_name}"
+                )));
+            }
+        };
+
+        let mut args = Vec::new();
+        if !self.matches(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_scalar_expr()?);
+                if self.matches(&TokenKind::Comma) {
+                    continue;
+                }
+                self.expect_symbol(TokenKind::RParen)?;
+                break;
+            }
+        }
+
+        Ok(ScalarExpr::Function { func, args })
     }
 
     fn parse_aggregate_item(&mut self, function_name: String) -> Result<SelectItem> {
@@ -1110,6 +1149,13 @@ fn is_identifier_token(token: &TokenKind) -> bool {
     matches!(
         token,
         TokenKind::Identifier(_) | TokenKind::Nulls | TokenKind::First | TokenKind::Last
+    )
+}
+
+fn is_aggregate_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
     )
 }
 

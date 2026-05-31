@@ -1202,6 +1202,106 @@ fn database_supports_expression_projection() {
 }
 
 #[test]
+fn database_supports_scalar_functions() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, nickname TEXT, delta INTEGER);
+         INSERT INTO users VALUES (1, 'Alice', NULL, -7);
+         INSERT INTO users VALUES (2, 'Bob', 'bobby', 4);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT LENGTH(name) AS name_len,
+                    LOWER(name) AS lower_name,
+                    UPPER(nickname) AS upper_nickname,
+                    ABS(delta) AS abs_delta,
+                    COALESCE(nickname, name, 'anonymous') AS display_name,
+                    IFNULL(nickname, name) AS fallback_name,
+                    LENGTH(name || '!') AS excited_len
+             FROM users
+             ORDER BY id;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(5),
+                Value::from("alice"),
+                Value::Null,
+                Value::Integer(7),
+                Value::from("Alice"),
+                Value::from("Alice"),
+                Value::Integer(6),
+            ],
+            vec![
+                Value::Integer(3),
+                Value::from("bob"),
+                Value::from("BOBBY"),
+                Value::Integer(4),
+                Value::from("bobby"),
+                Value::from("bobby"),
+                Value::Integer(4),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn database_rejects_invalid_scalar_function_calls() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);
+         INSERT INTO users VALUES (1, 'alice', 30);",
+    )
+    .unwrap();
+
+    let unknown = db.query("SELECT MYSTERY(name) FROM users;").unwrap_err();
+    assert!(unknown.to_string().contains("unsupported scalar function"));
+
+    let wrong_arity = db.query("SELECT IFNULL(name) FROM users;").unwrap_err();
+    assert!(
+        wrong_arity
+            .to_string()
+            .contains("IFNULL expects 2 arguments")
+    );
+
+    let wrong_type = db.query("SELECT LOWER(age) FROM users;").unwrap_err();
+    assert!(wrong_type.to_string().contains("LOWER expects TEXT"));
+}
+
+#[test]
+fn database_short_circuits_coalesce_and_ifnull() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+         INSERT INTO users VALUES (1, 'alice', 30);
+         INSERT INTO users VALUES (2, NULL, 40);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT COALESCE(name, LOWER(age), 'fallback') AS display_name,
+                    IFNULL(name, 1 / 0) AS fallback_name
+             FROM users
+             WHERE id = 1;",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::from("alice"), Value::from("alice")]]);
+
+    let error = db
+        .query("SELECT COALESCE(name, LOWER(age), 'fallback') FROM users WHERE id = 2;")
+        .unwrap_err();
+    assert!(error.to_string().contains("LOWER expects TEXT"));
+}
+
+#[test]
 fn database_supports_exists_and_not_exists_subqueries() {
     let db = Database::memory();
 

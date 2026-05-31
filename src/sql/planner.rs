@@ -724,6 +724,13 @@ impl Planner {
                 op: *op,
                 right: Box::new(self.normalize_scalar_expr(schema, table, table_alias, right)?),
             },
+            ScalarExpr::Function { func, args } => ScalarExpr::Function {
+                func: *func,
+                args: args
+                    .iter()
+                    .map(|arg| self.normalize_scalar_expr(schema, table, table_alias, arg))
+                    .collect::<Result<Vec<_>>>()?,
+            },
         })
     }
 
@@ -736,6 +743,12 @@ impl Planner {
                 self.require_scalar_expr_columns(schema, left)?;
                 self.require_scalar_expr_columns(schema, right)
             }
+            ScalarExpr::Function { args, .. } => {
+                for arg in args {
+                    self.require_scalar_expr_columns(schema, arg)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -747,6 +760,12 @@ impl Planner {
             ScalarExpr::Binary { left, right, .. } => {
                 self.require_scalar_expr_scope(scope, left)?;
                 self.require_scalar_expr_scope(scope, right)
+            }
+            ScalarExpr::Function { args, .. } => {
+                for arg in args {
+                    self.require_scalar_expr_scope(scope, arg)?;
+                }
+                Ok(())
             }
         }
     }
