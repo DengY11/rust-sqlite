@@ -1359,6 +1359,72 @@ fn database_rejects_aggregate_order_by_scalar_expressions_without_panic() {
 }
 
 #[test]
+fn database_filters_with_scalar_expression_comparisons() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, nickname TEXT, age INTEGER);
+         INSERT INTO users VALUES (1, 'Alice', NULL, 20);
+         INSERT INTO users VALUES (2, 'bob', 'bobby', 17);
+         INSERT INTO users VALUES (3, 'carol', NULL, 40);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT name
+             FROM users
+             WHERE LENGTH(name) > 3
+               AND (age + 1) >= 21
+               AND LOWER(name) = 'alice';",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::from("Alice")]]);
+
+    let coalesce_rows = db
+        .query(
+            "SELECT name
+             FROM users
+             WHERE COALESCE(nickname, name) = 'bobby';",
+        )
+        .unwrap();
+
+    assert_eq!(coalesce_rows, vec![vec![Value::from("bob")]]);
+
+    let short_circuit_rows = db
+        .query(
+            "SELECT name
+             FROM users
+             WHERE COALESCE(name, 1 / 0) = 'Alice'
+                OR IFNULL(name, 1 / 0) = 'Alice';",
+        )
+        .unwrap();
+
+    assert_eq!(short_circuit_rows, vec![vec![Value::from("Alice")]]);
+
+    db.execute(
+        "CREATE TABLE aliases (id INTEGER PRIMARY KEY, code TEXT NOT NULL);
+         INSERT INTO aliases VALUES (1, 'alice');
+         INSERT INTO aliases VALUES (2, 'carol');",
+    )
+    .unwrap();
+
+    let correlated_rows = db
+        .query(
+            "SELECT name
+             FROM users u
+             WHERE EXISTS (SELECT id FROM aliases a WHERE LOWER(u.name) = a.code)
+             ORDER BY name ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        correlated_rows,
+        vec![vec![Value::from("Alice")], vec![Value::from("carol")]]
+    );
+}
+
+#[test]
 fn database_supports_exists_and_not_exists_subqueries() {
     let db = Database::memory();
 

@@ -105,7 +105,10 @@ impl IndexSelectionPass {
             Expr::Compare { .. } => true,
             Expr::IsNull { negated, .. } => !negated,
             Expr::Not(inner) => self.expr_is_plain_indexable(inner),
-            Expr::And(left, right) | Expr::Or(left, right) => {
+            Expr::And(left, right) => {
+                self.expr_is_plain_indexable(left) || self.expr_is_plain_indexable(right)
+            }
+            Expr::Or(left, right) => {
                 self.expr_is_plain_indexable(left) && self.expr_is_plain_indexable(right)
             }
             Expr::Between { negated, .. } => !negated,
@@ -113,6 +116,7 @@ impl IndexSelectionPass {
                 pattern, negated, ..
             } => !negated && Self::prefix_like_bounds(pattern).is_some(),
             Expr::CompareColumns { .. }
+            | Expr::CompareScalar { .. }
             | Expr::InSubquery { .. }
             | Expr::CompareSubquery { .. }
             | Expr::ExistsSubquery { .. } => false,
@@ -264,11 +268,12 @@ impl IndexSelectionPass {
                 true
             }
             Expr::CompareColumns { .. }
+            | Expr::CompareScalar { .. }
             | Expr::InSubquery { .. }
             | Expr::CompareSubquery { .. }
             | Expr::ExistsSubquery { .. }
             | Expr::Like { .. }
-            | Expr::Between { .. } => false,
+            | Expr::Between { .. } => true,
             Expr::IsNull {
                 column,
                 negated: false,

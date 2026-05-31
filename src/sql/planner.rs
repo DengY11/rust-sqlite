@@ -637,6 +637,11 @@ impl Planner {
                 op: *op,
                 right: self.normalize_column_reference(schema, table, table_alias, right)?,
             },
+            Expr::CompareScalar { left, op, right } => Expr::CompareScalar {
+                left: self.normalize_scalar_expr(schema, table, table_alias, left)?,
+                op: *op,
+                right: self.normalize_scalar_expr(schema, table, table_alias, right)?,
+            },
             Expr::IsNull { column, negated } => Expr::IsNull {
                 column: self.normalize_column_reference(schema, table, table_alias, column)?,
                 negated: *negated,
@@ -1030,6 +1035,10 @@ impl Planner {
                 self.resolve_column_in_scope_chain(scope, outer_scope, right)
                     .map(|_| ())
             }
+            Expr::CompareScalar { left, right, .. } => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, left)?;
+                self.require_scalar_expr_scope_chain(scope, outer_scope, right)
+            }
             Expr::Not(expr) => self.require_scope_columns_with_outer(scope, outer_scope, expr),
             Expr::And(left, right) | Expr::Or(left, right) => {
                 self.require_scope_columns_with_outer(scope, outer_scope, left)?;
@@ -1057,6 +1066,7 @@ impl Planner {
             }
             Expr::Compare { .. }
             | Expr::CompareColumns { .. }
+            | Expr::CompareScalar { .. }
             | Expr::IsNull { .. }
             | Expr::Like { .. }
             | Expr::Between { .. } => Ok(()),
@@ -1092,6 +1102,33 @@ impl Planner {
                 } else {
                     Err(DbError::plan(format!("unknown column {column}")))
                 }
+            }
+        }
+    }
+
+    fn require_scalar_expr_scope_chain(
+        &self,
+        scope: &QueryScope,
+        outer_scope: Option<&QueryScope>,
+        expr: &ScalarExpr,
+    ) -> Result<()> {
+        match expr {
+            ScalarExpr::Literal(_) => Ok(()),
+            ScalarExpr::Column(name) => self
+                .resolve_column_in_scope_chain(scope, outer_scope, name)
+                .map(|_| ()),
+            ScalarExpr::UnaryMinus(expr) => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
+            }
+            ScalarExpr::Binary { left, right, .. } => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, left)?;
+                self.require_scalar_expr_scope_chain(scope, outer_scope, right)
+            }
+            ScalarExpr::Function { args, .. } => {
+                for arg in args {
+                    self.require_scalar_expr_scope_chain(scope, outer_scope, arg)?;
+                }
+                Ok(())
             }
         }
     }

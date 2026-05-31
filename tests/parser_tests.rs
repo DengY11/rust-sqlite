@@ -555,6 +555,75 @@ fn parses_order_by_scalar_expressions() {
 }
 
 #[test]
+fn parses_where_scalar_expression_comparisons() {
+    let statements = parse_sql(
+        "SELECT name FROM users WHERE LENGTH(name) > 3 AND age + 1 >= 21 AND LOWER(name) = 'alice';",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            Some(Expr::And(
+                Box::new(Expr::And(
+                    Box::new(Expr::CompareScalar {
+                        left: ScalarExpr::Function {
+                            func: ScalarFunc::Length,
+                            args: vec![ScalarExpr::Column("name".to_string())],
+                        },
+                        op: CompareOp::Gt,
+                        right: ScalarExpr::Literal(Value::Integer(3)),
+                    }),
+                    Box::new(Expr::CompareScalar {
+                        left: ScalarExpr::Binary {
+                            left: Box::new(ScalarExpr::Column("age".to_string())),
+                            op: ScalarBinaryOp::Add,
+                            right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                        },
+                        op: CompareOp::Gte,
+                        right: ScalarExpr::Literal(Value::Integer(21)),
+                    }),
+                )),
+                Box::new(Expr::CompareScalar {
+                    left: ScalarExpr::Function {
+                        func: ScalarFunc::Lower,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    },
+                    op: CompareOp::Eq,
+                    right: ScalarExpr::Literal(Value::from("alice")),
+                }),
+            )),
+            vec![],
+            None,
+        )]
+    );
+
+    let statements = parse_sql("SELECT name FROM users WHERE (age + 1) >= 21;").unwrap();
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            Some(Expr::CompareScalar {
+                left: ScalarExpr::Binary {
+                    left: Box::new(ScalarExpr::Column("age".to_string())),
+                    op: ScalarBinaryOp::Add,
+                    right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                },
+                op: CompareOp::Gte,
+                right: ScalarExpr::Literal(Value::Integer(21)),
+            }),
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
 fn parses_boolean_where_expression_with_precedence_and_parentheses() {
     let statements = parse_sql(
         "SELECT id FROM users WHERE name = 'alice' OR active = TRUE AND (id = 1 OR id = 2);",

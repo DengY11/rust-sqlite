@@ -1714,6 +1714,11 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 let right = self.lookup_filter_value(rowset, row, outer, right)?;
                 self.compare_with_operator(&left, op, &right)
             }
+            Expr::CompareScalar { left, op, right } => {
+                let left = self.evaluate_filter_scalar_expr(rowset, row, outer, left)?;
+                let right = self.evaluate_filter_scalar_expr(rowset, row, outer, right)?;
+                self.compare_with_operator(&left, op, &right)
+            }
             Expr::IsNull { column, negated } => {
                 let left = self.lookup_filter_value(rowset, row, outer, column)?;
                 Ok((left == Value::Null) ^ *negated)
@@ -1948,6 +1953,87 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 self.evaluate_scalar_function(*func, args)?
             }
         })
+    }
+
+    fn evaluate_filter_scalar_expr(
+        &self,
+        source: &RowSet,
+        row: &Row,
+        outer: Option<(&RowSet, &Row)>,
+        expr: &ScalarExpr,
+    ) -> Result<Value> {
+        Ok(match expr {
+            ScalarExpr::Literal(value) => value.clone(),
+            ScalarExpr::Column(name) => self.lookup_filter_value(source, row, outer, name)?,
+            ScalarExpr::UnaryMinus(expr) => {
+                match self.evaluate_filter_scalar_expr(source, row, outer, expr)? {
+                    Value::Integer(value) => Value::Integer(-value),
+                    Value::Null => Value::Null,
+                    value => {
+                        return Err(DbError::plan(format!(
+                            "unary - expects INTEGER but got {}",
+                            value.type_name()
+                        )));
+                    }
+                }
+            }
+            ScalarExpr::Binary { left, op, right } => {
+                let left = self.evaluate_filter_scalar_expr(source, row, outer, left)?;
+                let right = self.evaluate_filter_scalar_expr(source, row, outer, right)?;
+                self.evaluate_binary_scalar(*op, left, right)?
+            }
+            ScalarExpr::Function { func, args } => {
+                if matches!(func, ScalarFunc::Coalesce | ScalarFunc::IfNull) {
+                    return self.evaluate_filter_short_circuit_scalar_function(
+                        source, row, outer, *func, args,
+                    );
+                }
+                let args = args
+                    .iter()
+                    .map(|arg| self.evaluate_filter_scalar_expr(source, row, outer, arg))
+                    .collect::<Result<Vec<_>>>()?;
+                self.evaluate_scalar_function(*func, args)?
+            }
+        })
+    }
+
+    fn evaluate_filter_short_circuit_scalar_function(
+        &self,
+        source: &RowSet,
+        row: &Row,
+        outer: Option<(&RowSet, &Row)>,
+        func: ScalarFunc,
+        args: &[ScalarExpr],
+    ) -> Result<Value> {
+        match func {
+            ScalarFunc::Coalesce => {
+                if args.is_empty() {
+                    return Err(DbError::plan("COALESCE expects at least 1 argument"));
+                }
+                for arg in args {
+                    let value = self.evaluate_filter_scalar_expr(source, row, outer, arg)?;
+                    if !matches!(value, Value::Null) {
+                        return Ok(value);
+                    }
+                }
+                Ok(Value::Null)
+            }
+            ScalarFunc::IfNull => {
+                if args.len() != 2 {
+                    return Err(DbError::plan(format!(
+                        "IFNULL expects 2 arguments but got {}",
+                        args.len()
+                    )));
+                }
+                let first = self.evaluate_filter_scalar_expr(source, row, outer, &args[0])?;
+                if matches!(first, Value::Null) {
+                    self.evaluate_filter_scalar_expr(source, row, outer, &args[1])
+                } else {
+                    Ok(first)
+                }
+            }
+            _ => unreachable!("only short-circuit scalar functions are dispatched here"),
+        }
     }
 
     fn evaluate_short_circuit_scalar_function(

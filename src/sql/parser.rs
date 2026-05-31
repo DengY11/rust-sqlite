@@ -428,6 +428,9 @@ impl Parser {
 
     fn parse_unary_scalar_expr(&mut self) -> Result<ScalarExpr> {
         if self.matches(&TokenKind::Minus) {
+            if !is_scalar_expr_start(self.peek_kind()) {
+                return Err(self.error_expected("integer literal after -"));
+            }
             return Ok(ScalarExpr::UnaryMinus(Box::new(
                 self.parse_unary_scalar_expr()?,
             )));
@@ -569,17 +572,38 @@ impl Parser {
             });
         }
         if self.matches(&TokenKind::LParen) {
-            let expr = self.parse_or_expr()?;
-            self.expect_symbol(TokenKind::RParen)?;
-            return Ok(expr);
+            let group_start = self.index - 1;
+            match self.parse_or_expr().and_then(|expr| {
+                self.expect_symbol(TokenKind::RParen)?;
+                Ok(expr)
+            }) {
+                Ok(expr) => return Ok(expr),
+                Err(_) => self.index = group_start,
+            }
         }
 
         self.parse_comparison_expr()
     }
 
     fn parse_comparison_expr(&mut self) -> Result<Expr> {
-        let column = self.parse_identifier()?;
+        if !is_scalar_expr_start(self.peek_kind()) {
+            return Err(self.error_expected(&format!(
+                "identifier or scalar expression, found {}",
+                display_token(self.peek_kind())
+            )));
+        }
+        let left_expr = self.parse_scalar_expr()?;
+        let column = if let ScalarExpr::Column(column) = &left_expr {
+            Some(column.clone())
+        } else {
+            None
+        };
         if self.matches(&TokenKind::Is) {
+            let Some(column) = column else {
+                return Err(DbError::sql(
+                    "IS NULL currently requires a column reference",
+                ));
+            };
             let negated = self.matches(&TokenKind::Not);
             if !self.matches(&TokenKind::Null) {
                 return Err(self.error_expected(&format!(
@@ -591,6 +615,9 @@ impl Parser {
         }
         if self.matches(&TokenKind::Not) {
             if self.matches(&TokenKind::Like) {
+                let Some(column) = column else {
+                    return Err(DbError::sql("LIKE currently requires a column reference"));
+                };
                 return Ok(Expr::Like {
                     column,
                     pattern: self.parse_string_literal()?,
@@ -598,6 +625,11 @@ impl Parser {
                 });
             }
             if self.matches(&TokenKind::Between) {
+                let Some(column) = column else {
+                    return Err(DbError::sql(
+                        "BETWEEN currently requires a column reference",
+                    ));
+                };
                 let low = self.parse_literal()?;
                 self.expect_keyword(TokenKind::And)?;
                 let high = self.parse_literal()?;
@@ -609,6 +641,9 @@ impl Parser {
                 });
             }
             self.expect_keyword(TokenKind::In)?;
+            let Some(column) = column else {
+                return Err(DbError::sql("IN currently requires a column reference"));
+            };
             let query = self.parse_subquery()?;
             return Ok(Expr::InSubquery {
                 column,
@@ -617,6 +652,9 @@ impl Parser {
             });
         }
         if self.matches(&TokenKind::In) {
+            let Some(column) = column else {
+                return Err(DbError::sql("IN currently requires a column reference"));
+            };
             let query = self.parse_subquery()?;
             return Ok(Expr::InSubquery {
                 column,
@@ -625,6 +663,9 @@ impl Parser {
             });
         }
         if self.matches(&TokenKind::Like) {
+            let Some(column) = column else {
+                return Err(DbError::sql("LIKE currently requires a column reference"));
+            };
             return Ok(Expr::Like {
                 column,
                 pattern: self.parse_string_literal()?,
@@ -632,6 +673,11 @@ impl Parser {
             });
         }
         if self.matches(&TokenKind::Between) {
+            let Some(column) = column else {
+                return Err(DbError::sql(
+                    "BETWEEN currently requires a column reference",
+                ));
+            };
             let low = self.parse_literal()?;
             self.expect_keyword(TokenKind::And)?;
             let high = self.parse_literal()?;
@@ -676,6 +722,11 @@ impl Parser {
             }
         };
         if self.is_subquery_start() {
+            let Some(column) = column else {
+                return Err(DbError::sql(
+                    "subquery comparisons currently require a column reference",
+                ));
+            };
             let query = self.parse_subquery()?;
             return Ok(Expr::CompareSubquery {
                 column,
@@ -683,16 +734,35 @@ impl Parser {
                 query: Box::new(query),
             });
         }
-        if is_identifier_token(self.peek_kind()) {
-            return Ok(Expr::CompareColumns {
-                left: column,
-                op,
-                right: self.parse_identifier()?,
-            });
-        }
-        let value = self.parse_literal()?;
+        let right_expr = self.parse_scalar_expr()?;
 
-        Ok(Expr::Compare { column, op, value })
+        match (&left_expr, &right_expr) {
+            (ScalarExpr::Column(left), ScalarExpr::Column(right)) => Ok(Expr::CompareColumns {
+                left: left.clone(),
+                op,
+                right: right.clone(),
+            }),
+            (ScalarExpr::Column(column), _) => {
+                if let Some(value) = scalar_expr_literal_value(&right_expr) {
+                    Ok(Expr::Compare {
+                        column: column.clone(),
+                        op,
+                        value,
+                    })
+                } else {
+                    Ok(Expr::CompareScalar {
+                        left: left_expr,
+                        op,
+                        right: right_expr,
+                    })
+                }
+            }
+            _ => Ok(Expr::CompareScalar {
+                left: left_expr,
+                op,
+                right: right_expr,
+            }),
+        }
     }
 
     fn parse_column_def(&mut self, table_name: Option<&str>) -> Result<ColumnDef> {
@@ -1165,6 +1235,31 @@ fn is_identifier_token(token: &TokenKind) -> bool {
         token,
         TokenKind::Identifier(_) | TokenKind::Nulls | TokenKind::First | TokenKind::Last
     )
+}
+
+fn is_scalar_expr_start(token: &TokenKind) -> bool {
+    is_identifier_token(token)
+        || matches!(
+            token,
+            TokenKind::LParen
+                | TokenKind::Minus
+                | TokenKind::Integer(_)
+                | TokenKind::String(_)
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Null
+        )
+}
+
+fn scalar_expr_literal_value(expr: &ScalarExpr) -> Option<Value> {
+    match expr {
+        ScalarExpr::Literal(value) => Some(value.clone()),
+        ScalarExpr::UnaryMinus(expr) => match expr.as_ref() {
+            ScalarExpr::Literal(Value::Integer(value)) => Some(Value::Integer(-value)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn is_aggregate_function_name(name: &str) -> bool {

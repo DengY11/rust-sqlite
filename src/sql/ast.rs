@@ -194,6 +194,11 @@ pub enum Expr {
         op: CompareOp,
         right: String,
     },
+    CompareScalar {
+        left: ScalarExpr,
+        op: CompareOp,
+        right: ScalarExpr,
+    },
     IsNull {
         column: String,
         negated: bool,

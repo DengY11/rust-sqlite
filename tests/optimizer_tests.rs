@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use rustsql::common::types::{ColumnDef, ColumnType, Value};
-use rustsql::sql::ast::{Assignment, CompareOp, Expr, SelectItem};
+use rustsql::sql::ast::{Assignment, CompareOp, Expr, ScalarBinaryOp, ScalarExpr, SelectItem};
 use rustsql::sql::optimizer::Optimizer;
 use rustsql::sql::plan::{IndexBound, IndexRange, IndexScanMode, Plan};
 use rustsql::sql::planner::PlanningContext;
@@ -129,6 +129,75 @@ fn optimizer_rewrites_indexable_seq_scan_to_index_scan() {
                 op: CompareOp::Eq,
                 value: Value::Integer(7),
             }),
+            order_by: vec![],
+            limit: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn optimizer_uses_indexable_and_term_with_scalar_residual_filter() {
+    let optimizer = Optimizer::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            rustsql::common::types::Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::from([(
+            "users".to_string(),
+            vec![rustsql::common::types::IndexMeta {
+                name: "idx_users_id".to_string(),
+                columns: vec!["id".to_string()],
+                unique: false,
+            }],
+        )]),
+    );
+    let filter = Expr::And(
+        Box::new(Expr::Compare {
+            column: "id".to_string(),
+            op: CompareOp::Eq,
+            value: Value::Integer(7),
+        }),
+        Box::new(Expr::CompareScalar {
+            left: ScalarExpr::Binary {
+                left: Box::new(ScalarExpr::Column("age".to_string())),
+                op: ScalarBinaryOp::Add,
+                right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+            },
+            op: CompareOp::Gte,
+            right: ScalarExpr::Literal(Value::Integer(18)),
+        }),
+    );
+    let plan = Plan::SeqScan {
+        table: "users".to_string(),
+        table_alias: None,
+        columns: vec![SelectItem::Column("age".to_string())],
+        filter: Some(filter.clone()),
+        order_by: vec![],
+        limit: None,
+        distinct: false,
+    };
+
+    let optimized = optimizer.optimize_with_context(plan, &context).unwrap();
+
+    assert_eq!(
+        optimized,
+        Plan::IndexScan {
+            table: "users".to_string(),
+            table_alias: None,
+            columns: vec![SelectItem::Column("age".to_string())],
+            index: "idx_users_id".to_string(),
+            mode: IndexScanMode::Lookup,
+            key_prefix: vec![Value::Integer(7)],
+            range: None,
+            filter: Some(filter),
             order_by: vec![],
             limit: None,
             distinct: false,
