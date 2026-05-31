@@ -51,6 +51,7 @@ pub enum NullOrder {
 pub enum OrderByExpr {
     Column(String),
     Position(usize),
+    Expr(ScalarExpr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

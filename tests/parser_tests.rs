@@ -519,6 +519,42 @@ fn parses_scalar_function_expressions() {
 }
 
 #[test]
+fn parses_order_by_scalar_expressions() {
+    let statements =
+        parse_sql("SELECT name FROM users ORDER BY LENGTH(name) DESC, LOWER(name) ASC NULLS LAST;")
+            .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            None,
+            vec![
+                OrderBy {
+                    expr: OrderByExpr::Expr(ScalarExpr::Function {
+                        func: ScalarFunc::Length,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    }),
+                    descending: true,
+                    nulls: None,
+                },
+                OrderBy {
+                    expr: OrderByExpr::Expr(ScalarExpr::Function {
+                        func: ScalarFunc::Lower,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    }),
+                    descending: false,
+                    nulls: Some(NullOrder::Last),
+                },
+            ],
+            None,
+        )]
+    );
+}
+
+#[test]
 fn parses_boolean_where_expression_with_precedence_and_parentheses() {
     let statements = parse_sql(
         "SELECT id FROM users WHERE name = 'alice' OR active = TRUE AND (id = 1 OR id = 2);",

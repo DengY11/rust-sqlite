@@ -283,6 +283,7 @@ impl Planner {
             let source = self.plan_join_source(select, context, outer_scope)?;
             if has_aggregates || !select.group_by.is_empty() {
                 self.validate_aggregate_projection(select, context)?;
+                self.reject_aggregate_order_by_scalar_expressions(&select.order_by)?;
                 return Ok(Plan::Aggregate {
                     source: Box::new(source),
                     columns: select.columns.clone(),
@@ -316,6 +317,7 @@ impl Planner {
 
         if has_aggregates || !select.group_by.is_empty() {
             self.validate_aggregate_projection(select, context)?;
+            self.reject_aggregate_order_by_scalar_expressions(&select.order_by)?;
             let source = self.plan_single_table_source(
                 SingleTablePlanInput {
                     table: &select.table,
@@ -567,7 +569,20 @@ impl Planner {
         item: &OrderBy,
     ) -> Result<OrderBy> {
         let OrderByExpr::Column(column) = &item.expr else {
-            return Ok(item.clone());
+            return match &item.expr {
+                OrderByExpr::Expr(expr) => Ok(OrderBy {
+                    expr: OrderByExpr::Expr(self.normalize_scalar_expr(
+                        schema,
+                        table,
+                        table_alias,
+                        expr,
+                    )?),
+                    descending: item.descending,
+                    nulls: item.nulls,
+                }),
+                OrderByExpr::Position(_) => Ok(item.clone()),
+                OrderByExpr::Column(_) => unreachable!(),
+            };
         };
         if self
             .select_aliases(columns)
@@ -776,6 +791,18 @@ impl Planner {
             .any(|column| matches!(column, SelectItem::Aggregate { .. }))
     }
 
+    fn reject_aggregate_order_by_scalar_expressions(&self, order_by: &[OrderBy]) -> Result<()> {
+        if order_by
+            .iter()
+            .any(|item| matches!(item.expr, OrderByExpr::Expr(_)))
+        {
+            return Err(DbError::plan(
+                "ORDER BY scalar expressions are not supported with aggregate queries",
+            ));
+        }
+        Ok(())
+    }
+
     fn require_select_item_columns(&self, schema: &Schema, item: &SelectItem) -> Result<()> {
         match item {
             SelectItem::Wildcard => Ok(()),
@@ -966,17 +993,20 @@ impl Planner {
         columns: &[SelectItem],
         item: &OrderBy,
     ) -> Result<()> {
-        let OrderByExpr::Column(column) = &item.expr else {
-            return Ok(());
-        };
-        if self
-            .select_aliases(columns)
-            .iter()
-            .any(|alias| alias == column)
-        {
-            return Ok(());
+        match &item.expr {
+            OrderByExpr::Column(column) => {
+                if self
+                    .select_aliases(columns)
+                    .iter()
+                    .any(|alias| alias == column)
+                {
+                    return Ok(());
+                }
+                self.resolve_column_in_scope(scope, column).map(|_| ())
+            }
+            OrderByExpr::Expr(expr) => self.require_scalar_expr_scope(scope, expr),
+            OrderByExpr::Position(_) => Ok(()),
         }
-        self.resolve_column_in_scope(scope, column).map(|_| ())
     }
 
     fn require_scope_columns_with_outer(

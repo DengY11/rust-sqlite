@@ -1302,6 +1302,63 @@ fn database_short_circuits_coalesce_and_ifnull() {
 }
 
 #[test]
+fn database_orders_by_scalar_expressions() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, nickname TEXT);
+         INSERT INTO users VALUES (1, 'bob', NULL);
+         INSERT INTO users VALUES (2, 'alice', 'ally');
+         INSERT INTO users VALUES (3, 'carol', 'c');",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT name
+             FROM users
+             ORDER BY LENGTH(COALESCE(nickname, name)) DESC, LOWER(name) ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from("alice")],
+            vec![Value::from("bob")],
+            vec![Value::from("carol")],
+        ]
+    );
+}
+
+#[test]
+fn database_rejects_aggregate_order_by_scalar_expressions_without_panic() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN);
+         INSERT INTO users VALUES (1, 'bob', true);
+         INSERT INTO users VALUES (2, 'alice', true);
+         INSERT INTO users VALUES (3, 'carol', false);",
+    )
+    .unwrap();
+
+    let error = db
+        .query(
+            "SELECT active, COUNT(*) AS total
+             FROM users
+             GROUP BY active
+             ORDER BY total + 1 DESC;",
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("ORDER BY scalar expressions are not supported with aggregate queries"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn database_supports_exists_and_not_exists_subqueries() {
     let db = Database::memory();
 

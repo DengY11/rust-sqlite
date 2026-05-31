@@ -987,7 +987,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         distinct: bool,
     ) -> Result<RowSet> {
         if columns.len() == 1 && matches!(columns.first(), Some(SelectItem::Wildcard)) {
-            let mut rowset = self.sort_and_limit_rows(source, order_by, limit);
+            let mut rowset = self.sort_and_limit_rows(source, order_by, limit)?;
             if distinct {
                 rowset.rows = Self::deduplicate_rows(rowset.rows);
             }
@@ -995,29 +995,33 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         }
 
         let projected_columns = self.projected_columns(&source.columns, columns)?;
-        let mut entries = source
+        let entries = source
             .rows
             .iter()
             .map(|row| Ok((self.project_row(&source, row, columns)?, row.clone())))
             .collect::<Result<Vec<(Row, Row)>>>()?;
 
-        if !order_by.is_empty() {
-            entries.sort_by(
-                |(left_projected, left_full), (right_projected, right_full)| {
-                    self.compare_ordering(
-                        &projected_columns,
-                        (left_projected, right_projected),
-                        &source.columns,
-                        (left_full, right_full),
-                        order_by,
-                    )
-                },
-            );
-        }
-
         let mut rows = entries
             .into_iter()
-            .map(|(projected, _)| projected)
+            .map(|(projected, full)| {
+                let sort_key = self.order_sort_key(
+                    &projected_columns,
+                    &projected,
+                    &source.columns,
+                    &full,
+                    order_by,
+                )?;
+                Ok((sort_key, projected))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !order_by.is_empty() {
+            rows.sort_by(|(left_key, _), (right_key, _)| {
+                self.compare_order_keys(left_key, right_key, order_by)
+            });
+        }
+        let mut rows = rows
+            .into_iter()
+            .map(|(_, projected)| projected)
             .collect::<Vec<_>>();
         if distinct {
             rows = Self::deduplicate_rows(rows);
@@ -1406,49 +1410,71 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         mut rowset: RowSet,
         order_by: &[OrderBy],
         limit: Option<usize>,
-    ) -> RowSet {
+    ) -> Result<RowSet> {
         if !order_by.is_empty() {
-            rowset.rows.sort_by(|left, right| {
-                self.compare_ordering(
-                    &rowset.columns,
-                    (left, right),
-                    &rowset.columns,
-                    (left, right),
-                    order_by,
-                )
+            let mut rows = rowset
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let sort_key = self.order_sort_key(
+                        &rowset.columns,
+                        &row,
+                        &rowset.columns,
+                        &row,
+                        order_by,
+                    )?;
+                    Ok((sort_key, row))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.sort_by(|(left_key, _), (right_key, _)| {
+                self.compare_order_keys(left_key, right_key, order_by)
             });
+            rowset.rows = rows.into_iter().map(|(_, row)| row).collect();
         }
         if let Some(limit) = limit {
             rowset.rows.truncate(limit);
         }
-        rowset
+        Ok(rowset)
     }
 
-    fn compare_ordering(
+    fn order_sort_key(
         &self,
         projected_columns: &[ColumnMeta],
-        projected_rows: (&Row, &Row),
+        projected_row: &Row,
         full_columns: &[ColumnMeta],
-        full_rows: (&Row, &Row),
+        full_row: &Row,
+        order_by: &[OrderBy],
+    ) -> Result<Vec<Option<Value>>> {
+        let full_source = RowSet {
+            columns: full_columns.to_vec(),
+            rows: vec![],
+        };
+        order_by
+            .iter()
+            .map(|item| match &item.expr {
+                OrderByExpr::Expr(expr) => self
+                    .evaluate_scalar_expr(&full_source, full_row, expr)
+                    .map(Some),
+                _ => Ok(self
+                    .resolve_order_value(
+                        projected_columns,
+                        projected_row,
+                        full_columns,
+                        full_row,
+                        &item.expr,
+                    )
+                    .cloned()),
+            })
+            .collect()
+    }
+
+    fn compare_order_keys(
+        &self,
+        left_key: &[Option<Value>],
+        right_key: &[Option<Value>],
         order_by: &[OrderBy],
     ) -> Ordering {
-        let (left_projected, right_projected) = projected_rows;
-        let (left_full, right_full) = full_rows;
-        for item in order_by {
-            let left_value = self.resolve_order_value(
-                projected_columns,
-                left_projected,
-                full_columns,
-                left_full,
-                &item.expr,
-            );
-            let right_value = self.resolve_order_value(
-                projected_columns,
-                right_projected,
-                full_columns,
-                right_full,
-                &item.expr,
-            );
+        for ((left_value, right_value), item) in left_key.iter().zip(right_key).zip(order_by) {
             let ordering = match (left_value, right_value) {
                 (Some(left), Some(right)) => {
                     self.compare_order_values(left, right, item.nulls, item.descending)
@@ -1662,6 +1688,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 .try_lookup_value(projected_columns, projected, column)
                 .or_else(|| self.try_lookup_value(full_columns, full, column)),
             OrderByExpr::Position(position) => projected.get(position.saturating_sub(1)),
+            OrderByExpr::Expr(_) => None,
         }
     }
 

@@ -867,14 +867,29 @@ impl Parser {
     fn parse_order_by_items(&mut self) -> Result<Vec<OrderBy>> {
         let mut items = Vec::new();
         loop {
-            let expr = match self.peek_kind() {
-                TokenKind::Integer(value) if *value > 0 => {
-                    let position = usize::try_from(*value)
-                        .map_err(|_| DbError::sql("ORDER BY position is too large"))?;
-                    self.advance();
-                    OrderByExpr::Position(position)
+            let expr = if let TokenKind::Integer(value) = self.peek_kind()
+                && *value > 0
+                && matches!(
+                    self.tokens.get(self.index + 1).map(|token| &token.kind),
+                    Some(
+                        TokenKind::Asc
+                            | TokenKind::Desc
+                            | TokenKind::Nulls
+                            | TokenKind::Comma
+                            | TokenKind::Semicolon
+                            | TokenKind::Eof
+                    )
+                ) {
+                let position = usize::try_from(*value)
+                    .map_err(|_| DbError::sql("ORDER BY position is too large"))?;
+                self.advance();
+                OrderByExpr::Position(position)
+            } else {
+                let expr = self.parse_scalar_expr()?;
+                match expr {
+                    ScalarExpr::Column(name) => OrderByExpr::Column(name),
+                    expr => OrderByExpr::Expr(expr),
                 }
-                _ => OrderByExpr::Column(self.parse_identifier()?),
             };
             let descending = if self.matches(&TokenKind::Desc) {
                 true
