@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::common::error::{DbError, Result};
-use crate::common::types::{IndexMeta, Row, RowId, Schema, Value};
+use crate::common::types::{ColumnDef, IndexMeta, Row, RowId, Schema, Value};
 use crate::engine::traits::{
     CatalogStore, IndexStore, PlanningStorageEngine, TableStore, TransactionManager,
 };
@@ -197,7 +197,42 @@ impl FileStorageInner {
 
         for index in indexes.values_mut() {
             let key = Self::project_index_key(&schema, &index.meta, row)?;
+            if index.meta.enforces_unique_key(&key)
+                && index
+                    .entries
+                    .get(&key)
+                    .is_some_and(|row_ids| !row_ids.is_empty())
+            {
+                return Err(DbError::storage(format!(
+                    "unique index {} constraint failed",
+                    index.meta.name
+                )));
+            }
             index.entries.entry(key).or_default().insert(row_id);
+        }
+
+        Ok(())
+    }
+
+    fn validate_unique_index_constraints(&self, schema_name: &str, row: &Row) -> Result<()> {
+        let schema = self.require_schema(schema_name)?.clone();
+        let Some(indexes) = self.state.indexes.get(schema_name) else {
+            return Ok(());
+        };
+
+        for index in indexes.values() {
+            let key = Self::project_index_key(&schema, &index.meta, row)?;
+            if index.meta.enforces_unique_key(&key)
+                && index
+                    .entries
+                    .get(&key)
+                    .is_some_and(|row_ids| !row_ids.is_empty())
+            {
+                return Err(DbError::storage(format!(
+                    "unique index {} constraint failed",
+                    index.meta.name
+                )));
+            }
         }
 
         Ok(())
@@ -264,6 +299,138 @@ impl CatalogStore for FileStorage {
         Ok(())
     }
 
+    fn replace_schema(&self, transaction_id: TransactionId, schema: Schema) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        if !inner.state.schemas.contains_key(&schema.name) {
+            return Err(DbError::storage(format!("unknown table: {}", schema.name)));
+        }
+        inner.state.schemas.insert(schema.name.clone(), schema);
+        Ok(())
+    }
+
+    fn rename_schema(
+        &self,
+        transaction_id: TransactionId,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        if inner.state.schemas.contains_key(new_name) {
+            return Err(DbError::storage(format!(
+                "table already exists: {new_name}"
+            )));
+        }
+        let mut schema = inner
+            .state
+            .schemas
+            .remove(old_name)
+            .ok_or_else(|| DbError::storage(format!("unknown table: {old_name}")))?;
+        schema.name = new_name.to_string();
+        inner.state.schemas.insert(new_name.to_string(), schema);
+        if let Some(rows) = inner.state.rows.remove(old_name) {
+            inner.state.rows.insert(new_name.to_string(), rows);
+        }
+        if let Some(indexes) = inner.state.indexes.remove(old_name) {
+            inner.state.indexes.insert(new_name.to_string(), indexes);
+        }
+        if let Some(next_row_id) = inner.state.next_row_ids.remove(old_name) {
+            inner
+                .state
+                .next_row_ids
+                .insert(new_name.to_string(), next_row_id);
+        }
+        for schema in inner.state.schemas.values_mut() {
+            schema.rename_foreign_key_ref_table(old_name, new_name);
+        }
+        Ok(())
+    }
+
+    fn add_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        column: ColumnDef,
+    ) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let schema = inner.require_schema(schema_name)?.clone();
+        if schema.columns.iter().any(|entry| entry.name == column.name) {
+            return Err(DbError::storage(format!(
+                "column already exists on table {schema_name}: {}",
+                column.name
+            )));
+        }
+        let default_value = column.default_value.clone().unwrap_or(Value::Null);
+        let mut updated_schema = schema;
+        updated_schema.columns.push(column);
+        updated_schema.validate_constraints_metadata()?;
+        if let Some(rows) = inner.state.rows.get(schema_name) {
+            for row in rows.values() {
+                let mut candidate = row.clone();
+                candidate.push(default_value.clone());
+                updated_schema.validate_row_values(&candidate)?;
+                updated_schema.validate_check_constraints(&candidate)?;
+            }
+        }
+        inner
+            .state
+            .schemas
+            .insert(schema_name.to_string(), updated_schema);
+        if let Some(rows) = inner.state.rows.get_mut(schema_name) {
+            for row in rows.values_mut() {
+                row.push(default_value.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn rename_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let schema = inner.require_schema(schema_name)?.clone();
+        if !schema.columns.iter().any(|entry| entry.name == old_name) {
+            return Err(DbError::storage(format!(
+                "unknown column {old_name} on table {schema_name}"
+            )));
+        }
+        if schema.columns.iter().any(|entry| entry.name == new_name) {
+            return Err(DbError::storage(format!(
+                "column already exists on table {schema_name}: {new_name}"
+            )));
+        }
+        let mut updated_schema = schema;
+        updated_schema.rename_column_references(old_name, new_name);
+        updated_schema.rename_foreign_key_ref_column(schema_name, old_name, new_name);
+        updated_schema.validate_constraints_metadata()?;
+        inner
+            .state
+            .schemas
+            .insert(schema_name.to_string(), updated_schema);
+        if let Some(indexes) = inner.state.indexes.get_mut(schema_name) {
+            for index in indexes.values_mut() {
+                for column in &mut index.meta.columns {
+                    if column == old_name {
+                        *column = new_name.to_string();
+                    }
+                }
+            }
+        }
+        for (name, schema) in &mut inner.state.schemas {
+            if name != schema_name {
+                schema.rename_foreign_key_ref_column(schema_name, old_name, new_name);
+            }
+        }
+        Ok(())
+    }
+
     fn get_schema(&self, transaction_id: TransactionId, name: &str) -> Result<Option<Schema>> {
         let inner = self.inner.borrow();
         inner.validate_transaction(transaction_id)?;
@@ -304,8 +471,10 @@ impl TableStore for FileStorage {
                 .map(|rows| rows.values().collect::<Vec<_>>())
                 .unwrap_or_default();
             schema.validate_row_values(&row)?;
+            schema.validate_check_constraints(&row)?;
             schema.validate_primary_key_uniqueness(&row, &existing_rows)?;
         }
+        inner.validate_unique_index_constraints(schema_name, &row)?;
 
         let row_id = inner.next_row_id(schema_name);
         inner
@@ -410,6 +579,16 @@ impl IndexStore for FileStorage {
         if let Some(rows) = inner.state.rows.get(schema_name) {
             for (row_id, row) in rows {
                 let key = FileStorageInner::project_index_key(&schema, &index, row)?;
+                if index.enforces_unique_key(&key)
+                    && entries
+                        .get(&key)
+                        .is_some_and(|row_ids: &BTreeSet<RowId>| !row_ids.is_empty())
+                {
+                    return Err(DbError::storage(format!(
+                        "unique index {} constraint failed",
+                        index.name
+                    )));
+                }
                 entries
                     .entry(key)
                     .or_insert_with(BTreeSet::new)

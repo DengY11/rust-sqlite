@@ -1,8 +1,11 @@
 use crate::common::error::{DbError, Result};
-use crate::common::types::{ColumnDef, ColumnType, Value};
+use crate::common::types::{
+    CheckConstraint, CheckExpr, CheckOp, ColumnDef, ColumnType, ForeignKey, Value,
+};
 use crate::sql::ast::{
-    AggregateArg, AggregateFunc, Assignment, CompareOp, Expr, JoinClause, JoinKind, OrderBy,
-    OrderByExpr, SelectItem, SelectStatement, Statement,
+    AggregateArg, AggregateFunc, AlterTableAction, Assignment, CompareOp, Expr, JoinClause,
+    JoinKind, NullOrder, OrderBy, OrderByExpr, ScalarBinaryOp, ScalarExpr, SelectItem,
+    SelectStatement, Statement, TableConstraint,
 };
 use crate::sql::lexer::{Token, TokenKind, lex};
 
@@ -46,9 +49,11 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.peek_kind() {
             TokenKind::Create => self.parse_create(),
+            TokenKind::Alter => self.parse_alter(),
             TokenKind::Drop => self.parse_drop(),
             TokenKind::Insert => self.parse_insert(),
             TokenKind::Select => Ok(Statement::Select(self.parse_select_statement()?)),
+            TokenKind::Explain => self.parse_explain(),
             TokenKind::Delete => self.parse_delete(),
             TokenKind::Update => self.parse_update(),
             TokenKind::Begin => {
@@ -70,14 +75,67 @@ impl Parser {
         }
     }
 
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Alter)?;
+        self.expect_keyword(TokenKind::Table)?;
+        let table = self.parse_simple_identifier()?;
+
+        if self.matches(&TokenKind::Add) {
+            let _ = self.matches(&TokenKind::Column);
+            let column = self.parse_column_def(Some(&table))?;
+            return Ok(Statement::AlterTable {
+                table,
+                action: AlterTableAction::AddColumn(column),
+            });
+        }
+
+        self.expect_keyword(TokenKind::Rename)?;
+        if self.matches(&TokenKind::Column) {
+            let old_name = self.parse_simple_identifier()?;
+            self.expect_keyword(TokenKind::To)?;
+            let new_name = self.parse_simple_identifier()?;
+            return Ok(Statement::AlterTable {
+                table,
+                action: AlterTableAction::RenameColumn { old_name, new_name },
+            });
+        }
+
+        self.expect_keyword(TokenKind::To)?;
+        let new_name = self.parse_simple_identifier()?;
+        Ok(Statement::AlterTable {
+            table,
+            action: AlterTableAction::RenameTable { new_name },
+        })
+    }
+
+    fn parse_explain(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Explain)?;
+        self.expect_keyword(TokenKind::Query)?;
+        self.expect_keyword(TokenKind::Plan)?;
+        match self.peek_kind() {
+            TokenKind::Select => Ok(Statement::ExplainQueryPlan(Box::new(Statement::Select(
+                self.parse_select_statement()?,
+            )))),
+            token => Err(self.error_expected(&format!(
+                "SELECT after EXPLAIN QUERY PLAN, found {}",
+                display_token(token)
+            ))),
+        }
+    }
+
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Create)?;
         match self.peek_kind() {
             TokenKind::Table => self.parse_create_table(),
-            TokenKind::Index => self.parse_create_index(),
-            token => {
-                Err(self.error_expected(&format!("TABLE or INDEX, found {}", display_token(token))))
+            TokenKind::Index => self.parse_create_index(false),
+            TokenKind::Unique => {
+                self.advance();
+                self.parse_create_index(true)
             }
+            token => Err(self.error_expected(&format!(
+                "TABLE, INDEX, or UNIQUE INDEX, found {}",
+                display_token(token)
+            ))),
         }
     }
 
@@ -87,18 +145,28 @@ impl Parser {
         self.expect_symbol(TokenKind::LParen)?;
 
         let mut columns = Vec::new();
+        let mut constraints = Vec::new();
         loop {
-            columns.push(self.parse_column_def()?);
+            match self.peek_kind() {
+                TokenKind::Check | TokenKind::Foreign | TokenKind::Constraint => {
+                    constraints.push(self.parse_table_constraint(&name)?);
+                }
+                _ => columns.push(self.parse_column_def(Some(&name))?),
+            }
             if !self.matches(&TokenKind::Comma) {
                 break;
             }
         }
 
         self.expect_symbol(TokenKind::RParen)?;
-        Ok(Statement::CreateTable { name, columns })
+        Ok(Statement::CreateTable {
+            name,
+            columns,
+            constraints,
+        })
     }
 
-    fn parse_create_index(&mut self) -> Result<Statement> {
+    fn parse_create_index(&mut self, unique: bool) -> Result<Statement> {
         self.expect_keyword(TokenKind::Index)?;
         let name = self.parse_identifier()?;
         self.expect_keyword(TokenKind::On)?;
@@ -109,6 +177,7 @@ impl Parser {
             name,
             table,
             columns,
+            unique,
         })
     }
 
@@ -260,21 +329,22 @@ impl Parser {
             return Ok(SelectItem::Wildcard);
         }
 
-        let name = self.parse_simple_identifier()?;
-        let mut item = if matches!(self.peek_kind(), TokenKind::LParen) {
+        let mut item = if let TokenKind::Identifier(name) = self.peek_kind()
+            && matches!(
+                self.tokens.get(self.index + 1).map(|token| &token.kind),
+                Some(TokenKind::LParen)
+            ) {
+            let name = name.clone();
+            self.advance();
             self.parse_aggregate_item(name)?
         } else {
-            let mut name = name;
-            while self.matches(&TokenKind::Dot) {
-                let segment = self.parse_simple_identifier()?;
-                name.push('.');
-                name.push_str(&segment);
+            let expr = self.parse_scalar_expr()?;
+            match expr {
+                ScalarExpr::Column(name) => SelectItem::Column(name),
+                expr => SelectItem::Expr { expr, alias: None },
             }
-            SelectItem::Column(name)
         };
-        let alias = if self.matches(&TokenKind::As)
-            || matches!(self.peek_kind(), TokenKind::Identifier(_))
-        {
+        let alias = if self.matches(&TokenKind::As) || is_identifier_token(self.peek_kind()) {
             Some(self.parse_simple_identifier()?)
         } else {
             None
@@ -284,6 +354,10 @@ impl Parser {
             item = match item {
                 SelectItem::Column(name) => SelectItem::AliasedColumn { name, alias },
                 SelectItem::AliasedColumn { name, .. } => SelectItem::AliasedColumn { name, alias },
+                SelectItem::Expr { expr, .. } => SelectItem::Expr {
+                    expr,
+                    alias: Some(alias),
+                },
                 SelectItem::Aggregate { func, arg, .. } => SelectItem::Aggregate {
                     func,
                     arg,
@@ -294,6 +368,89 @@ impl Parser {
         }
 
         Ok(item)
+    }
+
+    fn parse_scalar_expr(&mut self) -> Result<ScalarExpr> {
+        self.parse_concat_expr()
+    }
+
+    fn parse_concat_expr(&mut self) -> Result<ScalarExpr> {
+        let mut expr = self.parse_additive_expr()?;
+        while self.matches(&TokenKind::PipePipe) {
+            expr = ScalarExpr::Binary {
+                left: Box::new(expr),
+                op: ScalarBinaryOp::Concat,
+                right: Box::new(self.parse_additive_expr()?),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_additive_expr(&mut self) -> Result<ScalarExpr> {
+        let mut expr = self.parse_multiplicative_expr()?;
+        loop {
+            let op = if self.matches(&TokenKind::Plus) {
+                ScalarBinaryOp::Add
+            } else if self.matches(&TokenKind::Minus) {
+                ScalarBinaryOp::Subtract
+            } else {
+                break;
+            };
+            expr = ScalarExpr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_multiplicative_expr()?),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_multiplicative_expr(&mut self) -> Result<ScalarExpr> {
+        let mut expr = self.parse_unary_scalar_expr()?;
+        loop {
+            let op = if self.matches(&TokenKind::Star) {
+                ScalarBinaryOp::Multiply
+            } else if self.matches(&TokenKind::Slash) {
+                ScalarBinaryOp::Divide
+            } else {
+                break;
+            };
+            expr = ScalarExpr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_unary_scalar_expr()?),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_unary_scalar_expr(&mut self) -> Result<ScalarExpr> {
+        if self.matches(&TokenKind::Minus) {
+            return Ok(ScalarExpr::UnaryMinus(Box::new(
+                self.parse_unary_scalar_expr()?,
+            )));
+        }
+        self.parse_primary_scalar_expr()
+    }
+
+    fn parse_primary_scalar_expr(&mut self) -> Result<ScalarExpr> {
+        if self.matches(&TokenKind::LParen) {
+            let expr = self.parse_scalar_expr()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(expr);
+        }
+        match self.peek_kind() {
+            token if is_identifier_token(token) => Ok(ScalarExpr::Column(self.parse_identifier()?)),
+            TokenKind::Integer(_)
+            | TokenKind::String(_)
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Null => Ok(ScalarExpr::Literal(self.parse_literal()?)),
+            token => Err(self.error_expected(&format!(
+                "scalar expression, found {}",
+                display_token(token)
+            ))),
+        }
     }
 
     fn parse_aggregate_item(&mut self, function_name: String) -> Result<SelectItem> {
@@ -351,6 +508,13 @@ impl Parser {
 
     fn parse_not_expr(&mut self) -> Result<Expr> {
         if self.matches(&TokenKind::Not) {
+            if self.matches(&TokenKind::Exists) {
+                let query = self.parse_subquery_after_exists()?;
+                return Ok(Expr::ExistsSubquery {
+                    query: Box::new(query),
+                    negated: true,
+                });
+            }
             return Ok(Expr::Not(Box::new(self.parse_not_expr()?)));
         }
 
@@ -358,6 +522,13 @@ impl Parser {
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr> {
+        if self.matches(&TokenKind::Exists) {
+            let query = self.parse_subquery_after_exists()?;
+            return Ok(Expr::ExistsSubquery {
+                query: Box::new(query),
+                negated: false,
+            });
+        }
         if self.matches(&TokenKind::LParen) {
             let expr = self.parse_or_expr()?;
             self.expect_symbol(TokenKind::RParen)?;
@@ -473,7 +644,7 @@ impl Parser {
                 query: Box::new(query),
             });
         }
-        if matches!(self.peek_kind(), TokenKind::Identifier(_)) {
+        if is_identifier_token(self.peek_kind()) {
             return Ok(Expr::CompareColumns {
                 left: column,
                 op,
@@ -485,7 +656,7 @@ impl Parser {
         Ok(Expr::Compare { column, op, value })
     }
 
-    fn parse_column_def(&mut self) -> Result<ColumnDef> {
+    fn parse_column_def(&mut self, table_name: Option<&str>) -> Result<ColumnDef> {
         let name = self.parse_simple_identifier()?;
         let column_type = self.parse_column_type()?;
         let mut column = ColumnDef::new(name, column_type);
@@ -504,10 +675,110 @@ impl Parser {
                 continue;
             }
 
+            if self.matches(&TokenKind::Default) {
+                column = column.default_value(self.parse_literal()?);
+                continue;
+            }
+
+            if self.matches(&TokenKind::Check) {
+                let check_name =
+                    format!("{}_{}_check", table_name.unwrap_or("column"), column.name);
+                column = column.check(self.parse_check_constraint(check_name)?);
+                continue;
+            }
+
+            if self.matches(&TokenKind::References) {
+                let ref_table = self.parse_simple_identifier()?;
+                self.expect_symbol(TokenKind::LParen)?;
+                let ref_column = self.parse_simple_identifier()?;
+                self.expect_symbol(TokenKind::RParen)?;
+                column = column.references(ref_table, ref_column);
+                continue;
+            }
+
             break;
         }
 
         Ok(column)
+    }
+
+    fn parse_table_constraint(&mut self, table_name: &str) -> Result<TableConstraint> {
+        let name = if self.matches(&TokenKind::Constraint) {
+            Some(self.parse_simple_identifier()?)
+        } else {
+            None
+        };
+
+        if self.matches(&TokenKind::Check) {
+            let name = name.unwrap_or_else(|| format!("{table_name}_check"));
+            return Ok(TableConstraint::Check(self.parse_check_constraint(name)?));
+        }
+
+        if self.matches(&TokenKind::Foreign) {
+            self.expect_keyword(TokenKind::Key)?;
+            return Ok(TableConstraint::ForeignKey(
+                self.parse_foreign_key_constraint()?,
+            ));
+        }
+
+        Err(self.error_expected(&format!(
+            "CHECK or FOREIGN KEY constraint, found {}",
+            display_token(self.peek_kind())
+        )))
+    }
+
+    fn parse_check_constraint(&mut self, name: String) -> Result<CheckConstraint> {
+        self.expect_symbol(TokenKind::LParen)?;
+        let expr = self.parse_where_expr()?;
+        self.expect_symbol(TokenKind::RParen)?;
+        Ok(CheckConstraint {
+            name,
+            expr: Self::check_expr_from_expr(expr)?,
+        })
+    }
+
+    fn parse_foreign_key_constraint(&mut self) -> Result<ForeignKey> {
+        self.expect_symbol(TokenKind::LParen)?;
+        let column = self.parse_simple_identifier()?;
+        self.expect_symbol(TokenKind::RParen)?;
+        self.expect_keyword(TokenKind::References)?;
+        let ref_table = self.parse_simple_identifier()?;
+        self.expect_symbol(TokenKind::LParen)?;
+        let ref_column = self.parse_simple_identifier()?;
+        self.expect_symbol(TokenKind::RParen)?;
+        Ok(ForeignKey::single_column(column, ref_table, ref_column))
+    }
+
+    fn check_expr_from_expr(expr: Expr) -> Result<CheckExpr> {
+        Ok(match expr {
+            Expr::Compare { column, op, value } => CheckExpr::Compare {
+                column,
+                op: Self::check_op_from_compare_op(op),
+                value,
+            },
+            Expr::IsNull { column, negated } => CheckExpr::IsNull { column, negated },
+            Expr::And(left, right) => CheckExpr::And(
+                Box::new(Self::check_expr_from_expr(*left)?),
+                Box::new(Self::check_expr_from_expr(*right)?),
+            ),
+            Expr::Or(left, right) => CheckExpr::Or(
+                Box::new(Self::check_expr_from_expr(*left)?),
+                Box::new(Self::check_expr_from_expr(*right)?),
+            ),
+            Expr::Not(expr) => CheckExpr::Not(Box::new(Self::check_expr_from_expr(*expr)?)),
+            _ => return Err(DbError::sql("unsupported CHECK expression")),
+        })
+    }
+
+    fn check_op_from_compare_op(op: CompareOp) -> CheckOp {
+        match op {
+            CompareOp::Eq => CheckOp::Eq,
+            CompareOp::Ne => CheckOp::Ne,
+            CompareOp::Gt => CheckOp::Gt,
+            CompareOp::Gte => CheckOp::Gte,
+            CompareOp::Lt => CheckOp::Lt,
+            CompareOp::Lte => CheckOp::Lte,
+        }
     }
 
     fn parse_column_type(&mut self) -> Result<ColumnType> {
@@ -572,7 +843,25 @@ impl Parser {
                 self.matches(&TokenKind::Asc);
                 false
             };
-            items.push(OrderBy { expr, descending });
+            let nulls = if self.matches(&TokenKind::Nulls) {
+                if self.matches(&TokenKind::First) {
+                    Some(NullOrder::First)
+                } else if self.matches(&TokenKind::Last) {
+                    Some(NullOrder::Last)
+                } else {
+                    return Err(self.error_expected(&format!(
+                        "FIRST or LAST after NULLS, found {}",
+                        display_token(self.peek_kind())
+                    )));
+                }
+            } else {
+                None
+            };
+            items.push(OrderBy {
+                expr,
+                descending,
+                nulls,
+            });
             if !self.matches(&TokenKind::Comma) {
                 break;
             }
@@ -633,6 +922,10 @@ impl Parser {
         let query = self.parse_select_statement()?;
         self.expect_symbol(TokenKind::RParen)?;
         Ok(query)
+    }
+
+    fn parse_subquery_after_exists(&mut self) -> Result<SelectStatement> {
+        self.parse_subquery()
     }
 
     fn parse_limit_value(&mut self) -> Result<usize> {
@@ -728,6 +1021,18 @@ impl Parser {
                 self.advance();
                 Ok(name)
             }
+            TokenKind::Nulls => {
+                self.advance();
+                Ok("nulls".to_string())
+            }
+            TokenKind::First => {
+                self.advance();
+                Ok("first".to_string())
+            }
+            TokenKind::Last => {
+                self.advance();
+                Ok("last".to_string())
+            }
             token => {
                 Err(self.error_expected(&format!("identifier, found {}", display_token(token))))
             }
@@ -738,7 +1043,7 @@ impl Parser {
         if self.matches(&TokenKind::As) {
             return Ok(Some(self.parse_simple_identifier()?));
         }
-        if matches!(self.peek_kind(), TokenKind::Identifier(_)) {
+        if is_identifier_token(self.peek_kind()) {
             return Ok(Some(self.parse_simple_identifier()?));
         }
         Ok(None)
@@ -801,11 +1106,24 @@ fn same_variant(left: &TokenKind, right: &TokenKind) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
 }
 
+fn is_identifier_token(token: &TokenKind) -> bool {
+    matches!(
+        token,
+        TokenKind::Identifier(_) | TokenKind::Nulls | TokenKind::First | TokenKind::Last
+    )
+}
+
 fn display_token(token: &TokenKind) -> String {
     match token {
         TokenKind::Create => "CREATE".to_string(),
+        TokenKind::Alter => "ALTER".to_string(),
+        TokenKind::Add => "ADD".to_string(),
+        TokenKind::Rename => "RENAME".to_string(),
         TokenKind::Drop => "DROP".to_string(),
         TokenKind::Table => "TABLE".to_string(),
+        TokenKind::Column => "COLUMN".to_string(),
+        TokenKind::To => "TO".to_string(),
+        TokenKind::Unique => "UNIQUE".to_string(),
         TokenKind::Index => "INDEX".to_string(),
         TokenKind::On => "ON".to_string(),
         TokenKind::Insert => "INSERT".to_string(),
@@ -841,6 +1159,17 @@ fn display_token(token: &TokenKind) -> String {
         TokenKind::In => "IN".to_string(),
         TokenKind::Is => "IS".to_string(),
         TokenKind::Exists => "EXISTS".to_string(),
+        TokenKind::Explain => "EXPLAIN".to_string(),
+        TokenKind::Query => "QUERY".to_string(),
+        TokenKind::Plan => "PLAN".to_string(),
+        TokenKind::Default => "DEFAULT".to_string(),
+        TokenKind::Check => "CHECK".to_string(),
+        TokenKind::Constraint => "CONSTRAINT".to_string(),
+        TokenKind::Foreign => "FOREIGN".to_string(),
+        TokenKind::References => "REFERENCES".to_string(),
+        TokenKind::Nulls => "NULLS".to_string(),
+        TokenKind::First => "FIRST".to_string(),
+        TokenKind::Last => "LAST".to_string(),
         TokenKind::Primary => "PRIMARY".to_string(),
         TokenKind::Key => "KEY".to_string(),
         TokenKind::IntegerType => "INTEGER".to_string(),
@@ -864,7 +1193,10 @@ fn display_token(token: &TokenKind) -> String {
         TokenKind::Gte => ">=".to_string(),
         TokenKind::Lt => "<".to_string(),
         TokenKind::Lte => "<=".to_string(),
+        TokenKind::Plus => "+".to_string(),
         TokenKind::Minus => "-".to_string(),
+        TokenKind::Slash => "/".to_string(),
+        TokenKind::PipePipe => "||".to_string(),
         TokenKind::Eof => "end of input".to_string(),
     }
 }

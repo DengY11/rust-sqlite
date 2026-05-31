@@ -1,7 +1,7 @@
 //! Storage engine traits shared by future backends.
 
 use crate::common::error::Result;
-use crate::common::types::{IndexMeta, Row, RowId, Schema, Value};
+use crate::common::types::{ColumnDef, IndexMeta, Row, RowId, Schema, Value};
 use crate::engine::txn::TransactionId;
 use crate::sql::ast::CompareOp;
 use crate::sql::planner::PlanningContext;
@@ -9,6 +9,26 @@ use crate::sql::planner::PlanningContext;
 pub trait CatalogStore {
     fn create_schema(&self, transaction_id: TransactionId, schema: Schema) -> Result<()>;
     fn drop_schema(&self, transaction_id: TransactionId, name: &str) -> Result<()>;
+    fn replace_schema(&self, transaction_id: TransactionId, schema: Schema) -> Result<()>;
+    fn rename_schema(
+        &self,
+        transaction_id: TransactionId,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()>;
+    fn add_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        column: ColumnDef,
+    ) -> Result<()>;
+    fn rename_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()>;
     fn get_schema(&self, transaction_id: TransactionId, name: &str) -> Result<Option<Schema>>;
     fn list_schemas(&self, transaction_id: TransactionId) -> Result<Vec<Schema>>;
 }

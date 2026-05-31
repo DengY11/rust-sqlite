@@ -71,27 +71,34 @@ DDL and writes:
 - `CREATE INDEX`
 - `DROP TABLE`
 - `DROP INDEX`
+- `ALTER TABLE ... ADD COLUMN ...`
+- `ALTER TABLE ... RENAME TO ...`
+- `ALTER TABLE ... RENAME COLUMN ... TO ...`
 - `INSERT INTO ... VALUES ...`
 - `INSERT INTO ... (columns...) VALUES ...`
 - `UPDATE ... SET ... WHERE ...`
 - `DELETE FROM ... WHERE ...`
 - `BEGIN`, `COMMIT`, `ROLLBACK`
+- literal `DEFAULT` values
+- `CHECK` constraints
+- basic single-column foreign keys with immediate enforcement
 
 Queries:
 
 - `SELECT *` and explicit projections
+- scalar projection expressions with integer arithmetic (`+`, `-`, `*`, `/`) and text concatenation (`||`)
 - column aliases and table aliases
 - `WHERE` with `=`, `!=`, `>`, `>=`, `<`, `<=`
 - `LIKE`, `NOT LIKE`, `BETWEEN`, and `NOT BETWEEN`
 - boolean expressions with `AND`, `OR`, `NOT`, parentheses
 - `IS NULL` / `IS NOT NULL`
-- `ORDER BY` by column, alias, or select-list position, and `LIMIT`
+- `ORDER BY` by column, alias, or select-list position, including `NULLS FIRST` / `NULLS LAST`, and `LIMIT`
 - `GROUP BY`
 - aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, including `DISTINCT` column arguments
 - `HAVING`
 - `INNER JOIN` and `LEFT JOIN`
 - `DISTINCT`
-- `IN (subquery)` and scalar comparison subqueries
+- `IN (subquery)`, `EXISTS (subquery)`, `NOT EXISTS (subquery)`, and scalar comparison subqueries
 
 ## Storage engines
 
@@ -113,7 +120,5 @@ cargo test
 
 ## Current limitations
 
-- No full SQL expression projection such as `SELECT 1 + 2`.
-- No `ALTER TABLE` yet.
 - The v2 storage engine is experimental and not the default file-backed engine, but it can be selected with `--engine v2`.
 - No complete buffer pool manager yet.

@@ -31,6 +31,14 @@ fn user_row(id: i64, name: &str, email: &str, active: bool) -> Vec<Value> {
     ]
 }
 
+fn unique_email_index(name: &str) -> IndexMeta {
+    IndexMeta {
+        name: name.to_string(),
+        columns: vec!["email".to_string()],
+        unique: true,
+    }
+}
+
 #[test]
 fn storage_v2_persists_schema_and_rows_across_reopen() {
     let dir = tempdir().unwrap();
@@ -62,6 +70,56 @@ fn storage_v2_persists_schema_and_rows_across_reopen() {
     assert!(reopened.get_schema(txn, "users").unwrap().is_some());
     assert_eq!(reopened.scan_rows(txn, "users").unwrap().len(), 1);
     reopened.rollback(txn).unwrap();
+}
+
+#[test]
+fn storage_v2_renames_table_and_column_and_rewrites_added_column() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db");
+    let storage = FileStorage::open(&path).unwrap();
+    let txn = storage.begin().unwrap();
+    storage.create_schema(txn, users_schema()).unwrap();
+    storage
+        .create_index(
+            txn,
+            "users",
+            IndexMeta {
+                name: "idx_users_name".to_string(),
+                columns: vec!["name".to_string()],
+                unique: false,
+            },
+        )
+        .unwrap();
+    storage
+        .insert_row(txn, "users", user_row(1, "alice", "a@example.com", true))
+        .unwrap();
+
+    storage
+        .add_column(
+            txn,
+            "users",
+            ColumnDef::new("age", ColumnType::Integer).default_value(Value::Integer(0)),
+        )
+        .unwrap();
+    storage
+        .rename_column(txn, "users", "name", "full_name")
+        .unwrap();
+    storage.rename_schema(txn, "users", "customers").unwrap();
+
+    assert!(storage.get_schema(txn, "users").unwrap().is_none());
+    let schema = storage.get_schema(txn, "customers").unwrap().unwrap();
+    assert_eq!(schema.name, "customers");
+    assert_eq!(schema.columns[1].name, "full_name");
+    assert_eq!(schema.columns[4].name, "age");
+    assert_eq!(
+        storage.scan_rows(txn, "customers").unwrap()[0].1[4],
+        Value::Integer(0)
+    );
+    assert_eq!(
+        storage.list_indexes(txn, "customers").unwrap()[0].columns,
+        vec!["full_name".to_string()]
+    );
+    storage.rollback(txn).unwrap();
 }
 
 #[test]
@@ -226,6 +284,72 @@ fn database_with_storage_v2_runs_create_insert_select_across_reopen() {
             .unwrap(),
         vec![vec![Value::from("alice")]]
     );
+}
+
+#[test]
+fn storage_v2_enforces_unique_index_on_insert_and_backfill() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db");
+    let storage = FileStorage::open(&path).unwrap();
+    let txn = storage.begin().unwrap();
+    storage.create_schema(txn, users_schema()).unwrap();
+    storage
+        .create_index(txn, "users", unique_email_index("idx_users_email_unique"))
+        .unwrap();
+
+    storage
+        .insert_row(
+            txn,
+            "users",
+            user_row(1, "alice", "alice@example.com", true),
+        )
+        .unwrap();
+
+    let insert_error = storage
+        .insert_row(
+            txn,
+            "users",
+            user_row(2, "ally", "alice@example.com", false),
+        )
+        .unwrap_err();
+    assert_eq!(
+        insert_error.to_string(),
+        "storage error: unique index idx_users_email_unique constraint failed"
+    );
+    assert_eq!(storage.scan_rows(txn, "users").unwrap().len(), 1);
+
+    storage.rollback(txn).unwrap();
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db");
+    let storage = FileStorage::open(&path).unwrap();
+    let txn = storage.begin().unwrap();
+    storage.create_schema(txn, users_schema()).unwrap();
+
+    storage
+        .insert_row(
+            txn,
+            "users",
+            user_row(1, "alice", "alice@example.com", true),
+        )
+        .unwrap();
+    storage
+        .insert_row(
+            txn,
+            "users",
+            user_row(2, "ally", "alice@example.com", false),
+        )
+        .unwrap();
+
+    let backfill_error = storage
+        .create_index(txn, "users", unique_email_index("idx_users_email_backfill"))
+        .unwrap_err();
+    assert_eq!(
+        backfill_error.to_string(),
+        "storage error: unique index idx_users_email_backfill constraint failed"
+    );
+
+    storage.rollback(txn).unwrap();
 }
 
 #[test]

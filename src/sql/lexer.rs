@@ -9,8 +9,14 @@ pub struct Token {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
     Create,
+    Alter,
+    Add,
+    Rename,
     Drop,
     Table,
+    Column,
+    To,
+    Unique,
     Index,
     On,
     Insert,
@@ -45,7 +51,18 @@ pub enum TokenKind {
     In,
     Is,
     Exists,
+    Explain,
+    Query,
+    Plan,
     Distinct,
+    Default,
+    Check,
+    Constraint,
+    Foreign,
+    References,
+    Nulls,
+    First,
+    Last,
     Primary,
     Key,
     IntegerType,
@@ -68,7 +85,10 @@ pub enum TokenKind {
     Gte,
     Lt,
     Lte,
+    Plus,
     Minus,
+    Slash,
+    PipePipe,
     Dot,
     Eof,
 }
@@ -119,6 +139,10 @@ impl<'a> Lexer<'a> {
                     self.advance_char();
                     TokenKind::Star
                 }
+                '+' => {
+                    self.advance_char();
+                    TokenKind::Plus
+                }
                 ';' => {
                     self.advance_char();
                     TokenKind::Semicolon
@@ -162,6 +186,21 @@ impl<'a> Lexer<'a> {
                 '-' => {
                     self.advance_char();
                     TokenKind::Minus
+                }
+                '/' => {
+                    self.advance_char();
+                    TokenKind::Slash
+                }
+                '|' if self.peek_next() == Some('|') => {
+                    self.advance_char();
+                    self.advance_char();
+                    TokenKind::PipePipe
+                }
+                '|' => {
+                    return Err(DbError::sql(format!(
+                        "unexpected character '{}' at position {}",
+                        ch, position
+                    )));
                 }
                 '\'' => self.lex_string()?,
                 '0'..='9' => self.lex_integer()?,
@@ -240,8 +279,14 @@ impl<'a> Lexer<'a> {
         let text = &self.input[start..self.offset];
         match text.to_ascii_uppercase().as_str() {
             "CREATE" => TokenKind::Create,
+            "ALTER" => TokenKind::Alter,
+            "ADD" => TokenKind::Add,
+            "RENAME" => TokenKind::Rename,
             "DROP" => TokenKind::Drop,
             "TABLE" => TokenKind::Table,
+            "COLUMN" => TokenKind::Column,
+            "TO" => TokenKind::To,
+            "UNIQUE" => TokenKind::Unique,
             "INDEX" => TokenKind::Index,
             "ON" => TokenKind::On,
             "INSERT" => TokenKind::Insert,
@@ -276,7 +321,18 @@ impl<'a> Lexer<'a> {
             "IN" => TokenKind::In,
             "IS" => TokenKind::Is,
             "EXISTS" => TokenKind::Exists,
+            "EXPLAIN" => TokenKind::Explain,
+            "QUERY" => TokenKind::Query,
+            "PLAN" => TokenKind::Plan,
             "DISTINCT" => TokenKind::Distinct,
+            "DEFAULT" => TokenKind::Default,
+            "CHECK" => TokenKind::Check,
+            "CONSTRAINT" => TokenKind::Constraint,
+            "FOREIGN" => TokenKind::Foreign,
+            "REFERENCES" => TokenKind::References,
+            "NULLS" => TokenKind::Nulls,
+            "FIRST" => TokenKind::First,
+            "LAST" => TokenKind::Last,
             "PRIMARY" => TokenKind::Primary,
             "KEY" => TokenKind::Key,
             "INTEGER" => TokenKind::IntegerType,

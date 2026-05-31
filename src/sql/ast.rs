@@ -1,4 +1,4 @@
-use crate::common::types::{ColumnDef, Value};
+use crate::common::types::{CheckConstraint, ColumnDef, ForeignKey, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectStatement {
@@ -38,12 +38,26 @@ pub struct Assignment {
 pub struct OrderBy {
     pub expr: OrderByExpr,
     pub descending: bool,
+    pub nulls: Option<NullOrder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullOrder {
+    First,
+    Last,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderByExpr {
     Column(String),
     Position(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterTableAction {
+    AddColumn(ColumnDef),
+    RenameTable { new_name: String },
+    RenameColumn { old_name: String, new_name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,17 +80,23 @@ pub enum Statement {
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
+        constraints: Vec<TableConstraint>,
     },
     CreateIndex {
         name: String,
         table: String,
         columns: Vec<String>,
+        unique: bool,
     },
     DropTable {
         name: String,
     },
     DropIndex {
         name: String,
+    },
+    AlterTable {
+        table: String,
+        action: AlterTableAction,
     },
     Insert {
         table: String,
@@ -95,9 +115,16 @@ pub enum Statement {
         filter: Option<Expr>,
     },
     Select(SelectStatement),
+    ExplainQueryPlan(Box<Statement>),
     Begin,
     Commit,
     Rollback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableConstraint {
+    Check(CheckConstraint),
+    ForeignKey(ForeignKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,11 +135,36 @@ pub enum SelectItem {
         name: String,
         alias: String,
     },
+    Expr {
+        expr: ScalarExpr,
+        alias: Option<String>,
+    },
     Aggregate {
         func: AggregateFunc,
         arg: AggregateArg,
         alias: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarExpr {
+    Literal(Value),
+    Column(String),
+    UnaryMinus(Box<ScalarExpr>),
+    Binary {
+        left: Box<ScalarExpr>,
+        op: ScalarBinaryOp,
+        right: Box<ScalarExpr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarBinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Concat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +192,10 @@ pub enum Expr {
         column: String,
         op: CompareOp,
         query: Box<SelectStatement>,
+    },
+    ExistsSubquery {
+        query: Box<SelectStatement>,
+        negated: bool,
     },
     Like {
         column: String,
@@ -180,12 +236,14 @@ mod tests {
         let statement = Statement::CreateTable {
             name: "users".to_string(),
             columns: vec![ColumnDef::primary_key("id", ColumnType::Integer)],
+            constraints: vec![],
         };
         assert_eq!(
             statement,
             Statement::CreateTable {
                 name: "users".to_string(),
                 columns: vec![ColumnDef::primary_key("id", ColumnType::Integer)],
+                constraints: vec![],
             }
         );
     }

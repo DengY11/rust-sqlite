@@ -1,13 +1,12 @@
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::common::error::{DbError, Result};
 use crate::common::types::{IndexMeta, Schema, Value};
 use crate::sql::ast::{
-    AggregateArg, AggregateFunc, Assignment, CompareOp, Expr, OrderBy, OrderByExpr, SelectItem,
-    SelectStatement, Statement,
+    AggregateArg, AggregateFunc, AlterTableAction, Assignment, Expr, OrderBy, OrderByExpr,
+    ScalarExpr, SelectItem, SelectStatement, Statement,
 };
-use crate::sql::plan::{IndexBound, IndexRange, IndexScanSpec, JoinPlan, Plan};
+use crate::sql::plan::{JoinPlan, Plan};
 
 #[derive(Debug, Clone, Default)]
 pub struct PlanningContext {
@@ -41,24 +40,40 @@ impl PlanningContext {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Planner;
+pub struct Planner {
+    allow_unresolved_outer_refs: bool,
+}
 
 impl Planner {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            allow_unresolved_outer_refs: false,
+        }
+    }
+
+    pub(crate) fn with_unresolved_outer_refs() -> Self {
+        Self {
+            allow_unresolved_outer_refs: true,
+        }
     }
 
     pub fn plan_statement(&self, statement: &Statement, context: &PlanningContext) -> Result<Plan> {
         match statement {
-            Statement::CreateTable { name, columns } => Ok(Plan::CreateTable {
+            Statement::CreateTable {
+                name,
+                columns,
+                constraints,
+            } => Ok(Plan::CreateTable {
                 name: name.clone(),
                 columns: columns.clone(),
+                constraints: constraints.clone(),
             }),
             Statement::CreateIndex {
                 name,
                 table,
                 columns,
+                unique,
             } => {
                 let schema = self.require_schema(context, table)?;
                 if columns.is_empty() {
@@ -78,6 +93,7 @@ impl Planner {
                     name: name.clone(),
                     table: table.clone(),
                     columns: columns.clone(),
+                    unique: *unique,
                 })
             }
             Statement::DropTable { name } => {
@@ -90,6 +106,9 @@ impl Planner {
                     table,
                     name: name.clone(),
                 })
+            }
+            Statement::AlterTable { table, action } => {
+                self.plan_alter_table(table, action, context)
             }
             Statement::Insert {
                 table,
@@ -108,10 +127,50 @@ impl Planner {
                 filter,
             } => self.plan_update(table, table_alias.as_deref(), assignments, filter, context),
             Statement::Select(select) => self.plan_select(select, context),
+            Statement::ExplainQueryPlan(statement) => Ok(Plan::ExplainQueryPlan {
+                plan: Box::new(self.plan_statement(statement, context)?),
+            }),
             Statement::Begin => Ok(Plan::BeginTxn),
             Statement::Commit => Ok(Plan::CommitTxn),
             Statement::Rollback => Ok(Plan::RollbackTxn),
         }
+    }
+
+    fn plan_alter_table(
+        &self,
+        table: &str,
+        action: &AlterTableAction,
+        context: &PlanningContext,
+    ) -> Result<Plan> {
+        let schema = self.require_schema(context, table)?;
+        match action {
+            AlterTableAction::AddColumn(column) => {
+                if schema.columns.iter().any(|entry| entry.name == column.name) {
+                    return Err(DbError::plan(format!(
+                        "column already exists on table {table}: {}",
+                        column.name
+                    )));
+                }
+            }
+            AlterTableAction::RenameTable { new_name } => {
+                if context.schema(new_name).is_some() {
+                    return Err(DbError::plan(format!("table already exists: {new_name}")));
+                }
+            }
+            AlterTableAction::RenameColumn { old_name, new_name } => {
+                self.require_column(schema, old_name)?;
+                if schema.columns.iter().any(|entry| entry.name == *new_name) {
+                    return Err(DbError::plan(format!(
+                        "column already exists on table {table}: {new_name}"
+                    )));
+                }
+            }
+        }
+
+        Ok(Plan::AlterTable {
+            table: table.to_string(),
+            action: action.clone(),
+        })
     }
 
     fn plan_insert(
@@ -158,8 +217,9 @@ impl Planner {
             .transpose()?;
 
         if let Some(expr) = &normalized_filter {
-            self.require_filter_columns(schema, expr)?;
-            self.validate_subqueries(expr, context)?;
+            let scope = self.build_single_table_scope(table, table_alias, context)?;
+            self.require_scope_columns_with_outer(&scope, None, expr)?;
+            self.validate_subqueries(expr, context, &scope)?;
         }
 
         Ok(Plan::Delete {
@@ -195,8 +255,9 @@ impl Planner {
             .map(|expr| self.normalize_expr(schema, table, table_alias, expr))
             .transpose()?;
         if let Some(expr) = &normalized_filter {
-            self.require_filter_columns(schema, expr)?;
-            self.validate_subqueries(expr, context)?;
+            let scope = self.build_single_table_scope(table, table_alias, context)?;
+            self.require_scope_columns_with_outer(&scope, None, expr)?;
+            self.validate_subqueries(expr, context, &scope)?;
         }
 
         Ok(Plan::Update {
@@ -207,10 +268,19 @@ impl Planner {
     }
 
     fn plan_select(&self, select: &SelectStatement, context: &PlanningContext) -> Result<Plan> {
+        self.plan_select_with_outer(select, context, None)
+    }
+
+    fn plan_select_with_outer(
+        &self,
+        select: &SelectStatement,
+        context: &PlanningContext,
+        outer_scope: Option<&QueryScope>,
+    ) -> Result<Plan> {
         let has_aggregates = self.select_has_aggregates(&select.columns);
 
         if !select.joins.is_empty() {
-            let source = self.plan_join_source(select, context)?;
+            let source = self.plan_join_source(select, context, outer_scope)?;
             if has_aggregates || !select.group_by.is_empty() {
                 self.validate_aggregate_projection(select, context)?;
                 return Ok(Plan::Aggregate {
@@ -257,6 +327,7 @@ impl Planner {
                     distinct: false,
                 },
                 context,
+                outer_scope,
             )?;
             return Ok(Plan::Aggregate {
                 source: Box::new(source),
@@ -289,6 +360,7 @@ impl Planner {
                 distinct: select.distinct,
             },
             context,
+            outer_scope,
         )
     }
 
@@ -296,6 +368,7 @@ impl Planner {
         &self,
         input: SingleTablePlanInput<'_>,
         context: &PlanningContext,
+        outer_scope: Option<&QueryScope>,
     ) -> Result<Plan> {
         let SingleTablePlanInput {
             table,
@@ -323,8 +396,9 @@ impl Planner {
             .transpose()?;
 
         if let Some(expr) = &normalized_filter {
-            self.require_filter_columns(schema, expr)?;
-            self.validate_subqueries(expr, context)?;
+            let scope = self.build_single_table_scope(table, table_alias, context)?;
+            self.require_scope_columns_with_outer(&scope, outer_scope, expr)?;
+            self.validate_subqueries(expr, context, &scope)?;
         }
 
         let normalized_order_by = order_by
@@ -333,38 +407,6 @@ impl Planner {
                 self.normalize_order_by(schema, table, table_alias, &normalized_columns, item)
             })
             .collect::<Result<Vec<_>>>()?;
-
-        if self.is_plain_indexable_filter(normalized_filter.as_ref())
-            && let Some(expr) = normalized_filter.as_ref()
-        {
-            if let Some(scans) = self.find_index_union_scans(context, table, expr) {
-                return Ok(Plan::IndexUnion {
-                    table: table.to_string(),
-                    table_alias: table_alias.map(str::to_string),
-                    columns: normalized_columns,
-                    scans,
-                    filter: normalized_filter,
-                    order_by: normalized_order_by,
-                    limit,
-                    distinct,
-                });
-            }
-
-            if let Some(scan) = self.find_matching_index_scan(context, table, expr) {
-                return Ok(Plan::IndexScan {
-                    table: table.to_string(),
-                    table_alias: table_alias.map(str::to_string),
-                    columns: normalized_columns,
-                    index: scan.index,
-                    key_prefix: scan.key_prefix,
-                    range: scan.range,
-                    filter: normalized_filter,
-                    order_by: normalized_order_by,
-                    limit,
-                    distinct,
-                });
-            }
-        }
 
         Ok(Plan::SeqScan {
             table: table.to_string(),
@@ -381,6 +423,7 @@ impl Planner {
         &self,
         select: &SelectStatement,
         context: &PlanningContext,
+        outer_scope: Option<&QueryScope>,
     ) -> Result<Plan> {
         self.require_schema(context, &select.table)?;
         let scope = self.build_scope(select, context)?;
@@ -389,13 +432,13 @@ impl Planner {
             self.require_join_select_item(&scope, item)?;
         }
         if let Some(filter) = &select.filter {
-            self.require_scope_columns(&scope, filter)?;
-            self.validate_subqueries(filter, context)?;
+            self.require_scope_columns_with_outer(&scope, outer_scope, filter)?;
+            self.validate_subqueries(filter, context, &scope)?;
         }
         for join in &select.joins {
             self.require_schema(context, &join.table)?;
-            self.require_scope_columns(&scope, &join.on)?;
-            self.validate_subqueries(&join.on, context)?;
+            self.require_scope_columns_with_outer(&scope, outer_scope, &join.on)?;
+            self.validate_subqueries(&join.on, context, &scope)?;
         }
         for item in &select.order_by {
             self.require_order_by_scope(&scope, &select.columns, item)?;
@@ -451,7 +494,11 @@ impl Planner {
                         values.len()
                     )));
                 }
-                let mut row = vec![Value::Null; schema.columns.len()];
+                let mut row = schema
+                    .columns
+                    .iter()
+                    .map(|column| column.default_value.clone().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
                 let mut seen = std::collections::BTreeSet::new();
                 for (column, value) in columns.iter().zip(values.iter()) {
                     if !seen.insert(column.clone()) {
@@ -491,6 +538,10 @@ impl Planner {
             )?),
             SelectItem::AliasedColumn { name, alias } => SelectItem::AliasedColumn {
                 name: self.normalize_column_reference(schema, table, table_alias, name)?,
+                alias: alias.clone(),
+            },
+            SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                expr: self.normalize_scalar_expr(schema, table, table_alias, expr)?,
                 alias: alias.clone(),
             },
             SelectItem::Aggregate { func, arg, alias } => SelectItem::Aggregate {
@@ -533,6 +584,7 @@ impl Planner {
                 column,
             )?),
             descending: item.descending,
+            nulls: item.nulls,
         })
     }
 
@@ -541,6 +593,9 @@ impl Planner {
             .iter()
             .filter_map(|column| match column {
                 SelectItem::AliasedColumn { alias, .. } => Some(alias.clone()),
+                SelectItem::Expr {
+                    alias: Some(alias), ..
+                } => Some(alias.clone()),
                 SelectItem::Aggregate {
                     alias: Some(alias), ..
                 } => Some(alias.clone()),
@@ -584,6 +639,10 @@ impl Planner {
                 column: self.normalize_column_reference(schema, table, table_alias, column)?,
                 op: *op,
                 query: query.clone(),
+            },
+            Expr::ExistsSubquery { query, negated } => Expr::ExistsSubquery {
+                query: query.clone(),
+                negated: *negated,
             },
             Expr::Like {
                 column,
@@ -635,8 +694,61 @@ impl Planner {
             self.require_column(schema, suffix)?;
             return Ok(suffix.to_string());
         }
+        if column.contains('.') {
+            return Ok(column.to_string());
+        }
         self.require_column(schema, column)?;
         Ok(column.to_string())
+    }
+
+    fn normalize_scalar_expr(
+        &self,
+        schema: &Schema,
+        table: &str,
+        table_alias: Option<&str>,
+        expr: &ScalarExpr,
+    ) -> Result<ScalarExpr> {
+        Ok(match expr {
+            ScalarExpr::Literal(value) => ScalarExpr::Literal(value.clone()),
+            ScalarExpr::Column(name) => ScalarExpr::Column(self.normalize_column_reference(
+                schema,
+                table,
+                table_alias,
+                name,
+            )?),
+            ScalarExpr::UnaryMinus(expr) => ScalarExpr::UnaryMinus(Box::new(
+                self.normalize_scalar_expr(schema, table, table_alias, expr)?,
+            )),
+            ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+                left: Box::new(self.normalize_scalar_expr(schema, table, table_alias, left)?),
+                op: *op,
+                right: Box::new(self.normalize_scalar_expr(schema, table, table_alias, right)?),
+            },
+        })
+    }
+
+    fn require_scalar_expr_columns(&self, schema: &Schema, expr: &ScalarExpr) -> Result<()> {
+        match expr {
+            ScalarExpr::Literal(_) => Ok(()),
+            ScalarExpr::Column(name) => self.require_column(schema, name),
+            ScalarExpr::UnaryMinus(expr) => self.require_scalar_expr_columns(schema, expr),
+            ScalarExpr::Binary { left, right, .. } => {
+                self.require_scalar_expr_columns(schema, left)?;
+                self.require_scalar_expr_columns(schema, right)
+            }
+        }
+    }
+
+    fn require_scalar_expr_scope(&self, scope: &QueryScope, expr: &ScalarExpr) -> Result<()> {
+        match expr {
+            ScalarExpr::Literal(_) => Ok(()),
+            ScalarExpr::Column(name) => self.resolve_column_in_scope(scope, name).map(|_| ()),
+            ScalarExpr::UnaryMinus(expr) => self.require_scalar_expr_scope(scope, expr),
+            ScalarExpr::Binary { left, right, .. } => {
+                self.require_scalar_expr_scope(scope, left)?;
+                self.require_scalar_expr_scope(scope, right)
+            }
+        }
     }
 
     fn select_has_aggregates(&self, columns: &[SelectItem]) -> bool {
@@ -651,6 +763,7 @@ impl Planner {
             SelectItem::Column(name) | SelectItem::AliasedColumn { name, .. } => {
                 self.require_column(schema, name)
             }
+            SelectItem::Expr { expr, .. } => self.require_scalar_expr_columns(schema, expr),
             SelectItem::Aggregate { arg, func, .. } => match arg {
                 AggregateArg::Wildcard => {
                     if *func == AggregateFunc::Count {
@@ -739,6 +852,11 @@ impl Planner {
                         )));
                     }
                 }
+                SelectItem::Expr { .. } => {
+                    return Err(DbError::plan(
+                        "scalar expressions cannot be used with GROUP BY or aggregate projections",
+                    ));
+                }
                 SelectItem::Aggregate { func, arg, .. } => {
                     if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg)
                         && matches!(arg, AggregateArg::Column { name: column, .. } if !schema.columns.iter().any(|entry| entry.name == *column && matches!(entry.column_type, crate::common::types::ColumnType::Integer)))
@@ -763,25 +881,6 @@ impl Planner {
         Ok(())
     }
 
-    fn is_plain_indexable_filter(&self, filter: Option<&Expr>) -> bool {
-        filter.is_some_and(|expr| self.expr_is_plain_indexable(expr))
-    }
-
-    fn expr_is_plain_indexable(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::Compare { .. } | Expr::IsNull { .. } => true,
-            Expr::Not(inner) => self.expr_is_plain_indexable(inner),
-            Expr::And(left, right) | Expr::Or(left, right) => {
-                self.expr_is_plain_indexable(left) && self.expr_is_plain_indexable(right)
-            }
-            Expr::CompareColumns { .. }
-            | Expr::InSubquery { .. }
-            | Expr::CompareSubquery { .. }
-            | Expr::Like { .. }
-            | Expr::Between { .. } => false,
-        }
-    }
-
     fn build_scope(
         &self,
         select: &SelectStatement,
@@ -803,12 +902,28 @@ impl Planner {
         Ok(QueryScope { bindings })
     }
 
+    fn build_single_table_scope(
+        &self,
+        table: &str,
+        table_alias: Option<&str>,
+        context: &PlanningContext,
+    ) -> Result<QueryScope> {
+        Ok(QueryScope {
+            bindings: vec![TableBinding {
+                table: table.to_string(),
+                alias: table_alias.map(str::to_string),
+                schema: self.require_schema(context, table)?.clone(),
+            }],
+        })
+    }
+
     fn require_join_select_item(&self, scope: &QueryScope, item: &SelectItem) -> Result<()> {
         match item {
             SelectItem::Wildcard => Ok(()),
             SelectItem::Column(name) | SelectItem::AliasedColumn { name, .. } => {
                 self.resolve_column_in_scope(scope, name).map(|_| ())
             }
+            SelectItem::Expr { expr, .. } => self.require_scalar_expr_scope(scope, expr),
             SelectItem::Aggregate { arg, func, .. } => match arg {
                 AggregateArg::Wildcard => {
                     if *func == AggregateFunc::Count {
@@ -845,37 +960,51 @@ impl Planner {
         self.resolve_column_in_scope(scope, column).map(|_| ())
     }
 
-    fn require_scope_columns(&self, scope: &QueryScope, filter: &Expr) -> Result<()> {
+    fn require_scope_columns_with_outer(
+        &self,
+        scope: &QueryScope,
+        outer_scope: Option<&QueryScope>,
+        filter: &Expr,
+    ) -> Result<()> {
         match filter {
             Expr::Compare { column, .. }
             | Expr::IsNull { column, .. }
             | Expr::InSubquery { column, .. }
             | Expr::CompareSubquery { column, .. }
             | Expr::Like { column, .. }
-            | Expr::Between { column, .. } => {
-                self.resolve_column_in_scope(scope, column).map(|_| ())
-            }
+            | Expr::Between { column, .. } => self
+                .resolve_column_in_scope_chain(scope, outer_scope, column)
+                .map(|_| ()),
+            Expr::ExistsSubquery { .. } => Ok(()),
             Expr::CompareColumns { left, right, .. } => {
-                self.resolve_column_in_scope(scope, left)?;
-                self.resolve_column_in_scope(scope, right).map(|_| ())
+                self.resolve_column_in_scope_chain(scope, outer_scope, left)?;
+                self.resolve_column_in_scope_chain(scope, outer_scope, right)
+                    .map(|_| ())
             }
-            Expr::Not(expr) => self.require_scope_columns(scope, expr),
+            Expr::Not(expr) => self.require_scope_columns_with_outer(scope, outer_scope, expr),
             Expr::And(left, right) | Expr::Or(left, right) => {
-                self.require_scope_columns(scope, left)?;
-                self.require_scope_columns(scope, right)
+                self.require_scope_columns_with_outer(scope, outer_scope, left)?;
+                self.require_scope_columns_with_outer(scope, outer_scope, right)
             }
         }
     }
 
-    fn validate_subqueries(&self, filter: &Expr, context: &PlanningContext) -> Result<()> {
+    fn validate_subqueries(
+        &self,
+        filter: &Expr,
+        context: &PlanningContext,
+        outer_scope: &QueryScope,
+    ) -> Result<()> {
         match filter {
-            Expr::InSubquery { query, .. } | Expr::CompareSubquery { query, .. } => {
-                self.validate_select_subquery(query, context)
+            Expr::InSubquery { query, .. }
+            | Expr::CompareSubquery { query, .. }
+            | Expr::ExistsSubquery { query, .. } => {
+                self.validate_select_subquery(query, context, outer_scope)
             }
-            Expr::Not(expr) => self.validate_subqueries(expr, context),
+            Expr::Not(expr) => self.validate_subqueries(expr, context, outer_scope),
             Expr::And(left, right) | Expr::Or(left, right) => {
-                self.validate_subqueries(left, context)?;
-                self.validate_subqueries(right, context)
+                self.validate_subqueries(left, context, outer_scope)?;
+                self.validate_subqueries(right, context, outer_scope)
             }
             Expr::Compare { .. }
             | Expr::CompareColumns { .. }
@@ -889,12 +1018,33 @@ impl Planner {
         &self,
         query: &SelectStatement,
         context: &PlanningContext,
+        outer_scope: &QueryScope,
     ) -> Result<()> {
-        let _ = self.plan_select(query, context)?;
+        let _ = self.plan_select_with_outer(query, context, Some(outer_scope))?;
         if query.columns.len() != 1 {
             return Err(DbError::plan("subquery must return exactly one column"));
         }
         Ok(())
+    }
+
+    fn resolve_column_in_scope_chain(
+        &self,
+        scope: &QueryScope,
+        outer_scope: Option<&QueryScope>,
+        column: &str,
+    ) -> Result<(String, String)> {
+        match self.resolve_column_in_scope(scope, column) {
+            Ok(resolved) => Ok(resolved),
+            Err(_) => {
+                if let Some(outer_scope) = outer_scope {
+                    self.resolve_column_in_scope(outer_scope, column)
+                } else if self.allow_unresolved_outer_refs && column.contains('.') {
+                    Ok((String::new(), column.to_string()))
+                } else {
+                    Err(DbError::plan(format!("unknown column {column}")))
+                }
+            }
+        }
     }
 
     fn resolve_column_in_scope(
@@ -935,185 +1085,6 @@ impl Planner {
         Ok((first.table.clone(), column.to_string()))
     }
 
-    fn find_matching_index_scan(
-        &self,
-        context: &PlanningContext,
-        table: &str,
-        filter: &Expr,
-    ) -> Option<IndexScanSpec> {
-        let (index, key_prefix, range) = self.find_matching_index(context, table, filter)?;
-        Some(IndexScanSpec {
-            index: index.name.clone(),
-            key_prefix,
-            range,
-        })
-    }
-
-    fn find_index_union_scans(
-        &self,
-        context: &PlanningContext,
-        table: &str,
-        filter: &Expr,
-    ) -> Option<Vec<IndexScanSpec>> {
-        let mut branches = Vec::new();
-        self.collect_or_branches(filter, &mut branches);
-        if branches.len() < 2 {
-            return None;
-        }
-
-        branches
-            .into_iter()
-            .map(|branch| self.find_matching_index_scan(context, table, branch))
-            .collect()
-    }
-
-    fn collect_or_branches<'a>(&self, expr: &'a Expr, branches: &mut Vec<&'a Expr>) {
-        match expr {
-            Expr::Or(left, right) => {
-                self.collect_or_branches(left, branches);
-                self.collect_or_branches(right, branches);
-            }
-            _ => branches.push(expr),
-        }
-    }
-
-    fn find_matching_index<'a>(
-        &self,
-        context: &'a PlanningContext,
-        table: &str,
-        filter: &Expr,
-    ) -> Option<(&'a IndexMeta, Vec<Value>, Option<IndexRange>)> {
-        let predicate_summary = self.extract_conjunctive_terms(filter)?;
-        context
-            .indexes_for(table)
-            .iter()
-            .filter_map(|index| {
-                let key_prefix = index
-                    .columns
-                    .iter()
-                    .map_while(|column| predicate_summary.equality_terms.get(column).cloned())
-                    .collect::<Vec<_>>();
-                let range = index.columns.get(key_prefix.len()).and_then(|column| {
-                    let bounds = predicate_summary.range_terms.get(column)?;
-                    (bounds.lower.is_some() || bounds.upper.is_some()).then(|| IndexRange {
-                        column: column.clone(),
-                        lower: bounds.lower.as_ref().map(|(op, value)| IndexBound {
-                            op: *op,
-                            value: value.clone(),
-                        }),
-                        upper: bounds.upper.as_ref().map(|(op, value)| IndexBound {
-                            op: *op,
-                            value: value.clone(),
-                        }),
-                    })
-                });
-                (!key_prefix.is_empty() || range.is_some()).then_some((index, key_prefix, range))
-            })
-            .max_by_key(|(_, key_prefix, range)| (key_prefix.len(), range.is_some()))
-    }
-
-    fn extract_conjunctive_terms(&self, expr: &Expr) -> Option<PredicateSummary> {
-        let mut summary = PredicateSummary::default();
-        self.collect_conjunctive_terms(expr, &mut summary)
-            .then_some(summary)
-    }
-
-    fn collect_conjunctive_terms(&self, expr: &Expr, summary: &mut PredicateSummary) -> bool {
-        match expr {
-            Expr::Compare {
-                column,
-                op: CompareOp::Eq,
-                value,
-            } => {
-                summary
-                    .equality_terms
-                    .entry(column.clone())
-                    .or_insert_with(|| value.clone());
-                true
-            }
-            Expr::Compare { column, op, value } => {
-                let entry = summary.range_terms.entry(column.clone()).or_default();
-                match op {
-                    CompareOp::Gt | CompareOp::Gte => self.tighten_lower_bound(entry, *op, value),
-                    CompareOp::Lt | CompareOp::Lte => self.tighten_upper_bound(entry, *op, value),
-                    CompareOp::Ne => {}
-                    CompareOp::Eq => unreachable!("equality branch handled above"),
-                }
-                true
-            }
-            Expr::CompareColumns { .. }
-            | Expr::InSubquery { .. }
-            | Expr::CompareSubquery { .. }
-            | Expr::Like { .. }
-            | Expr::Between { .. } => false,
-            Expr::IsNull { .. } => true,
-            Expr::Not(_) => false,
-            Expr::Or(_, _) => false,
-            Expr::And(left, right) => {
-                self.collect_conjunctive_terms(left, summary)
-                    && self.collect_conjunctive_terms(right, summary)
-            }
-        }
-    }
-
-    fn tighten_lower_bound(&self, entry: &mut RangeBounds, op: CompareOp, value: &Value) {
-        match entry.lower.as_ref() {
-            None => entry.lower = Some((op, value.clone())),
-            Some((current_op, current)) => match self.compare_values(current, value) {
-                Some(Ordering::Less) => entry.lower = Some((op, value.clone())),
-                Some(Ordering::Equal)
-                    if Self::lower_bound_strictness(op)
-                        > Self::lower_bound_strictness(*current_op) =>
-                {
-                    entry.lower = Some((op, value.clone()));
-                }
-                _ => {}
-            },
-        }
-    }
-
-    fn tighten_upper_bound(&self, entry: &mut RangeBounds, op: CompareOp, value: &Value) {
-        match entry.upper.as_ref() {
-            None => entry.upper = Some((op, value.clone())),
-            Some((current_op, current)) => match self.compare_values(current, value) {
-                Some(Ordering::Greater) => entry.upper = Some((op, value.clone())),
-                Some(Ordering::Equal)
-                    if Self::upper_bound_strictness(op)
-                        > Self::upper_bound_strictness(*current_op) =>
-                {
-                    entry.upper = Some((op, value.clone()));
-                }
-                _ => {}
-            },
-        }
-    }
-
-    fn lower_bound_strictness(op: CompareOp) -> u8 {
-        match op {
-            CompareOp::Gt => 2,
-            CompareOp::Gte => 1,
-            _ => 0,
-        }
-    }
-
-    fn upper_bound_strictness(op: CompareOp) -> u8 {
-        match op {
-            CompareOp::Lt => 2,
-            CompareOp::Lte => 1,
-            _ => 0,
-        }
-    }
-
-    fn compare_values(&self, left: &Value, right: &Value) -> Option<Ordering> {
-        match (left, right) {
-            (Value::Null, Value::Null) => Some(Ordering::Equal),
-            (Value::Boolean(left), Value::Boolean(right)) => Some(left.cmp(right)),
-            (Value::Integer(left), Value::Integer(right)) => Some(left.cmp(right)),
-            (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
-            _ => None,
-        }
-    }
-
     fn require_schema<'a>(&self, context: &'a PlanningContext, table: &str) -> Result<&'a Schema> {
         context
             .schema(table)
@@ -1130,38 +1101,6 @@ impl Planner {
             )))
         }
     }
-
-    fn require_filter_columns(&self, schema: &Schema, filter: &Expr) -> Result<()> {
-        match filter {
-            Expr::Compare { column, .. } => self.require_column(schema, column),
-            Expr::CompareColumns { left, right, .. } => {
-                self.require_column(schema, left)?;
-                self.require_column(schema, right)
-            }
-            Expr::IsNull { column, .. } => self.require_column(schema, column),
-            Expr::InSubquery { column, .. }
-            | Expr::CompareSubquery { column, .. }
-            | Expr::Like { column, .. }
-            | Expr::Between { column, .. } => self.require_column(schema, column),
-            Expr::Not(expr) => self.require_filter_columns(schema, expr),
-            Expr::And(left, right) | Expr::Or(left, right) => {
-                self.require_filter_columns(schema, left)?;
-                self.require_filter_columns(schema, right)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct PredicateSummary {
-    equality_terms: HashMap<String, Value>,
-    range_terms: HashMap<String, RangeBounds>,
-}
-
-#[derive(Debug, Default)]
-struct RangeBounds {
-    lower: Option<(CompareOp, Value)>,
-    upper: Option<(CompareOp, Value)>,
 }
 
 #[derive(Debug, Clone)]

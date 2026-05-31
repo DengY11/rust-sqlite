@@ -6,6 +6,7 @@ use crate::common::types::{IndexMeta, Row, Schema};
 use crate::engine::{PlanningStorageEngine, TransactionId};
 use crate::sql::ast::Statement;
 use crate::sql::executor::Executor;
+use crate::sql::optimizer::Optimizer;
 use crate::sql::parse_sql;
 use crate::sql::planner::Planner;
 use crate::storage::memory::MemoryStorage;
@@ -21,6 +22,7 @@ pub(crate) enum StatementBatchKind {
 pub struct Database<S = MemoryStorage> {
     storage: S,
     planner: Planner,
+    optimizer: Optimizer,
     current_txn: Cell<Option<TransactionId>>,
 }
 
@@ -30,6 +32,7 @@ impl<S: PlanningStorageEngine> Database<S> {
         Self {
             storage,
             planner: Planner::new(),
+            optimizer: Optimizer::new(),
             current_txn: Cell::new(None),
         }
     }
@@ -86,10 +89,12 @@ impl<S: PlanningStorageEngine> Database<S> {
     }
 
     pub(crate) fn classify_batch(statements: &[Statement]) -> StatementBatchKind {
-        if statements
-            .iter()
-            .all(|statement| matches!(statement, Statement::Select(_)))
-        {
+        if statements.iter().all(|statement| {
+            matches!(
+                statement,
+                Statement::Select(_) | Statement::ExplainQueryPlan(_)
+            )
+        }) {
             StatementBatchKind::Query
         } else {
             StatementBatchKind::Execute
@@ -102,6 +107,13 @@ impl<S: PlanningStorageEngine> Database<S> {
             .any(|statement| matches!(statement, Statement::Select(_)))
         {
             return Err(DbError::sql("SELECT statements must use Database::query"));
+        }
+
+        if statements
+            .iter()
+            .any(|statement| matches!(statement, Statement::ExplainQueryPlan(_)))
+        {
+            return Err(DbError::sql("EXPLAIN statements must use Database::query"));
         }
 
         Ok(())
@@ -121,7 +133,8 @@ impl<S: PlanningStorageEngine> Database<S> {
         let context = self
             .storage
             .planning_context_snapshot(self.current_txn.get())?;
-        self.planner.plan_statement(statement, &context)
+        let plan = self.planner.plan_statement(statement, &context)?;
+        self.optimizer.optimize_with_context(plan, &context)
     }
 
     fn with_metadata_transaction<T>(

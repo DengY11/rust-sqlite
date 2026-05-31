@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use rustsql::common::types::Value;
+use rustsql::common::types::{ForeignKey, Value};
 use rustsql::db::Database;
 use tempfile::tempdir;
 
@@ -38,6 +38,205 @@ fn database_execute_and_query_run_full_sql_pipeline() {
         .query("SELECT name, id FROM users WHERE id = 2;")
         .unwrap();
     assert_eq!(projected, vec![vec![Value::from("bob"), Value::Integer(2)]]);
+}
+
+#[test]
+fn database_preserves_create_table_foreign_key_metadata() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);
+         CREATE TABLE orders (
+             id INTEGER PRIMARY KEY,
+             user_id INTEGER,
+             FOREIGN KEY (user_id) REFERENCES users(id)
+         );",
+    )
+    .unwrap();
+
+    let schemas = db.list_schemas().unwrap();
+    let orders_schema = schemas
+        .iter()
+        .find(|schema| schema.name == "orders")
+        .expect("orders schema should be stored");
+
+    assert_eq!(
+        orders_schema.foreign_keys,
+        vec![ForeignKey::single_column("user_id", "users", "id")]
+    );
+}
+
+#[test]
+fn database_preserves_inline_foreign_key_metadata() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);
+         CREATE TABLE orders (
+             id INTEGER PRIMARY KEY,
+             user_id INTEGER REFERENCES users(id)
+         );",
+    )
+    .unwrap();
+
+    let schemas = db.list_schemas().unwrap();
+    let orders_schema = schemas
+        .iter()
+        .find(|schema| schema.name == "orders")
+        .expect("orders schema should be stored");
+    let user_id_column = orders_schema
+        .columns
+        .iter()
+        .find(|column| column.name == "user_id")
+        .expect("user_id column should be stored");
+
+    assert_eq!(
+        user_id_column.foreign_key,
+        Some(ForeignKey::single_column("user_id", "users", "id"))
+    );
+    assert_eq!(
+        orders_schema.all_foreign_keys(),
+        vec![ForeignKey::single_column("user_id", "users", "id")]
+    );
+}
+
+#[test]
+fn database_rejects_check_constraint_that_references_unknown_column() {
+    let db = Database::memory();
+
+    let error = db
+        .execute("CREATE TABLE users (id INTEGER PRIMARY KEY, CHECK (missing > 0));")
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert!(
+        message.contains("unknown column") || message.contains("CHECK"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn database_rejects_foreign_key_that_references_unknown_child_column() {
+    let db = Database::memory();
+
+    let error = db
+        .execute(
+            "CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                FOREIGN KEY (missing) REFERENCES users(id)
+            );",
+        )
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert!(
+        message.contains("unknown column") || message.contains("FOREIGN KEY"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn database_rejects_foreign_key_that_references_unknown_parent() {
+    let db = Database::memory();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY);")
+        .unwrap();
+
+    let missing_column_error = db
+        .execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(missing));")
+        .unwrap_err();
+    let missing_column_message = missing_column_error.to_string();
+    assert!(
+        missing_column_message.contains("unknown column")
+            || missing_column_message.contains("FOREIGN KEY"),
+        "unexpected error: {missing_column_message}"
+    );
+
+    let missing_table_error = db
+        .execute("CREATE TABLE payments (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES missing(id));")
+        .unwrap_err();
+    let missing_table_message = missing_table_error.to_string();
+    assert!(
+        missing_table_message.contains("unknown table")
+            || missing_table_message.contains("FOREIGN KEY"),
+        "unexpected error: {missing_table_message}"
+    );
+}
+
+#[test]
+fn database_explains_optimized_query_plan() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, email TEXT);
+         CREATE TABLE logs (id INTEGER PRIMARY KEY, level TEXT NOT NULL, created_at INTEGER NOT NULL);
+         CREATE INDEX idx_users_id ON users (id);
+         CREATE INDEX idx_users_age ON users (age);
+         CREATE INDEX idx_users_name ON users (name);
+         CREATE INDEX idx_users_email ON users (email);
+         CREATE INDEX idx_logs_level_created_at ON logs (level, created_at);",
+    )
+    .unwrap();
+
+    let indexed_plan = db
+        .query("EXPLAIN QUERY PLAN SELECT name FROM users WHERE id = 1;")
+        .unwrap();
+    assert_eq!(indexed_plan.len(), 1);
+    assert_eq!(indexed_plan[0][0], Value::from("IndexScan"));
+    assert_eq!(
+        indexed_plan[0][1],
+        Value::from("table=users index=idx_users_id mode=lookup key_prefix=[1]")
+    );
+
+    let seq_plan = db
+        .query("EXPLAIN QUERY PLAN SELECT name FROM users WHERE name != 'alice';")
+        .unwrap();
+    assert_eq!(seq_plan.len(), 1);
+    assert_eq!(seq_plan[0][0], Value::from("SeqScan"));
+    assert_eq!(seq_plan[0][1], Value::from("table=users"));
+
+    let range_plan = db
+        .query("EXPLAIN QUERY PLAN SELECT name FROM users WHERE age BETWEEN 18 AND 30;")
+        .unwrap();
+    assert_eq!(range_plan.len(), 1);
+    assert_eq!(range_plan[0][0], Value::from("IndexScan"));
+    assert_eq!(
+        range_plan[0][1],
+        Value::from(
+            "table=users index=idx_users_age mode=range key_prefix=[] range=age:Gte 18..Lte 30"
+        )
+    );
+
+    let like_plan = db
+        .query("EXPLAIN QUERY PLAN SELECT name FROM users WHERE name LIKE 'ali%';")
+        .unwrap();
+    assert_eq!(like_plan.len(), 1);
+    assert_eq!(like_plan[0][0], Value::from("IndexScan"));
+    assert_eq!(
+        like_plan[0][1],
+        Value::from(
+            "table=users index=idx_users_name mode=range key_prefix=[] range=name:Gte ali..Lt alj"
+        )
+    );
+
+    let null_plan = db
+        .query("EXPLAIN QUERY PLAN SELECT name FROM users WHERE email IS NULL;")
+        .unwrap();
+    assert_eq!(null_plan.len(), 1);
+    assert_eq!(null_plan[0][0], Value::from("IndexScan"));
+    assert_eq!(
+        null_plan[0][1],
+        Value::from("table=users index=idx_users_email mode=lookup key_prefix=[NULL]")
+    );
+
+    let prefix_plan = db
+        .query("EXPLAIN QUERY PLAN SELECT id FROM logs WHERE level = 'info';")
+        .unwrap();
+    assert_eq!(prefix_plan.len(), 1);
+    assert_eq!(prefix_plan[0][0], Value::from("IndexScan"));
+    assert_eq!(
+        prefix_plan[0][1],
+        Value::from("table=logs index=idx_logs_level_created_at mode=prefix key_prefix=[info]")
+    );
 }
 
 #[test]
@@ -212,6 +411,332 @@ fn database_supports_drop_index_and_drop_table() {
     assert!(error.to_string().contains("unknown table: users"));
 }
 
+#[test]
+fn database_supports_unique_index_constraints() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);
+         CREATE UNIQUE INDEX idx_users_email ON users (email);
+         INSERT INTO users VALUES (1, 'alice@example.com');",
+    )
+    .unwrap();
+
+    let indexes = db.list_indexes("users").unwrap();
+    assert_eq!(indexes.len(), 1);
+    assert!(indexes[0].unique);
+
+    let error = db
+        .execute("INSERT INTO users VALUES (2, 'alice@example.com');")
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "storage error: unique index idx_users_email constraint failed"
+    );
+    assert_eq!(
+        db.query("SELECT id FROM users WHERE email = 'alice@example.com';")
+            .unwrap(),
+        vec![vec![Value::Integer(1)]]
+    );
+
+    db.execute("INSERT INTO users VALUES (3, NULL); INSERT INTO users VALUES (4, NULL);")
+        .unwrap();
+    assert_eq!(
+        db.query("SELECT id FROM users WHERE email IS NULL ORDER BY id ASC;")
+            .unwrap(),
+        vec![vec![Value::Integer(3)], vec![Value::Integer(4)]]
+    );
+
+    db.execute(
+        "CREATE TABLE contacts (id INTEGER PRIMARY KEY, email TEXT);
+         INSERT INTO contacts VALUES (1, 'dupe@example.com');
+         INSERT INTO contacts VALUES (2, 'dupe@example.com');",
+    )
+    .unwrap();
+    let backfill_error = db
+        .execute("CREATE UNIQUE INDEX idx_contacts_email ON contacts (email);")
+        .unwrap_err();
+    assert_eq!(
+        backfill_error.to_string(),
+        "storage error: unique index idx_contacts_email constraint failed"
+    );
+}
+
+#[test]
+fn database_enforces_default_and_check_constraints() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER DEFAULT 0 CHECK (age >= 0));",
+    )
+    .unwrap();
+    db.execute("INSERT INTO users (id) VALUES (1);").unwrap();
+    assert_eq!(
+        db.query("SELECT age FROM users WHERE id = 1;").unwrap(),
+        vec![vec![Value::Integer(0)]]
+    );
+
+    let error = db.execute("INSERT INTO users VALUES (2, -1);").unwrap_err();
+    assert!(error.to_string().contains("check constraint"));
+}
+
+#[test]
+fn database_applies_defaults_for_missing_insert_columns() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT DEFAULT 'anonymous', active BOOLEAN DEFAULT true);",
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO users (id) VALUES (1);").unwrap();
+
+    assert_eq!(
+        db.query("SELECT name, active FROM users WHERE id = 1;")
+            .unwrap(),
+        vec![vec![Value::from("anonymous"), Value::Boolean(true)]]
+    );
+}
+
+#[test]
+fn database_enforces_check_constraints_on_insert_and_update() {
+    let db = Database::memory();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0));")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 1);").unwrap();
+
+    let insert_error = db.execute("INSERT INTO users VALUES (2, -1);").unwrap_err();
+    assert!(insert_error.to_string().contains("check constraint"));
+
+    let update_error = db
+        .execute("UPDATE users SET age = -2 WHERE id = 1;")
+        .unwrap_err();
+    assert!(update_error.to_string().contains("check constraint"));
+}
+
+#[test]
+fn database_enforces_basic_foreign_keys() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));
+         INSERT INTO users VALUES (1);",
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO orders VALUES (10, 1);").unwrap();
+
+    let child_error = db
+        .execute("INSERT INTO orders VALUES (11, 404);")
+        .unwrap_err();
+    assert!(child_error.to_string().contains("foreign key constraint"));
+
+    db.execute("INSERT INTO orders VALUES (12, NULL);").unwrap();
+    let update_error = db
+        .execute("UPDATE orders SET user_id = 404 WHERE id = 12;")
+        .unwrap_err();
+    assert!(update_error.to_string().contains("foreign key constraint"));
+    db.execute("UPDATE orders SET user_id = 1 WHERE id = 12;")
+        .unwrap();
+
+    let parent_error = db.execute("DELETE FROM users WHERE id = 1;").unwrap_err();
+    assert!(parent_error.to_string().contains("foreign key constraint"));
+}
+
+#[test]
+fn database_rejects_update_that_would_orphan_foreign_key_child() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));
+         INSERT INTO users VALUES (1);
+         INSERT INTO orders VALUES (10, 1);",
+    )
+    .unwrap();
+
+    let error = db
+        .execute("UPDATE users SET id = 2 WHERE id = 1;")
+        .unwrap_err();
+    assert!(error.to_string().contains("foreign key constraint"));
+
+    assert_eq!(
+        db.query("SELECT id FROM users ORDER BY id ASC;").unwrap(),
+        vec![vec![Value::Integer(1)]]
+    );
+    assert_eq!(
+        db.query("SELECT user_id FROM orders WHERE id = 10;")
+            .unwrap(),
+        vec![vec![Value::Integer(1)]]
+    );
+}
+
+#[test]
+fn database_does_not_partially_delete_when_foreign_key_delete_fails_inside_explicit_transaction() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));
+         INSERT INTO users VALUES (1);
+         INSERT INTO users VALUES (2);
+         INSERT INTO orders VALUES (10, 2);",
+    )
+    .unwrap();
+
+    db.execute("BEGIN;").unwrap();
+    let error = db.execute("DELETE FROM users WHERE id >= 1;").unwrap_err();
+    assert!(error.to_string().contains("foreign key constraint"));
+    db.execute("COMMIT;").unwrap();
+
+    assert_eq!(
+        db.query("SELECT id FROM users ORDER BY id ASC;").unwrap(),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+}
+
+#[test]
+fn database_enforces_table_level_foreign_key_on_parent_delete() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);
+         CREATE TABLE orders (
+             id INTEGER PRIMARY KEY,
+             user_id INTEGER,
+             FOREIGN KEY (user_id) REFERENCES users(id)
+         );
+         INSERT INTO users VALUES (1);
+         INSERT INTO orders VALUES (10, 1);",
+    )
+    .unwrap();
+
+    let error = db.execute("DELETE FROM users WHERE id = 1;").unwrap_err();
+    assert!(error.to_string().contains("foreign key constraint"));
+
+    assert_eq!(
+        db.query("SELECT id FROM users ORDER BY id ASC;").unwrap(),
+        vec![vec![Value::Integer(1)]]
+    );
+}
+
+#[test]
+fn database_updates_foreign_keys_when_parent_table_is_renamed() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));
+         INSERT INTO users VALUES (1);
+         INSERT INTO orders VALUES (10, 1);
+         ALTER TABLE users RENAME TO people;",
+    )
+    .unwrap();
+
+    let delete_error = db.execute("DELETE FROM people WHERE id = 1;").unwrap_err();
+    assert!(delete_error.to_string().contains("foreign key constraint"));
+
+    db.execute(
+        "INSERT INTO people VALUES (2);
+         INSERT INTO orders VALUES (11, 2);",
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.query("SELECT user_id FROM orders WHERE id = 11;")
+            .unwrap(),
+        vec![vec![Value::Integer(2)]]
+    );
+}
+
+#[test]
+fn database_updates_foreign_keys_when_parent_column_is_renamed() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));
+         INSERT INTO users VALUES (1);
+         ALTER TABLE users RENAME COLUMN id TO uid;",
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO orders VALUES (10, 1);").unwrap();
+
+    let delete_error = db.execute("DELETE FROM users WHERE uid = 1;").unwrap_err();
+    assert!(delete_error.to_string().contains("foreign key constraint"));
+}
+
+#[test]
+fn database_does_not_lose_row_when_update_violates_check_inside_explicit_transaction() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0));
+         INSERT INTO users VALUES (1, 10);",
+    )
+    .unwrap();
+
+    db.execute("BEGIN;").unwrap();
+    let error = db
+        .execute("UPDATE users SET age = -1 WHERE id = 1;")
+        .unwrap_err();
+    assert!(error.to_string().contains("check constraint"));
+    db.execute("COMMIT;").unwrap();
+
+    assert_eq!(
+        db.query("SELECT age FROM users WHERE id = 1;").unwrap(),
+        vec![vec![Value::Integer(10)]]
+    );
+}
+
+#[test]
+fn database_does_not_lose_row_when_update_violates_unique_index_inside_explicit_transaction() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);
+         CREATE UNIQUE INDEX idx_users_email ON users(email);
+         INSERT INTO users VALUES (1, 'a');
+         INSERT INTO users VALUES (2, 'b');",
+    )
+    .unwrap();
+
+    db.execute("BEGIN;").unwrap();
+    let error = db
+        .execute("UPDATE users SET email = 'b' WHERE id = 1;")
+        .unwrap_err();
+    assert!(error.to_string().contains("unique index"));
+    db.execute("COMMIT;").unwrap();
+
+    assert_eq!(
+        db.query("SELECT id, email FROM users ORDER BY id ASC;")
+            .unwrap(),
+        vec![
+            vec![Value::Integer(1), Value::from("a")],
+            vec![Value::Integer(2), Value::from("b")],
+        ]
+    );
+}
+
+#[test]
+fn database_does_not_lose_row_when_update_violates_primary_key_inside_explicit_transaction() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);
+         INSERT INTO users VALUES (1, 'a');
+         INSERT INTO users VALUES (2, 'b');",
+    )
+    .unwrap();
+
+    db.execute("BEGIN;").unwrap();
+    let error = db
+        .execute("UPDATE users SET id = 2 WHERE id = 1;")
+        .unwrap_err();
+    assert!(error.to_string().contains("duplicate primary key"));
+    db.execute("COMMIT;").unwrap();
+
+    assert_eq!(
+        db.query("SELECT id, email FROM users ORDER BY id ASC;")
+            .unwrap(),
+        vec![
+            vec![Value::Integer(1), Value::from("a")],
+            vec![Value::Integer(2), Value::from("b")],
+        ]
+    );
+}
+
 fn run_rustsql_binary(path: &std::path::Path, input: &str) -> String {
     run_rustsql_binary_with_args(&[path.to_str().unwrap()], input)
 }
@@ -304,6 +829,55 @@ fn database_open_reports_constraint_violations() {
         duplicate_error
             .to_string()
             .contains("duplicate primary key value for column 'id'")
+    );
+}
+
+#[test]
+fn database_supports_alter_table_add_column_and_renames() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO users VALUES (1, 'alice');
+         ALTER TABLE users ADD COLUMN age INTEGER DEFAULT 0;
+         ALTER TABLE users RENAME COLUMN name TO full_name;
+         ALTER TABLE users RENAME TO customers;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.query("SELECT full_name, age FROM customers WHERE id = 1;")
+            .unwrap(),
+        vec![vec![Value::from("alice"), Value::Integer(0)]]
+    );
+}
+
+#[test]
+fn database_rejects_add_column_that_violates_existing_rows() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO users VALUES (1, 'alice');",
+    )
+    .unwrap();
+
+    let not_null_error = db
+        .execute("ALTER TABLE users ADD COLUMN age INTEGER NOT NULL;")
+        .unwrap_err();
+    assert!(not_null_error.to_string().contains("cannot be NULL"));
+
+    assert_eq!(
+        db.query("SELECT * FROM users;").unwrap(),
+        vec![vec![Value::Integer(1), Value::from("alice")]]
+    );
+
+    let check_error = db
+        .execute("ALTER TABLE users ADD COLUMN score INTEGER DEFAULT -1 CHECK (score >= 0);")
+        .unwrap_err();
+    assert!(check_error.to_string().contains("check constraint"));
+
+    assert_eq!(
+        db.query("SELECT * FROM users;").unwrap(),
+        vec![vec![Value::Integer(1), Value::from("alice")]]
     );
 }
 
@@ -405,6 +979,26 @@ fn database_supports_group_by_join_and_subqueries() {
         .query("SELECT name FROM users WHERE id = (SELECT user_id FROM orders WHERE id = 4);")
         .unwrap();
     assert_eq!(scalar_subquery, vec![vec![Value::from("bob")]]);
+
+    let correlated_in_subquery = db
+        .query(
+            "SELECT name FROM users u WHERE id IN (SELECT user_id FROM orders o WHERE o.user_id = u.id AND o.amount >= 100) ORDER BY name ASC;",
+        )
+        .unwrap();
+    assert_eq!(
+        correlated_in_subquery,
+        vec![vec![Value::from("alice")], vec![Value::from("carol")]]
+    );
+
+    let correlated_scalar_subquery = db
+        .query(
+            "SELECT name FROM users u WHERE id = (SELECT user_id FROM orders o WHERE o.user_id = u.id AND o.amount >= 100) ORDER BY name ASC;",
+        )
+        .unwrap();
+    assert_eq!(
+        correlated_scalar_subquery,
+        vec![vec![Value::from("alice")], vec![Value::from("carol")]]
+    );
 }
 
 #[test]
@@ -466,12 +1060,14 @@ fn database_supports_common_sql_predicates_order_positions_and_distinct_aggregat
     let db = Database::memory();
 
     db.execute(
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, active BOOLEAN);
-         INSERT INTO users VALUES (1, 'alice', 30, true);
-         INSERT INTO users VALUES (2, 'alicia', 24, true);
-         INSERT INTO users VALUES (3, 'bob', 19, false);
-         INSERT INTO users VALUES (4, 'carol', 41, true);
-         INSERT INTO users VALUES (5, 'dave', NULL, false);",
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, active BOOLEAN, email TEXT);
+         CREATE INDEX idx_users_name ON users (name);
+         CREATE INDEX idx_users_email ON users (email);
+         INSERT INTO users VALUES (1, 'alice', 30, true, 'alice@example.com');
+         INSERT INTO users VALUES (2, 'alicia', 24, true, NULL);
+         INSERT INTO users VALUES (3, 'bob', 19, false, 'bob@example.com');
+         INSERT INTO users VALUES (4, 'carol', 41, true, NULL);
+         INSERT INTO users VALUES (5, 'dave', NULL, false, 'dave@example.com');",
     )
     .unwrap();
 
@@ -507,8 +1103,166 @@ fn database_supports_common_sql_predicates_order_positions_and_distinct_aggregat
         vec![vec![Value::from("bob")], vec![Value::from("carol")]]
     );
 
+    let null_email_rows = db
+        .query("SELECT name FROM users WHERE email IS NULL ORDER BY 1 ASC;")
+        .unwrap();
+    assert_eq!(
+        null_email_rows,
+        vec![vec![Value::from("alicia")], vec![Value::from("carol")]]
+    );
+
     let distinct_count = db
         .query("SELECT COUNT(DISTINCT active) AS active_values FROM users;")
         .unwrap();
     assert_eq!(distinct_count, vec![vec![Value::Integer(2)]]);
+}
+
+#[test]
+fn database_supports_explicit_null_ordering() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);
+         INSERT INTO users VALUES (1, 'alice', 30);
+         INSERT INTO users VALUES (2, 'bob', NULL);
+         INSERT INTO users VALUES (3, 'carol', 20);
+         INSERT INTO users VALUES (4, 'dave', NULL);",
+    )
+    .unwrap();
+
+    let nulls_first = db
+        .query("SELECT name, age FROM users ORDER BY age NULLS FIRST, name DESC NULLS LAST;")
+        .unwrap();
+    assert_eq!(
+        nulls_first,
+        vec![
+            vec![Value::from("dave"), Value::Null],
+            vec![Value::from("bob"), Value::Null],
+            vec![Value::from("carol"), Value::Integer(20)],
+            vec![Value::from("alice"), Value::Integer(30)],
+        ]
+    );
+
+    let nulls_last_desc = db
+        .query("SELECT name, age FROM users ORDER BY age DESC NULLS LAST, name ASC;")
+        .unwrap();
+    assert_eq!(
+        nulls_last_desc,
+        vec![
+            vec![Value::from("alice"), Value::Integer(30)],
+            vec![Value::from("carol"), Value::Integer(20)],
+            vec![Value::from("bob"), Value::Null],
+            vec![Value::from("dave"), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn database_supports_expression_projection() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);
+         INSERT INTO users VALUES (1, 'alice', 30);
+         INSERT INTO users VALUES (2, 'bob', 19);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT id + 10 AS shifted_id,
+                    age * 2 AS doubled_age,
+                    name || '_user' AS label,
+                    (age - 1) / 2 AS half_minus_one,
+                    1 + 2 * 3 AS constant_value
+             FROM users
+             ORDER BY shifted_id DESC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(12),
+                Value::Integer(38),
+                Value::from("bob_user"),
+                Value::Integer(9),
+                Value::Integer(7),
+            ],
+            vec![
+                Value::Integer(11),
+                Value::Integer(60),
+                Value::from("alice_user"),
+                Value::Integer(14),
+                Value::Integer(7),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn database_supports_exists_and_not_exists_subqueries() {
+    let db = Database::memory();
+
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL);
+         INSERT INTO users VALUES (1, 'alice');
+         INSERT INTO users VALUES (2, 'bob');
+         INSERT INTO users VALUES (3, 'carol');
+         INSERT INTO orders VALUES (1, 1, 120);
+         INSERT INTO orders VALUES (2, 2, 5);",
+    )
+    .unwrap();
+
+    let exists_rows = db
+        .query(
+            "SELECT name FROM users WHERE EXISTS (SELECT id FROM orders WHERE amount > 100) ORDER BY name ASC;",
+        )
+        .unwrap();
+    assert_eq!(
+        exists_rows,
+        vec![
+            vec![Value::from("alice")],
+            vec![Value::from("bob")],
+            vec![Value::from("carol")]
+        ]
+    );
+
+    let not_exists_rows = db
+        .query(
+            "SELECT name FROM users WHERE NOT EXISTS (SELECT id FROM orders WHERE amount > 999) ORDER BY name ASC;",
+        )
+        .unwrap();
+    assert_eq!(
+        not_exists_rows,
+        vec![
+            vec![Value::from("alice")],
+            vec![Value::from("bob")],
+            vec![Value::from("carol")]
+        ]
+    );
+
+    let empty_exists_rows = db
+        .query("SELECT name FROM users WHERE EXISTS (SELECT id FROM orders WHERE amount > 999);")
+        .unwrap();
+    assert_eq!(empty_exists_rows, Vec::<Vec<Value>>::new());
+
+    let correlated_exists_rows = db
+        .query(
+            "SELECT name FROM users u WHERE EXISTS (SELECT id FROM orders o WHERE o.user_id = u.id) ORDER BY name ASC;",
+        )
+        .unwrap();
+    assert_eq!(
+        correlated_exists_rows,
+        vec![vec![Value::from("alice")], vec![Value::from("bob")]]
+    );
+
+    let correlated_not_exists_rows = db
+        .query(
+            "SELECT name FROM users u WHERE NOT EXISTS (SELECT id FROM orders o WHERE o.user_id = u.id) ORDER BY name ASC;",
+        )
+        .unwrap();
+    assert_eq!(correlated_not_exists_rows, vec![vec![Value::from("carol")]]);
 }

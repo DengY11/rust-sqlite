@@ -3,13 +3,14 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::common::error::{DbError, Result};
-use crate::common::types::{IndexMeta, Row, RowId, Schema, Value};
+use crate::common::types::{ColumnDef, IndexMeta, Row, RowId, Schema, Value};
 use crate::engine::{PlanningStorageEngine, TransactionId};
 use crate::sql::ast::{
-    AggregateArg, AggregateFunc, CompareOp, Expr, JoinKind, OrderBy, OrderByExpr, SelectItem,
-    Statement,
+    AggregateArg, AggregateFunc, AlterTableAction, CompareOp, Expr, JoinKind, NullOrder, OrderBy,
+    OrderByExpr, ScalarBinaryOp, ScalarExpr, SelectItem, Statement, TableConstraint,
 };
-use crate::sql::plan::{IndexScanSpec, JoinPlan, Plan};
+use crate::sql::optimizer::Optimizer;
+use crate::sql::plan::{IndexScanMode, IndexScanSpec, JoinPlan, Plan};
 use crate::sql::planner::Planner;
 
 #[derive(Debug, Clone)]
@@ -115,15 +116,29 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         plan: Plan,
     ) -> Result<Vec<Row>> {
         match plan {
-            Plan::CreateTable { name, columns } => {
-                self.storage
-                    .create_schema(transaction_id, Schema::new(name, columns))?;
+            Plan::CreateTable {
+                name,
+                columns,
+                constraints,
+            } => {
+                let mut schema = Schema::new(name, columns);
+                for constraint in constraints {
+                    match constraint {
+                        TableConstraint::Check(check) => schema = schema.with_check(check),
+                        TableConstraint::ForeignKey(foreign_key) => {
+                            schema = schema.with_foreign_key(foreign_key);
+                        }
+                    }
+                }
+                self.validate_create_table_foreign_key_metadata(transaction_id, &schema)?;
+                self.storage.create_schema(transaction_id, schema)?;
                 Ok(Vec::new())
             }
             Plan::CreateIndex {
                 name,
                 table,
                 columns,
+                unique,
             } => {
                 self.storage.create_index(
                     transaction_id,
@@ -131,7 +146,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     IndexMeta {
                         name,
                         columns,
-                        unique: false,
+                        unique,
                     },
                 )?;
                 Ok(Vec::new())
@@ -144,17 +159,51 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 self.storage.drop_index(transaction_id, &table, &name)?;
                 Ok(Vec::new())
             }
+            Plan::AlterTable { table, action } => {
+                match action {
+                    AlterTableAction::AddColumn(column) => {
+                        self.validate_add_column_existing_rows(transaction_id, &table, &column)?;
+                        self.storage.add_column(transaction_id, &table, column)?;
+                    }
+                    AlterTableAction::RenameTable { new_name } => {
+                        self.storage
+                            .rename_schema(transaction_id, &table, &new_name)?;
+                    }
+                    AlterTableAction::RenameColumn { old_name, new_name } => {
+                        self.storage
+                            .rename_column(transaction_id, &table, &old_name, &new_name)?;
+                    }
+                }
+                Ok(Vec::new())
+            }
             Plan::Insert { table, values } => {
+                let schema = self.require_schema(transaction_id, &table)?;
+                self.validate_foreign_key_references(transaction_id, &schema, &values)?;
                 self.storage.insert_row(transaction_id, &table, values)?;
                 Ok(Vec::new())
             }
             Plan::Delete { table, filter } => {
-                let source = self.scan_table_rowset(transaction_id, &table, None, None)?;
+                let source = self.scan_table_rowset(transaction_id, &table, None, None, None)?;
                 let rows = self.storage.scan_rows(transaction_id, &table)?;
-                for ((row_id, _), row) in rows.iter().zip(source.rows.iter()) {
-                    if self.matches_filter(transaction_id, &source, row, filter.as_ref())? {
-                        self.storage.delete_row(transaction_id, &table, *row_id)?;
+                let mut pending_deletes = Vec::new();
+                for ((row_id, stored_row), source_row) in rows.iter().zip(source.rows.iter()) {
+                    if self.matches_filter(
+                        transaction_id,
+                        &source,
+                        source_row,
+                        filter.as_ref(),
+                        None,
+                    )? {
+                        pending_deletes.push((*row_id, stored_row.clone()));
                     }
+                }
+
+                for (_, stored_row) in &pending_deletes {
+                    self.validate_no_foreign_key_dependents(transaction_id, &table, stored_row)?;
+                }
+
+                for (row_id, _) in pending_deletes {
+                    self.storage.delete_row(transaction_id, &table, row_id)?;
                 }
                 Ok(Vec::new())
             }
@@ -164,10 +213,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 filter,
             } => {
                 let schema = self.require_schema(transaction_id, &table)?;
-                let source = self.scan_table_rowset(transaction_id, &table, None, None)?;
+                let source = self.scan_table_rowset(transaction_id, &table, None, None, None)?;
                 let rows = self.storage.scan_rows(transaction_id, &table)?;
+                let indexes = self.storage.list_indexes(transaction_id, &table)?;
+                let mut pending_updates = Vec::new();
+                let mut final_rows = Vec::with_capacity(source.rows.len());
+
                 for ((row_id, _), row) in rows.iter().zip(source.rows.iter()) {
-                    if self.matches_filter(transaction_id, &source, row, filter.as_ref())? {
+                    if self.matches_filter(transaction_id, &source, row, filter.as_ref(), None)? {
                         let mut updated = row.clone();
                         for assignment in &assignments {
                             let position = schema
@@ -182,9 +235,29 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                                 })?;
                             updated[position] = assignment.value.clone();
                         }
-                        self.storage.delete_row(transaction_id, &table, *row_id)?;
-                        self.storage.insert_row(transaction_id, &table, updated)?;
+                        final_rows.push(updated.clone());
+                        pending_updates.push((*row_id, row.clone(), updated));
+                    } else {
+                        final_rows.push(row.clone());
                     }
+                }
+
+                self.validate_update_result_constraints(
+                    transaction_id,
+                    &schema,
+                    &indexes,
+                    &final_rows,
+                )?;
+                self.validate_update_parent_key_changes(
+                    transaction_id,
+                    &table,
+                    &schema,
+                    &pending_updates,
+                )?;
+
+                for (row_id, _, updated) in pending_updates {
+                    self.storage.delete_row(transaction_id, &table, row_id)?;
+                    self.storage.insert_row(transaction_id, &table, updated)?;
                 }
                 Ok(Vec::new())
             }
@@ -192,7 +265,299 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         }
     }
 
+    fn validate_update_result_constraints(
+        &self,
+        transaction_id: TransactionId,
+        schema: &Schema,
+        indexes: &[IndexMeta],
+        final_rows: &[Row],
+    ) -> Result<()> {
+        for row in final_rows {
+            schema.validate_row_values(row)?;
+            schema.validate_check_constraints(row)?;
+            self.validate_foreign_key_references(transaction_id, schema, row)?;
+        }
+
+        self.validate_update_primary_key_uniqueness(schema, final_rows)?;
+        self.validate_update_unique_index_constraints(schema, indexes, final_rows)
+    }
+
+    fn validate_create_table_foreign_key_metadata(
+        &self,
+        transaction_id: TransactionId,
+        schema: &Schema,
+    ) -> Result<()> {
+        schema.validate_constraints_metadata()?;
+
+        for foreign_key in schema.all_foreign_keys() {
+            let parent_schema = if foreign_key.ref_table == schema.name {
+                schema.clone()
+            } else {
+                self.require_schema(transaction_id, &foreign_key.ref_table)?
+            };
+            parent_schema.column_index(&foreign_key.ref_column)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_add_column_existing_rows(
+        &self,
+        transaction_id: TransactionId,
+        table: &str,
+        column: &ColumnDef,
+    ) -> Result<()> {
+        let mut updated_schema = self.require_schema(transaction_id, table)?;
+        if updated_schema
+            .columns
+            .iter()
+            .any(|entry| entry.name == column.name)
+        {
+            return Err(DbError::storage(format!(
+                "column already exists on table {table}: {}",
+                column.name
+            )));
+        }
+        let default_value = column.default_value.clone().unwrap_or(Value::Null);
+        updated_schema.columns.push(column.clone());
+        updated_schema.validate_constraints_metadata()?;
+
+        for (_, row) in self.storage.scan_rows(transaction_id, table)? {
+            let mut candidate = row;
+            candidate.push(default_value.clone());
+            updated_schema.validate_row_values(&candidate)?;
+            updated_schema.validate_check_constraints(&candidate)?;
+            self.validate_foreign_key_references(transaction_id, &updated_schema, &candidate)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_foreign_key_references(
+        &self,
+        transaction_id: TransactionId,
+        schema: &Schema,
+        row: &Row,
+    ) -> Result<()> {
+        for foreign_key in schema.all_foreign_keys() {
+            let child_value = schema.value_for_column(row, &foreign_key.column)?;
+            if matches!(child_value, Value::Null) {
+                continue;
+            }
+
+            let parent_schema = self.require_schema(transaction_id, &foreign_key.ref_table)?;
+            let parent_column = parent_schema.column_index(&foreign_key.ref_column)?;
+            let parent_rows = self
+                .storage
+                .scan_rows(transaction_id, &foreign_key.ref_table)?;
+            let found = parent_rows
+                .iter()
+                .any(|(_, parent_row)| parent_row.get(parent_column) == Some(child_value));
+
+            if !found {
+                return Err(DbError::storage(format!(
+                    "foreign key constraint failed: {} references {}({})",
+                    foreign_key.column, foreign_key.ref_table, foreign_key.ref_column
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_no_foreign_key_dependents(
+        &self,
+        transaction_id: TransactionId,
+        parent_table: &str,
+        parent_row: &Row,
+    ) -> Result<()> {
+        let parent_schema = self.require_schema(transaction_id, parent_table)?;
+        for child_schema in self.storage.list_schemas(transaction_id)? {
+            for foreign_key in child_schema
+                .all_foreign_keys()
+                .into_iter()
+                .filter(|foreign_key| foreign_key.ref_table == parent_table)
+            {
+                let parent_value =
+                    parent_schema.value_for_column(parent_row, &foreign_key.ref_column)?;
+                if matches!(parent_value, Value::Null) {
+                    continue;
+                }
+
+                self.validate_no_foreign_key_dependents_for_key(
+                    transaction_id,
+                    &child_schema,
+                    &foreign_key.column,
+                    parent_table,
+                    &foreign_key.ref_column,
+                    parent_value,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_no_foreign_key_dependents_for_key(
+        &self,
+        transaction_id: TransactionId,
+        child_schema: &Schema,
+        child_column: &str,
+        parent_table: &str,
+        parent_column: &str,
+        parent_value: &Value,
+    ) -> Result<()> {
+        let child_rows = self.storage.scan_rows(transaction_id, &child_schema.name)?;
+        for (_, child_row) in child_rows {
+            let child_value = child_schema.value_for_column(&child_row, child_column)?;
+            if matches!(child_value, Value::Null) {
+                continue;
+            }
+            if child_value == parent_value {
+                return Err(DbError::storage(format!(
+                    "foreign key constraint failed: {}.{} references {}({})",
+                    child_schema.name, child_column, parent_table, parent_column
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_update_parent_key_changes(
+        &self,
+        transaction_id: TransactionId,
+        parent_table: &str,
+        parent_schema: &Schema,
+        pending_updates: &[(RowId, Row, Row)],
+    ) -> Result<()> {
+        if pending_updates.is_empty() {
+            return Ok(());
+        }
+
+        for child_schema in self.storage.list_schemas(transaction_id)? {
+            for foreign_key in child_schema
+                .all_foreign_keys()
+                .into_iter()
+                .filter(|foreign_key| foreign_key.ref_table == parent_table)
+            {
+                for (_, old_row, updated_row) in pending_updates {
+                    let old_parent_value =
+                        parent_schema.value_for_column(old_row, &foreign_key.ref_column)?;
+                    let updated_parent_value =
+                        parent_schema.value_for_column(updated_row, &foreign_key.ref_column)?;
+
+                    if old_parent_value == updated_parent_value
+                        || matches!(old_parent_value, Value::Null)
+                    {
+                        continue;
+                    }
+
+                    self.validate_no_foreign_key_dependents_for_key(
+                        transaction_id,
+                        &child_schema,
+                        &foreign_key.column,
+                        parent_table,
+                        &foreign_key.ref_column,
+                        old_parent_value,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_update_primary_key_uniqueness(
+        &self,
+        schema: &Schema,
+        final_rows: &[Row],
+    ) -> Result<()> {
+        for (column_index, column) in schema.columns.iter().enumerate() {
+            if !column.primary_key {
+                continue;
+            }
+
+            let mut seen = BTreeSet::new();
+            for row in final_rows {
+                let Some(value) = row.get(column_index) else {
+                    continue;
+                };
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                if !seen.insert(value.clone()) {
+                    return Err(DbError::storage(format!(
+                        "duplicate primary key value for column '{}': {}",
+                        column.name, value
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_update_unique_index_constraints(
+        &self,
+        schema: &Schema,
+        indexes: &[IndexMeta],
+        final_rows: &[Row],
+    ) -> Result<()> {
+        for index in indexes.iter().filter(|index| index.unique) {
+            let mut seen = BTreeSet::new();
+            for row in final_rows {
+                let key = Self::project_index_key(schema, index, row)?;
+                if !index.enforces_unique_key(&key) {
+                    continue;
+                }
+                if !seen.insert(key) {
+                    return Err(DbError::storage(format!(
+                        "unique index {} constraint failed",
+                        index.name
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn project_index_key(schema: &Schema, index: &IndexMeta, row: &Row) -> Result<Vec<Value>> {
+        index
+            .columns
+            .iter()
+            .map(|column| {
+                let position = schema
+                    .columns
+                    .iter()
+                    .position(|entry| entry.name == *column)
+                    .ok_or_else(|| {
+                        DbError::storage(format!(
+                            "unknown column {column} on table {}",
+                            schema.name
+                        ))
+                    })?;
+                row.get(position).cloned().ok_or_else(|| {
+                    DbError::storage(format!(
+                        "row for table {} is missing column {column}",
+                        schema.name
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn execute_query_plan(&self, transaction_id: TransactionId, plan: Plan) -> Result<RowSet> {
+        self.execute_query_plan_with_outer(transaction_id, plan, None)
+    }
+
+    fn execute_query_plan_with_outer(
+        &self,
+        transaction_id: TransactionId,
+        plan: Plan,
+        outer: Option<(&RowSet, &Row)>,
+    ) -> Result<RowSet> {
         match plan {
             Plan::SeqScan {
                 table,
@@ -208,6 +573,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     &table,
                     table_alias.as_deref(),
                     filter.as_ref(),
+                    outer,
                 )?;
                 self.finish_projection(transaction_id, source, &columns, &order_by, limit, distinct)
             }
@@ -216,6 +582,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 table_alias,
                 columns,
                 index,
+                mode,
                 key_prefix,
                 range,
                 filter,
@@ -228,6 +595,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     &table,
                     &IndexScanSpec {
                         index,
+                        mode,
                         key_prefix,
                         range,
                     },
@@ -238,6 +606,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     table_alias.as_deref(),
                     &row_ids,
                     filter.as_ref(),
+                    outer,
                 )?;
                 self.finish_projection(transaction_id, source, &columns, &order_by, limit, distinct)
             }
@@ -262,6 +631,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     table_alias.as_deref(),
                     &row_ids,
                     filter.as_ref(),
+                    outer,
                 )?;
                 self.finish_projection(transaction_id, source, &columns, &order_by, limit, distinct)
             }
@@ -281,6 +651,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     table_alias.as_deref(),
                     &joins,
                     filter.as_ref(),
+                    outer,
                 )?;
                 self.finish_projection(transaction_id, source, &columns, &order_by, limit, distinct)
             }
@@ -292,7 +663,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 order_by,
                 limit,
             } => {
-                let source = self.execute_query_plan(transaction_id, *source)?;
+                let source = self.execute_query_plan_with_outer(transaction_id, *source, outer)?;
                 self.execute_aggregate(
                     transaction_id,
                     source,
@@ -305,10 +676,157 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     },
                 )
             }
+            Plan::ExplainQueryPlan { plan } => Ok(self.explain_query_plan(&plan)),
             Plan::BeginTxn | Plan::CommitTxn | Plan::RollbackTxn => Err(DbError::txn(
                 "transaction control plan reached data execution path",
             )),
             other => Err(DbError::plan(format!("unexpected query plan: {other:?}"))),
+        }
+    }
+
+    fn explain_query_plan(&self, plan: &Plan) -> RowSet {
+        let mut rows = Vec::new();
+        Self::collect_plan_rows(plan, 0, &mut rows);
+        RowSet {
+            columns: vec![
+                ColumnMeta {
+                    table: None,
+                    alias: None,
+                    name: "operation".to_string(),
+                    output_name: "operation".to_string(),
+                },
+                ColumnMeta {
+                    table: None,
+                    alias: None,
+                    name: "detail".to_string(),
+                    output_name: "detail".to_string(),
+                },
+            ],
+            rows,
+        }
+    }
+
+    fn collect_plan_rows(plan: &Plan, depth: usize, rows: &mut Vec<Row>) {
+        let indent = "  ".repeat(depth);
+        match plan {
+            Plan::SeqScan { table, .. } => rows.push(vec![
+                Value::from(format!("{indent}SeqScan")),
+                Value::from(format!("table={table}")),
+            ]),
+            Plan::IndexScan {
+                table,
+                index,
+                mode,
+                key_prefix,
+                range,
+                ..
+            } => rows.push(vec![
+                Value::from(format!("{indent}IndexScan")),
+                Value::from(format!(
+                    "table={table} index={index} mode={} key_prefix={}{}",
+                    Self::format_index_scan_mode(*mode),
+                    Self::format_values(key_prefix),
+                    range
+                        .as_ref()
+                        .map(|range| format!(" range={}", Self::format_index_range(range)))
+                        .unwrap_or_default()
+                )),
+            ]),
+            Plan::IndexUnion { table, scans, .. } => {
+                rows.push(vec![
+                    Value::from(format!("{indent}IndexUnion")),
+                    Value::from(format!("table={table} scans={}", scans.len())),
+                ]);
+                for scan in scans {
+                    rows.push(vec![
+                        Value::from(format!("{indent}  IndexScan")),
+                        Value::from(format!(
+                            "index={} mode={} key_prefix={}{}",
+                            scan.index,
+                            Self::format_index_scan_mode(scan.mode),
+                            Self::format_values(&scan.key_prefix),
+                            scan.range
+                                .as_ref()
+                                .map(|range| format!(" range={}", Self::format_index_range(range)))
+                                .unwrap_or_default()
+                        )),
+                    ]);
+                }
+            }
+            Plan::NestedLoopJoin { table, joins, .. } => rows.push(vec![
+                Value::from(format!("{indent}NestedLoopJoin")),
+                Value::from(format!("table={table} joins={}", joins.len())),
+            ]),
+            Plan::Aggregate { source, .. } => {
+                rows.push(vec![
+                    Value::from(format!("{indent}Aggregate")),
+                    Value::from("grouped"),
+                ]);
+                Self::collect_plan_rows(source, depth + 1, rows);
+            }
+            Plan::ExplainQueryPlan { plan } => Self::collect_plan_rows(plan, depth, rows),
+            other => rows.push(vec![
+                Value::from(format!("{indent}{}", Self::plan_name(other))),
+                Value::from(""),
+            ]),
+        }
+    }
+
+    fn plan_name(plan: &Plan) -> &'static str {
+        match plan {
+            Plan::CreateTable { .. } => "CreateTable",
+            Plan::CreateIndex { .. } => "CreateIndex",
+            Plan::DropTable { .. } => "DropTable",
+            Plan::DropIndex { .. } => "DropIndex",
+            Plan::AlterTable { .. } => "AlterTable",
+            Plan::Insert { .. } => "Insert",
+            Plan::Delete { .. } => "Delete",
+            Plan::Update { .. } => "Update",
+            Plan::SeqScan { .. } => "SeqScan",
+            Plan::IndexScan { .. } => "IndexScan",
+            Plan::IndexUnion { .. } => "IndexUnion",
+            Plan::NestedLoopJoin { .. } => "NestedLoopJoin",
+            Plan::Aggregate { .. } => "Aggregate",
+            Plan::ExplainQueryPlan { .. } => "ExplainQueryPlan",
+            Plan::BeginTxn => "BeginTxn",
+            Plan::CommitTxn => "CommitTxn",
+            Plan::RollbackTxn => "RollbackTxn",
+        }
+    }
+
+    fn format_values(values: &[Value]) -> String {
+        format!(
+            "[{}]",
+            values
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
+    fn format_index_range(range: &crate::sql::plan::IndexRange) -> String {
+        format!(
+            "{}:{}..{}",
+            range.column,
+            range
+                .lower
+                .as_ref()
+                .map(|bound| format!("{:?} {}", bound.op, bound.value))
+                .unwrap_or_else(|| "unbounded".to_string()),
+            range
+                .upper
+                .as_ref()
+                .map(|bound| format!("{:?} {}", bound.op, bound.value))
+                .unwrap_or_else(|| "unbounded".to_string())
+        )
+    }
+
+    fn format_index_scan_mode(mode: IndexScanMode) -> &'static str {
+        match mode {
+            IndexScanMode::Lookup => "lookup",
+            IndexScanMode::Prefix => "prefix",
+            IndexScanMode::Range => "range",
         }
     }
 
@@ -318,6 +836,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         table: &str,
         table_alias: Option<&str>,
         filter: Option<&Expr>,
+        outer: Option<(&RowSet, &Row)>,
     ) -> Result<RowSet> {
         let schema = self.require_schema(transaction_id, table)?;
         let mut rowset = RowSet {
@@ -335,7 +854,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         };
 
         for (_, row) in self.storage.scan_rows(transaction_id, table)? {
-            if self.matches_filter(transaction_id, &rowset, &row, filter)? {
+            if self.matches_filter(transaction_id, &rowset, &row, filter, outer)? {
                 rowset.rows.push(row);
             }
         }
@@ -350,6 +869,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         table_alias: Option<&str>,
         row_ids: &[RowId],
         filter: Option<&Expr>,
+        outer: Option<(&RowSet, &Row)>,
     ) -> Result<RowSet> {
         let schema = self.require_schema(transaction_id, table)?;
         let mut rowset = RowSet {
@@ -368,7 +888,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
 
         for row_id in row_ids {
             if let Some(row) = self.storage.get_row(transaction_id, table, *row_id)?
-                && self.matches_filter(transaction_id, &rowset, &row, filter)?
+                && self.matches_filter(transaction_id, &rowset, &row, filter, outer)?
             {
                 rowset.rows.push(row);
             }
@@ -384,8 +904,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         table_alias: Option<&str>,
         joins: &[JoinPlan],
         filter: Option<&Expr>,
+        outer: Option<(&RowSet, &Row)>,
     ) -> Result<RowSet> {
-        let mut current = self.scan_table_rowset(transaction_id, table, table_alias, None)?;
+        let mut current =
+            self.scan_table_rowset(transaction_id, table, table_alias, None, outer)?;
 
         for join in joins {
             let right = self.scan_table_rowset(
@@ -393,6 +915,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 &join.table,
                 join.table_alias.as_deref(),
                 None,
+                outer,
             )?;
             let joined_columns = current
                 .columns
@@ -412,7 +935,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         columns: joined_columns.clone(),
                         rows: Vec::new(),
                     };
-                    if self.matches_filter(transaction_id, &candidate, &row, Some(&join.on))? {
+                    if self.matches_filter(
+                        transaction_id,
+                        &candidate,
+                        &row,
+                        Some(&join.on),
+                        outer,
+                    )? {
                         joined_rows.push(row);
                         matched = true;
                     }
@@ -435,7 +964,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 .rows
                 .iter()
                 .filter_map(|row| {
-                    match self.matches_filter(transaction_id, &current, row, Some(filter)) {
+                    match self.matches_filter(transaction_id, &current, row, Some(filter), outer) {
                         Ok(true) => Some(Ok(row.clone())),
                         Ok(false) => None,
                         Err(error) => Some(Err(error)),
@@ -575,6 +1104,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     &aggregate_rowset,
                     &aggregate_row,
                     Some(having),
+                    None,
                 )? {
                     continue;
                 }
@@ -765,6 +1295,11 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     let key_index = self.group_key_index(source, group_by, name)?;
                     row.push(key[key_index].clone());
                 }
+                SelectItem::Expr { .. } => {
+                    return Err(DbError::plan(
+                        "scalar expressions cannot be used with GROUP BY or aggregate projections",
+                    ));
+                }
                 SelectItem::Aggregate { .. } => {
                     row.push(self.aggregate_state_value(&states[state_index])?);
                     state_index += 1;
@@ -915,18 +1450,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 &item.expr,
             );
             let ordering = match (left_value, right_value) {
-                (Some(left), Some(right)) => self
-                    .compare(left, right)
-                    .unwrap_or(None)
-                    .unwrap_or(Ordering::Equal),
+                (Some(left), Some(right)) => {
+                    self.compare_order_values(left, right, item.nulls, item.descending)
+                }
                 _ => Ordering::Equal,
             };
             if ordering != Ordering::Equal {
-                return if item.descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                };
+                return ordering;
             }
         }
         Ordering::Equal
@@ -944,18 +1474,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             if let OrderByExpr::Position(position) = item.expr {
                 let index = position.saturating_sub(1);
                 ordering = match (left.get(index), right.get(index)) {
-                    (Some(left), Some(right)) => self
-                        .compare(left, right)
-                        .unwrap_or(None)
-                        .unwrap_or(Ordering::Equal),
+                    (Some(left), Some(right)) => {
+                        self.compare_order_values(left, right, item.nulls, item.descending)
+                    }
                     _ => Ordering::Equal,
                 };
                 if ordering != Ordering::Equal {
-                    return if item.descending {
-                        ordering.reverse()
-                    } else {
-                        ordering
-                    };
+                    return ordering;
                 }
                 continue;
             }
@@ -973,6 +1498,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                             || alias == order_column
                             || output_name == *order_column
                     }
+                    SelectItem::Expr { alias, .. } => {
+                        alias.as_ref().is_some_and(|alias| alias == order_column)
+                            || output_name == *order_column
+                    }
                     SelectItem::Aggregate { alias, .. } => {
                         alias.as_ref().is_some_and(|alias| alias == order_column)
                             || output_name == *order_column
@@ -981,24 +1510,48 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 };
                 if matches {
                     ordering = match (left.get(index), right.get(index)) {
-                        (Some(left), Some(right)) => self
-                            .compare(left, right)
-                            .unwrap_or(None)
-                            .unwrap_or(Ordering::Equal),
+                        (Some(left), Some(right)) => {
+                            self.compare_order_values(left, right, item.nulls, item.descending)
+                        }
                         _ => Ordering::Equal,
                     };
                     break;
                 }
             }
             if ordering != Ordering::Equal {
-                return if item.descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                };
+                return ordering;
             }
         }
         Ordering::Equal
+    }
+
+    fn compare_order_values(
+        &self,
+        left: &Value,
+        right: &Value,
+        nulls: Option<NullOrder>,
+        descending: bool,
+    ) -> Ordering {
+        let ordering = match (nulls, left, right) {
+            (Some(_), Value::Null, Value::Null) => Ordering::Equal,
+            (Some(NullOrder::First), Value::Null, _) => Ordering::Less,
+            (Some(NullOrder::First), _, Value::Null) => Ordering::Greater,
+            (Some(NullOrder::Last), Value::Null, _) => Ordering::Greater,
+            (Some(NullOrder::Last), _, Value::Null) => Ordering::Less,
+            _ => self
+                .compare(left, right)
+                .unwrap_or(None)
+                .unwrap_or(Ordering::Equal),
+        };
+
+        let should_reverse = descending
+            && (nulls.is_none() || !matches!((left, right), (Value::Null, _) | (_, Value::Null)));
+
+        if should_reverse {
+            ordering.reverse()
+        } else {
+            ordering
+        }
     }
 
     fn scan_index_spec(
@@ -1007,16 +1560,25 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         table: &str,
         scan: &IndexScanSpec,
     ) -> Result<Vec<RowId>> {
-        match &scan.range {
-            Some(range) => self.storage.scan_index_range(
-                transaction_id,
-                table,
-                &scan.index,
-                &scan.key_prefix,
-                range.lower.as_ref().map(|bound| (bound.op, &bound.value)),
-                range.upper.as_ref().map(|bound| (bound.op, &bound.value)),
-            ),
-            None => {
+        match scan.mode {
+            IndexScanMode::Lookup => {
+                self.storage
+                    .lookup_index(transaction_id, table, &scan.index, &scan.key_prefix)
+            }
+            IndexScanMode::Range => {
+                let Some(range) = &scan.range else {
+                    return Err(DbError::plan("range index scan is missing range bounds"));
+                };
+                self.storage.scan_index_range(
+                    transaction_id,
+                    table,
+                    &scan.index,
+                    &scan.key_prefix,
+                    range.lower.as_ref().map(|bound| (bound.op, &bound.value)),
+                    range.upper.as_ref().map(|bound| (bound.op, &bound.value)),
+                )
+            }
+            IndexScanMode::Prefix => {
                 self.storage
                     .scan_index_prefix(transaction_id, table, &scan.index, &scan.key_prefix)
             }
@@ -1039,6 +1601,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 SelectItem::Column(name) | SelectItem::AliasedColumn { name, .. } => {
                     self.lookup_value(&source.columns, row, name).cloned()
                 }
+                SelectItem::Expr { expr, .. } => self.evaluate_scalar_expr(source, row, expr),
                 SelectItem::Aggregate { .. } => Err(DbError::plan(
                     "aggregate projection requires aggregate execution path",
                 )),
@@ -1070,6 +1633,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     meta.name = alias.clone();
                     Ok(meta)
                 }
+                SelectItem::Expr { expr, alias } => {
+                    let output_name = alias.clone().unwrap_or_else(|| self.scalar_expr_name(expr));
+                    Ok(ColumnMeta {
+                        table: None,
+                        alias: None,
+                        name: output_name.clone(),
+                        output_name,
+                    })
+                }
                 SelectItem::Aggregate { .. } => Err(DbError::plan(
                     "aggregate projection requires aggregate execution path",
                 )),
@@ -1099,6 +1671,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         rowset: &RowSet,
         row: &Row,
         filter: Option<&Expr>,
+        outer: Option<(&RowSet, &Row)>,
     ) -> Result<bool> {
         let Some(filter) = filter else {
             return Ok(true);
@@ -1106,42 +1679,48 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
 
         match filter {
             Expr::Compare { column, op, value } => {
-                let left = self.lookup_value(&rowset.columns, row, column)?;
-                self.compare_with_operator(left, op, value)
+                let left = self.lookup_filter_value(rowset, row, outer, column)?;
+                self.compare_with_operator(&left, op, value)
             }
             Expr::CompareColumns { left, op, right } => {
-                let left = self.lookup_value(&rowset.columns, row, left)?;
-                let right = self.lookup_value(&rowset.columns, row, right)?;
-                self.compare_with_operator(left, op, right)
+                let left = self.lookup_filter_value(rowset, row, outer, left)?;
+                let right = self.lookup_filter_value(rowset, row, outer, right)?;
+                self.compare_with_operator(&left, op, &right)
             }
             Expr::IsNull { column, negated } => {
-                let left = self.lookup_value(&rowset.columns, row, column)?;
-                Ok((left == &Value::Null) ^ *negated)
+                let left = self.lookup_filter_value(rowset, row, outer, column)?;
+                Ok((left == Value::Null) ^ *negated)
             }
             Expr::InSubquery {
                 column,
                 query,
                 negated,
             } => {
-                let left = self.lookup_value(&rowset.columns, row, column)?;
-                let rows = self.execute_subquery(transaction_id, query)?;
-                let contains = rows.rows.iter().any(|row| row.first() == Some(left));
+                let left = self.lookup_filter_value(rowset, row, outer, column)?;
+                let rows = self.execute_subquery(transaction_id, query, Some((rowset, row)))?;
+                let contains = rows.rows.iter().any(|row| row.first() == Some(&left));
                 Ok(contains ^ *negated)
             }
             Expr::CompareSubquery { column, op, query } => {
-                let left = self.lookup_value(&rowset.columns, row, column)?;
-                let right = self.scalar_subquery_value(transaction_id, query)?;
-                self.compare_with_operator(left, op, &right)
+                let left = self.lookup_filter_value(rowset, row, outer, column)?;
+                let right =
+                    self.scalar_subquery_value(transaction_id, query, Some((rowset, row)))?;
+                self.compare_with_operator(&left, op, &right)
+            }
+            Expr::ExistsSubquery { query, negated } => {
+                let rows = self.execute_subquery(transaction_id, query, Some((rowset, row)))?;
+                Ok((!rows.rows.is_empty()) ^ *negated)
             }
             Expr::Like {
                 column,
                 pattern,
                 negated,
             } => {
-                let Value::Text(value) = self.lookup_value(&rowset.columns, row, column)? else {
+                let Value::Text(value) = self.lookup_filter_value(rowset, row, outer, column)?
+                else {
                     return Ok(false);
                 };
-                Ok(Self::matches_like_pattern(value, pattern) ^ *negated)
+                Ok(Self::matches_like_pattern(&value, pattern) ^ *negated)
             }
             Expr::Between {
                 column,
@@ -1149,39 +1728,45 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 high,
                 negated,
             } => {
-                let value = self.lookup_value(&rowset.columns, row, column)?;
-                let Some(low_cmp) = self.compare(value, low)? else {
+                let value = self.lookup_filter_value(rowset, row, outer, column)?;
+                let Some(low_cmp) = self.compare(&value, low)? else {
                     return Ok(false);
                 };
-                let Some(high_cmp) = self.compare(value, high)? else {
+                let Some(high_cmp) = self.compare(&value, high)? else {
                     return Ok(false);
                 };
                 let matches = matches!(low_cmp, Ordering::Greater | Ordering::Equal)
                     && matches!(high_cmp, Ordering::Less | Ordering::Equal);
                 Ok(matches ^ *negated)
             }
-            Expr::Not(expr) => {
-                Ok(!self.matches_filter(transaction_id, rowset, row, Some(expr.as_ref()))?)
-            }
+            Expr::Not(expr) => Ok(!self.matches_filter(
+                transaction_id,
+                rowset,
+                row,
+                Some(expr.as_ref()),
+                outer,
+            )?),
             Expr::And(left, right) => {
                 Ok(
-                    self.matches_filter(transaction_id, rowset, row, Some(left.as_ref()))?
+                    self.matches_filter(transaction_id, rowset, row, Some(left.as_ref()), outer)?
                         && self.matches_filter(
                             transaction_id,
                             rowset,
                             row,
                             Some(right.as_ref()),
+                            outer,
                         )?,
                 )
             }
             Expr::Or(left, right) => {
                 Ok(
-                    self.matches_filter(transaction_id, rowset, row, Some(left.as_ref()))?
+                    self.matches_filter(transaction_id, rowset, row, Some(left.as_ref()), outer)?
                         || self.matches_filter(
                             transaction_id,
                             rowset,
                             row,
                             Some(right.as_ref()),
+                            outer,
                         )?,
                 )
             }
@@ -1192,13 +1777,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         &self,
         transaction_id: TransactionId,
         query: &crate::sql::ast::SelectStatement,
+        outer: Option<(&RowSet, &Row)>,
     ) -> Result<RowSet> {
-        let planner = Planner::new();
+        let planner = Planner::with_unresolved_outer_refs();
         let context = self
             .storage
             .planning_context_snapshot(Some(transaction_id))?;
         let plan = planner.plan_statement(&Statement::Select(query.clone()), &context)?;
-        let rows = self.execute_query_plan(transaction_id, plan)?;
+        let plan = Optimizer::new().optimize_with_context(plan, &context)?;
+        let rows = self.execute_query_plan_with_outer(transaction_id, plan, outer)?;
         if rows.columns.len() != 1 {
             return Err(DbError::plan("subquery must return exactly one column"));
         }
@@ -1209,8 +1796,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         &self,
         transaction_id: TransactionId,
         query: &crate::sql::ast::SelectStatement,
+        outer: Option<(&RowSet, &Row)>,
     ) -> Result<Value> {
-        let rows = self.execute_subquery(transaction_id, query)?;
+        let rows = self.execute_subquery(transaction_id, query, outer)?;
         match rows.rows.as_slice() {
             [] => Ok(Value::Null),
             [row] => Ok(row.first().cloned().unwrap_or(Value::Null)),
@@ -1238,6 +1826,24 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         self.resolve_column_index(columns, column)
             .ok()
             .and_then(|index| row.get(index))
+    }
+
+    fn lookup_filter_value(
+        &self,
+        rowset: &RowSet,
+        row: &Row,
+        outer: Option<(&RowSet, &Row)>,
+        column: &str,
+    ) -> Result<Value> {
+        if let Some(value) = self.try_lookup_value(&rowset.columns, row, column) {
+            return Ok(value.clone());
+        }
+        if let Some((outer_rowset, outer_row)) = outer
+            && let Some(value) = self.try_lookup_value(&outer_rowset.columns, outer_row, column)
+        {
+            return Ok(value.clone());
+        }
+        self.lookup_value(&rowset.columns, row, column).cloned()
     }
 
     fn resolve_column_index(&self, columns: &[ColumnMeta], column: &str) -> Result<usize> {
@@ -1285,6 +1891,79 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         }
     }
 
+    fn evaluate_scalar_expr(&self, source: &RowSet, row: &Row, expr: &ScalarExpr) -> Result<Value> {
+        Ok(match expr {
+            ScalarExpr::Literal(value) => value.clone(),
+            ScalarExpr::Column(name) => self.lookup_value(&source.columns, row, name)?.clone(),
+            ScalarExpr::UnaryMinus(expr) => match self.evaluate_scalar_expr(source, row, expr)? {
+                Value::Integer(value) => Value::Integer(-value),
+                Value::Null => Value::Null,
+                value => {
+                    return Err(DbError::plan(format!(
+                        "unary - expects INTEGER but got {}",
+                        value.type_name()
+                    )));
+                }
+            },
+            ScalarExpr::Binary { left, op, right } => {
+                let left = self.evaluate_scalar_expr(source, row, left)?;
+                let right = self.evaluate_scalar_expr(source, row, right)?;
+                self.evaluate_binary_scalar(*op, left, right)?
+            }
+        })
+    }
+
+    fn evaluate_binary_scalar(
+        &self,
+        op: ScalarBinaryOp,
+        left: Value,
+        right: Value,
+    ) -> Result<Value> {
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
+        match op {
+            ScalarBinaryOp::Add => Self::integer_binary_op(left, right, "+", |l, r| l + r),
+            ScalarBinaryOp::Subtract => Self::integer_binary_op(left, right, "-", |l, r| l - r),
+            ScalarBinaryOp::Multiply => Self::integer_binary_op(left, right, "*", |l, r| l * r),
+            ScalarBinaryOp::Divide => match (left, right) {
+                (Value::Integer(_), Value::Integer(0)) => Err(DbError::plan("division by zero")),
+                (Value::Integer(left), Value::Integer(right)) => Ok(Value::Integer(left / right)),
+                (left, right) => Err(DbError::plan(format!(
+                    "/ expects INTEGER operands but got {} and {}",
+                    left.type_name(),
+                    right.type_name()
+                ))),
+            },
+            ScalarBinaryOp::Concat => match (left, right) {
+                (Value::Text(left), Value::Text(right)) => {
+                    Ok(Value::Text(format!("{left}{right}")))
+                }
+                (left, right) => Err(DbError::plan(format!(
+                    "|| expects TEXT operands but got {} and {}",
+                    left.type_name(),
+                    right.type_name()
+                ))),
+            },
+        }
+    }
+
+    fn integer_binary_op(
+        left: Value,
+        right: Value,
+        op: &str,
+        f: impl FnOnce(i64, i64) -> i64,
+    ) -> Result<Value> {
+        match (left, right) {
+            (Value::Integer(left), Value::Integer(right)) => Ok(Value::Integer(f(left, right))),
+            (left, right) => Err(DbError::plan(format!(
+                "{op} expects INTEGER operands but got {} and {}",
+                left.type_name(),
+                right.type_name()
+            ))),
+        }
+    }
+
     fn compare(&self, left: &Value, right: &Value) -> Result<Option<Ordering>> {
         let ordering = match (left, right) {
             (Value::Null, Value::Null) => Some(Ordering::Equal),
@@ -1324,6 +2003,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             SelectItem::Wildcard => "*".to_string(),
             SelectItem::Column(name) => name.clone(),
             SelectItem::AliasedColumn { alias, .. } => alias.clone(),
+            SelectItem::Expr { expr, alias } => {
+                alias.clone().unwrap_or_else(|| self.scalar_expr_name(expr))
+            }
             SelectItem::Aggregate { func, arg, alias } => alias.clone().unwrap_or_else(|| {
                 format!(
                     "{}({})",
@@ -1346,6 +2028,26 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     }
                 )
             }),
+        }
+    }
+
+    fn scalar_expr_name(&self, expr: &ScalarExpr) -> String {
+        match expr {
+            ScalarExpr::Literal(value) => value.to_string(),
+            ScalarExpr::Column(name) => name.clone(),
+            ScalarExpr::UnaryMinus(expr) => format!("-{}", self.scalar_expr_name(expr)),
+            ScalarExpr::Binary { left, op, right } => format!(
+                "{} {} {}",
+                self.scalar_expr_name(left),
+                match op {
+                    ScalarBinaryOp::Add => "+",
+                    ScalarBinaryOp::Subtract => "-",
+                    ScalarBinaryOp::Multiply => "*",
+                    ScalarBinaryOp::Divide => "/",
+                    ScalarBinaryOp::Concat => "||",
+                },
+                self.scalar_expr_name(right)
+            ),
         }
     }
 }

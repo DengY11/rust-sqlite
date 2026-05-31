@@ -21,6 +21,14 @@ fn name_index() -> IndexMeta {
     }
 }
 
+fn unique_name_index() -> IndexMeta {
+    IndexMeta {
+        name: "idx_users_name_unique".to_string(),
+        columns: vec!["name".to_string()],
+        unique: true,
+    }
+}
+
 #[test]
 fn file_storage_reopen_preserves_schema_rows_and_index_entries() {
     let dir = tempdir().unwrap();
@@ -56,6 +64,46 @@ fn file_storage_reopen_preserves_schema_rows_and_index_entries() {
         1
     );
     reopened.rollback(txn).unwrap();
+}
+
+#[test]
+fn file_storage_renames_table_and_column_and_rewrites_added_column() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db");
+    let storage = FileStorage::open(&path).unwrap();
+    let txn = storage.begin().unwrap();
+    storage.create_schema(txn, users_schema()).unwrap();
+    storage.create_index(txn, "users", name_index()).unwrap();
+    storage
+        .insert_row(txn, "users", vec![Value::Integer(1), Value::from("alice")])
+        .unwrap();
+
+    storage
+        .add_column(
+            txn,
+            "users",
+            ColumnDef::new("age", ColumnType::Integer).default_value(Value::Integer(0)),
+        )
+        .unwrap();
+    storage
+        .rename_column(txn, "users", "name", "full_name")
+        .unwrap();
+    storage.rename_schema(txn, "users", "customers").unwrap();
+
+    assert!(storage.get_schema(txn, "users").unwrap().is_none());
+    let schema = storage.get_schema(txn, "customers").unwrap().unwrap();
+    assert_eq!(schema.name, "customers");
+    assert_eq!(schema.columns[1].name, "full_name");
+    assert_eq!(schema.columns[2].name, "age");
+    assert_eq!(
+        storage.scan_rows(txn, "customers").unwrap()[0].1[2],
+        Value::Integer(0)
+    );
+    assert_eq!(
+        storage.list_indexes(txn, "customers").unwrap()[0].columns,
+        vec!["full_name".to_string()]
+    );
+    storage.rollback(txn).unwrap();
 }
 
 #[test]
@@ -145,6 +193,64 @@ fn file_storage_rejects_duplicate_primary_key_and_persists_only_legal_rows() {
         )]
     );
     reopened.rollback(txn).unwrap();
+}
+
+#[test]
+fn file_storage_enforces_unique_index_on_insert_and_backfill() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db");
+    let storage = FileStorage::open(&path).unwrap();
+    let txn = storage.begin().unwrap();
+    storage.create_schema(txn, users_schema()).unwrap();
+    storage
+        .create_index(txn, "users", unique_name_index())
+        .unwrap();
+
+    storage
+        .insert_row(txn, "users", vec![Value::Integer(1), Value::from("alice")])
+        .unwrap();
+
+    let insert_error = storage
+        .insert_row(txn, "users", vec![Value::Integer(2), Value::from("alice")])
+        .unwrap_err();
+    assert_eq!(
+        insert_error.to_string(),
+        "storage error: unique index idx_users_name_unique constraint failed"
+    );
+    assert_eq!(storage.scan_rows(txn, "users").unwrap().len(), 1);
+
+    storage.rollback(txn).unwrap();
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db");
+    let storage = FileStorage::open(&path).unwrap();
+    let txn = storage.begin().unwrap();
+    storage.create_schema(txn, users_schema()).unwrap();
+
+    storage
+        .insert_row(txn, "users", vec![Value::Integer(1), Value::from("alice")])
+        .unwrap();
+    storage
+        .insert_row(txn, "users", vec![Value::Integer(2), Value::from("alice")])
+        .unwrap();
+
+    let backfill_error = storage
+        .create_index(
+            txn,
+            "users",
+            IndexMeta {
+                name: "idx_users_name_backfill".to_string(),
+                columns: vec!["name".to_string()],
+                unique: true,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        backfill_error.to_string(),
+        "storage error: unique index idx_users_name_backfill constraint failed"
+    );
+
+    storage.rollback(txn).unwrap();
 }
 
 #[test]

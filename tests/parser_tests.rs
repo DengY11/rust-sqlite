@@ -1,7 +1,7 @@
 use rustsql::common::types::{ColumnDef, ColumnType, Value};
 use rustsql::sql::ast::{
-    AggregateArg, AggregateFunc, Assignment, CompareOp, Expr, JoinClause, JoinKind, OrderBy,
-    OrderByExpr, SelectItem, SelectStatement, Statement,
+    AggregateArg, AggregateFunc, AlterTableAction, Assignment, CompareOp, Expr, JoinClause,
+    JoinKind, NullOrder, OrderBy, OrderByExpr, SelectItem, SelectStatement, Statement,
 };
 use rustsql::sql::lexer::{TokenKind, lex};
 use rustsql::sql::parser::parse_sql;
@@ -29,6 +29,27 @@ fn select_statement(
 }
 
 #[test]
+fn parses_explain_query_plan_select_statement() {
+    let statements = parse_sql("EXPLAIN QUERY PLAN SELECT name FROM users WHERE id = 1;").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::ExplainQueryPlan(Box::new(select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            Some(Expr::Compare {
+                column: "id".to_string(),
+                op: CompareOp::Eq,
+                value: Value::Integer(1),
+            }),
+            vec![],
+            None,
+        )))]
+    );
+}
+
+#[test]
 fn parses_create_table_statement() {
     let statements = parse_sql("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);").unwrap();
 
@@ -40,7 +61,76 @@ fn parses_create_table_statement() {
                 ColumnDef::primary_key("id", ColumnType::Integer),
                 ColumnDef::new("name", ColumnType::Text),
             ],
+            constraints: vec![],
         }]
+    );
+}
+
+#[test]
+fn parses_create_table_defaults_checks_and_foreign_keys() {
+    let statements = parse_sql(
+        "CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id),
+            amount INTEGER DEFAULT 0 CHECK (amount >= 0),
+            CHECK (id > 0),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );",
+    )
+    .unwrap();
+
+    let Statement::CreateTable {
+        name,
+        columns,
+        constraints,
+    } = &statements[0]
+    else {
+        panic!("expected create table");
+    };
+
+    assert_eq!(name, "orders");
+    assert_eq!(columns[2].default_value, Some(Value::Integer(0)));
+    assert_eq!(columns[1].foreign_key.as_ref().unwrap().ref_table, "users");
+    assert_eq!(constraints.len(), 2);
+}
+
+#[test]
+fn parses_alter_table_variants() {
+    let statements = parse_sql(
+        "ALTER TABLE users ADD COLUMN age INTEGER DEFAULT 0;
+         ALTER TABLE users RENAME TO customers;
+         ALTER TABLE customers RENAME COLUMN name TO full_name;",
+    )
+    .unwrap();
+
+    assert_eq!(statements.len(), 3);
+    assert_eq!(
+        statements[0],
+        Statement::AlterTable {
+            table: "users".to_string(),
+            action: AlterTableAction::AddColumn(
+                ColumnDef::new("age", ColumnType::Integer).default_value(Value::Integer(0))
+            ),
+        }
+    );
+    assert_eq!(
+        statements[1],
+        Statement::AlterTable {
+            table: "users".to_string(),
+            action: AlterTableAction::RenameTable {
+                new_name: "customers".to_string(),
+            },
+        }
+    );
+    assert_eq!(
+        statements[2],
+        Statement::AlterTable {
+            table: "customers".to_string(),
+            action: AlterTableAction::RenameColumn {
+                old_name: "name".to_string(),
+                new_name: "full_name".to_string(),
+            },
+        }
     );
 }
 
@@ -57,6 +147,7 @@ fn parses_not_null_column_constraint() {
                 ColumnDef::primary_key("id", ColumnType::Integer),
                 ColumnDef::new("name", ColumnType::Text).nullable(false),
             ],
+            constraints: vec![],
         }]
     );
 }
@@ -71,6 +162,22 @@ fn parses_create_index_statement() {
             name: "idx_users_id".to_string(),
             table: "users".to_string(),
             columns: vec!["id".to_string()],
+            unique: false,
+        }]
+    );
+}
+
+#[test]
+fn parses_create_unique_index_statement() {
+    let statements = parse_sql("CREATE UNIQUE INDEX idx_users_email ON users (email);").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::CreateIndex {
+            name: "idx_users_email".to_string(),
+            table: "users".to_string(),
+            columns: vec!["email".to_string()],
+            unique: true,
         }]
     );
 }
@@ -85,6 +192,7 @@ fn parses_multi_column_create_index_statement() {
             name: "idx_users_id_name".to_string(),
             table: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
+            unique: false,
         }]
     );
 }
@@ -100,6 +208,7 @@ fn parses_three_column_create_index_statement() {
             name: "idx_users_id_name_active".to_string(),
             table: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
+            unique: false,
         }]
     );
 }
@@ -244,16 +353,91 @@ fn parses_delete_update_order_by_limit_and_aliases() {
                     OrderBy {
                         expr: OrderByExpr::Column("username".to_string()),
                         descending: true,
+                        nulls: None,
                     },
                     OrderBy {
                         expr: OrderByExpr::Column("u.id".to_string()),
                         descending: false,
+                        nulls: None,
                     },
                 ],
                 limit: Some(5),
                 distinct: false,
                 having: None,
             }),
+        ]
+    );
+}
+
+#[test]
+fn parses_order_by_nulls_first_and_last() {
+    let statements =
+        parse_sql("SELECT age, name FROM users ORDER BY age NULLS FIRST, name DESC NULLS LAST;")
+            .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![
+                SelectItem::Column("age".to_string()),
+                SelectItem::Column("name".to_string()),
+            ],
+            "users",
+            None,
+            None,
+            vec![
+                OrderBy {
+                    expr: OrderByExpr::Column("age".to_string()),
+                    descending: false,
+                    nulls: Some(NullOrder::First),
+                },
+                OrderBy {
+                    expr: OrderByExpr::Column("name".to_string()),
+                    descending: true,
+                    nulls: Some(NullOrder::Last),
+                },
+            ],
+            None,
+        )]
+    );
+}
+
+#[test]
+fn parses_null_ordering_words_as_identifiers() {
+    let statements = parse_sql(
+        "CREATE TABLE t (first INTEGER, last TEXT, nulls INTEGER);
+         SELECT first, last, nulls FROM t ORDER BY nulls NULLS LAST;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![
+            Statement::CreateTable {
+                name: "t".to_string(),
+                columns: vec![
+                    ColumnDef::new("first", ColumnType::Integer),
+                    ColumnDef::new("last", ColumnType::Text),
+                    ColumnDef::new("nulls", ColumnType::Integer),
+                ],
+                constraints: vec![],
+            },
+            select_statement(
+                vec![
+                    SelectItem::Column("first".to_string()),
+                    SelectItem::Column("last".to_string()),
+                    SelectItem::Column("nulls".to_string()),
+                ],
+                "t",
+                None,
+                None,
+                vec![OrderBy {
+                    expr: OrderByExpr::Column("nulls".to_string()),
+                    descending: false,
+                    nulls: Some(NullOrder::Last),
+                }],
+                None,
+            ),
         ]
     );
 }
@@ -682,6 +866,7 @@ fn parses_group_by_join_and_subquery_forms() {
                 order_by: vec![OrderBy {
                     expr: OrderByExpr::Column("total".to_string()),
                     descending: true,
+                    nulls: None,
                 }],
                 limit: None,
             }),
@@ -713,6 +898,7 @@ fn parses_group_by_join_and_subquery_forms() {
                 order_by: vec![OrderBy {
                     expr: OrderByExpr::Column("u.name".to_string()),
                     descending: false,
+                    nulls: None,
                 }],
                 limit: None,
             }),

@@ -1,5 +1,7 @@
 use crate::common::types::{ColumnDef, Value};
-use crate::sql::ast::{Assignment, CompareOp, Expr, JoinKind, OrderBy, SelectItem};
+use crate::sql::ast::{
+    AlterTableAction, Assignment, CompareOp, Expr, JoinKind, OrderBy, SelectItem, TableConstraint,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinPlan {
@@ -12,8 +14,16 @@ pub struct JoinPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexScanSpec {
     pub index: String,
+    pub mode: IndexScanMode,
     pub key_prefix: Vec<Value>,
     pub range: Option<IndexRange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexScanMode {
+    Lookup,
+    Prefix,
+    Range,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,11 +44,13 @@ pub enum Plan {
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
+        constraints: Vec<TableConstraint>,
     },
     CreateIndex {
         name: String,
         table: String,
         columns: Vec<String>,
+        unique: bool,
     },
     DropTable {
         name: String,
@@ -46,6 +58,10 @@ pub enum Plan {
     DropIndex {
         table: String,
         name: String,
+    },
+    AlterTable {
+        table: String,
+        action: AlterTableAction,
     },
     Insert {
         table: String,
@@ -74,6 +90,7 @@ pub enum Plan {
         table_alias: Option<String>,
         columns: Vec<SelectItem>,
         index: String,
+        mode: IndexScanMode,
         key_prefix: Vec<Value>,
         range: Option<IndexRange>,
         filter: Option<Expr>,
@@ -109,6 +126,9 @@ pub enum Plan {
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
     },
+    ExplainQueryPlan {
+        plan: Box<Plan>,
+    },
     BeginTxn,
     CommitTxn,
     RollbackTxn,
@@ -119,19 +139,21 @@ mod tests {
     use crate::common::types::{ColumnDef, ColumnType, Value};
     use crate::sql::ast::{CompareOp, Expr, JoinKind, SelectItem};
 
-    use super::{IndexBound, IndexRange, IndexScanSpec, JoinPlan, Plan};
+    use super::{IndexBound, IndexRange, IndexScanMode, IndexScanSpec, JoinPlan, Plan};
 
     #[test]
     fn plan_variants_preserve_statement_payloads() {
         let plan = Plan::CreateTable {
             name: "users".to_string(),
             columns: vec![ColumnDef::primary_key("id", ColumnType::Integer)],
+            constraints: vec![],
         };
         assert_eq!(
             plan,
             Plan::CreateTable {
                 name: "users".to_string(),
                 columns: vec![ColumnDef::primary_key("id", ColumnType::Integer)],
+                constraints: vec![],
             }
         );
     }
@@ -176,6 +198,7 @@ mod tests {
             table_alias: None,
             columns: vec![SelectItem::Wildcard],
             index: "idx_users_id_name".to_string(),
+            mode: IndexScanMode::Range,
             key_prefix: vec![Value::Integer(7)],
             range: Some(IndexRange {
                 column: "name".to_string(),
@@ -197,6 +220,7 @@ mod tests {
                 table_alias: None,
                 columns: vec![SelectItem::Wildcard],
                 index: "idx_users_id_name".to_string(),
+                mode: IndexScanMode::Range,
                 key_prefix: vec![Value::Integer(7)],
                 range: Some(IndexRange {
                     column: "name".to_string(),
@@ -223,11 +247,13 @@ mod tests {
             scans: vec![
                 IndexScanSpec {
                     index: "idx_users_id".to_string(),
+                    mode: IndexScanMode::Lookup,
                     key_prefix: vec![Value::Integer(7)],
                     range: None,
                 },
                 IndexScanSpec {
                     index: "idx_users_name".to_string(),
+                    mode: IndexScanMode::Lookup,
                     key_prefix: vec![Value::from("alice")],
                     range: None,
                 },
@@ -258,11 +284,13 @@ mod tests {
                 scans: vec![
                     IndexScanSpec {
                         index: "idx_users_id".to_string(),
+                        mode: IndexScanMode::Lookup,
                         key_prefix: vec![Value::Integer(7)],
                         range: None,
                     },
                     IndexScanSpec {
                         index: "idx_users_name".to_string(),
+                        mode: IndexScanMode::Lookup,
                         key_prefix: vec![Value::from("alice")],
                         range: None,
                     },

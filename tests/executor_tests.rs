@@ -3,7 +3,8 @@ use std::cell::Cell;
 use rustsql::common::types::{ColumnDef, ColumnType, Value};
 use rustsql::sql::ast::{CompareOp, Expr, SelectItem, SelectStatement, Statement};
 use rustsql::sql::executor::Executor;
-use rustsql::sql::plan::{IndexBound, IndexRange, IndexScanSpec, Plan};
+use rustsql::sql::optimizer::Optimizer;
+use rustsql::sql::plan::{IndexBound, IndexRange, IndexScanMode, IndexScanSpec, Plan};
 use rustsql::sql::planner::Planner;
 use rustsql::storage::memory::MemoryStorage;
 
@@ -30,6 +31,12 @@ fn users_columns() -> Vec<ColumnDef> {
     ]
 }
 
+fn optimize_plan(plan: Plan, context: &rustsql::sql::planner::PlanningContext) -> Plan {
+    Optimizer::new()
+        .optimize_with_context(plan, context)
+        .unwrap()
+}
+
 #[test]
 fn executor_runs_seq_scan_with_wildcard_projection_and_filter() {
     let storage = MemoryStorage::new();
@@ -40,6 +47,7 @@ fn executor_runs_seq_scan_with_wildcard_projection_and_filter() {
         .execute(Plan::CreateTable {
             name: "users".to_string(),
             columns: users_columns(),
+            constraints: vec![],
         })
         .unwrap();
     executor
@@ -86,7 +94,7 @@ fn executor_runs_seq_scan_with_wildcard_projection_and_filter() {
 }
 
 #[test]
-fn executor_runs_index_scan_selected_by_planner() {
+fn executor_runs_index_scan_selected_by_optimizer() {
     let storage = MemoryStorage::new();
     let current_txn = Cell::new(None);
     let executor = Executor::new(&storage, &current_txn);
@@ -99,6 +107,7 @@ fn executor_runs_index_scan_selected_by_planner() {
                 ColumnDef::primary_key("id", ColumnType::Integer),
                 ColumnDef::new("name", ColumnType::Text).nullable(false),
             ],
+            constraints: vec![],
         })
         .unwrap();
     executor
@@ -106,6 +115,7 @@ fn executor_runs_index_scan_selected_by_planner() {
             name: "idx_users_name".to_string(),
             table: "users".to_string(),
             columns: vec!["name".to_string()],
+            unique: false,
         })
         .unwrap();
     executor
@@ -131,7 +141,10 @@ fn executor_runs_index_scan_selected_by_planner() {
         }),
     );
     let context = storage.planning_context(current_txn.get()).unwrap();
-    let plan = planner.plan_statement(&statement, &context).unwrap();
+    let plan = optimize_plan(
+        planner.plan_statement(&statement, &context).unwrap(),
+        &context,
+    );
 
     assert_eq!(
         plan,
@@ -140,6 +153,7 @@ fn executor_runs_index_scan_selected_by_planner() {
             table_alias: None,
             columns: vec![SelectItem::Column("id".to_string())],
             index: "idx_users_name".to_string(),
+            mode: IndexScanMode::Lookup,
             key_prefix: vec![Value::from("alice")],
             range: None,
             filter: Some(Expr::Compare {
@@ -168,6 +182,7 @@ fn executor_rechecks_full_filter_after_prefix_index_scan() {
         .execute(Plan::CreateTable {
             name: "users".to_string(),
             columns: users_columns(),
+            constraints: vec![],
         })
         .unwrap();
     executor
@@ -175,6 +190,7 @@ fn executor_rechecks_full_filter_after_prefix_index_scan() {
             name: "idx_users_active_name".to_string(),
             table: "users".to_string(),
             columns: vec!["active".to_string(), "name".to_string()],
+            unique: false,
         })
         .unwrap();
     executor
@@ -215,7 +231,10 @@ fn executor_rechecks_full_filter_after_prefix_index_scan() {
         )),
     );
     let context = storage.planning_context(current_txn.get()).unwrap();
-    let plan = planner.plan_statement(&statement, &context).unwrap();
+    let plan = optimize_plan(
+        planner.plan_statement(&statement, &context).unwrap(),
+        &context,
+    );
 
     assert_eq!(
         plan,
@@ -224,6 +243,7 @@ fn executor_rechecks_full_filter_after_prefix_index_scan() {
             table_alias: None,
             columns: vec![SelectItem::Column("id".to_string())],
             index: "idx_users_active_name".to_string(),
+            mode: IndexScanMode::Lookup,
             key_prefix: vec![Value::Boolean(true), Value::from("alice")],
             range: None,
             filter: Some(Expr::And(
@@ -263,6 +283,7 @@ fn executor_uses_eq_prefix_index_scan_even_with_range_term_in_filter() {
                 ColumnDef::new("id", ColumnType::Integer).nullable(false),
                 ColumnDef::new("name", ColumnType::Text).nullable(false),
             ],
+            constraints: vec![],
         })
         .unwrap();
     executor
@@ -270,6 +291,7 @@ fn executor_uses_eq_prefix_index_scan_even_with_range_term_in_filter() {
             name: "idx_users_id_name".to_string(),
             table: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
+            unique: false,
         })
         .unwrap();
     executor
@@ -308,7 +330,10 @@ fn executor_uses_eq_prefix_index_scan_even_with_range_term_in_filter() {
         )),
     );
     let context = storage.planning_context(current_txn.get()).unwrap();
-    let plan = planner.plan_statement(&statement, &context).unwrap();
+    let plan = optimize_plan(
+        planner.plan_statement(&statement, &context).unwrap(),
+        &context,
+    );
 
     assert_eq!(
         plan,
@@ -317,6 +342,7 @@ fn executor_uses_eq_prefix_index_scan_even_with_range_term_in_filter() {
             table_alias: None,
             columns: vec![SelectItem::Column("name".to_string())],
             index: "idx_users_id_name".to_string(),
+            mode: IndexScanMode::Range,
             key_prefix: vec![Value::Integer(7)],
             range: Some(IndexRange {
                 column: "name".to_string(),
@@ -362,6 +388,7 @@ fn executor_uses_leading_column_range_scan() {
                 ColumnDef::primary_key("id", ColumnType::Integer),
                 ColumnDef::new("name", ColumnType::Text).nullable(false),
             ],
+            constraints: vec![],
         })
         .unwrap();
     executor
@@ -369,6 +396,7 @@ fn executor_uses_leading_column_range_scan() {
             name: "idx_users_id".to_string(),
             table: "users".to_string(),
             columns: vec!["id".to_string()],
+            unique: false,
         })
         .unwrap();
     executor
@@ -400,7 +428,10 @@ fn executor_uses_leading_column_range_scan() {
         }),
     );
     let context = storage.planning_context(current_txn.get()).unwrap();
-    let plan = planner.plan_statement(&statement, &context).unwrap();
+    let plan = optimize_plan(
+        planner.plan_statement(&statement, &context).unwrap(),
+        &context,
+    );
 
     assert_eq!(
         plan,
@@ -409,6 +440,7 @@ fn executor_uses_leading_column_range_scan() {
             table_alias: None,
             columns: vec![SelectItem::Column("name".to_string())],
             index: "idx_users_id".to_string(),
+            mode: IndexScanMode::Range,
             key_prefix: vec![],
             range: Some(IndexRange {
                 column: "id".to_string(),
@@ -451,6 +483,7 @@ fn executor_uses_two_sided_range_scan_after_eq_prefix() {
                 ColumnDef::new("id", ColumnType::Integer).nullable(false),
                 ColumnDef::new("name", ColumnType::Text).nullable(false),
             ],
+            constraints: vec![],
         })
         .unwrap();
     executor
@@ -458,6 +491,7 @@ fn executor_uses_two_sided_range_scan_after_eq_prefix() {
             name: "idx_users_id_name".to_string(),
             table: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
+            unique: false,
         })
         .unwrap();
     executor
@@ -509,7 +543,10 @@ fn executor_uses_two_sided_range_scan_after_eq_prefix() {
         )),
     );
     let context = storage.planning_context(current_txn.get()).unwrap();
-    let plan = planner.plan_statement(&statement, &context).unwrap();
+    let plan = optimize_plan(
+        planner.plan_statement(&statement, &context).unwrap(),
+        &context,
+    );
 
     assert_eq!(
         plan,
@@ -518,6 +555,7 @@ fn executor_uses_two_sided_range_scan_after_eq_prefix() {
             table_alias: None,
             columns: vec![SelectItem::Column("name".to_string())],
             index: "idx_users_id_name".to_string(),
+            mode: IndexScanMode::Range,
             key_prefix: vec![Value::Integer(7)],
             range: Some(IndexRange {
                 column: "name".to_string(),
@@ -576,6 +614,7 @@ fn executor_evaluates_not_is_null_and_inclusive_range_filters() {
                 ColumnDef::new("email", ColumnType::Text),
                 ColumnDef::new("active", ColumnType::Boolean).nullable(false),
             ],
+            constraints: vec![],
         })
         .unwrap();
     executor
@@ -659,6 +698,7 @@ fn executor_merges_or_index_scans_and_deduplicates_rows() {
                 ColumnDef::new("id", ColumnType::Integer).nullable(false),
                 ColumnDef::new("name", ColumnType::Text).nullable(false),
             ],
+            constraints: vec![],
         })
         .unwrap();
     executor
@@ -666,6 +706,7 @@ fn executor_merges_or_index_scans_and_deduplicates_rows() {
             name: "idx_users_id".to_string(),
             table: "users".to_string(),
             columns: vec!["id".to_string()],
+            unique: false,
         })
         .unwrap();
     executor
@@ -673,6 +714,7 @@ fn executor_merges_or_index_scans_and_deduplicates_rows() {
             name: "idx_users_name".to_string(),
             table: "users".to_string(),
             columns: vec!["name".to_string()],
+            unique: false,
         })
         .unwrap();
     executor
@@ -711,7 +753,10 @@ fn executor_merges_or_index_scans_and_deduplicates_rows() {
         )),
     );
     let context = storage.planning_context(current_txn.get()).unwrap();
-    let plan = planner.plan_statement(&statement, &context).unwrap();
+    let plan = optimize_plan(
+        planner.plan_statement(&statement, &context).unwrap(),
+        &context,
+    );
 
     assert_eq!(
         plan,
@@ -722,11 +767,13 @@ fn executor_merges_or_index_scans_and_deduplicates_rows() {
             scans: vec![
                 IndexScanSpec {
                     index: "idx_users_id".to_string(),
+                    mode: IndexScanMode::Lookup,
                     key_prefix: vec![Value::Integer(1)],
                     range: None,
                 },
                 IndexScanSpec {
                     index: "idx_users_name".to_string(),
+                    mode: IndexScanMode::Lookup,
                     key_prefix: vec![Value::from("alice")],
                     range: None,
                 },
@@ -770,6 +817,7 @@ fn executor_projects_selected_columns_in_schema_order() {
         .execute(Plan::CreateTable {
             name: "users".to_string(),
             columns: users_columns(),
+            constraints: vec![],
         })
         .unwrap();
     executor

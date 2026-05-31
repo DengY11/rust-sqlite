@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::common::error::{DbError, Result};
-use crate::common::types::{IndexMeta, Row, RowId, Schema, Value};
+use crate::common::types::{ColumnDef, IndexMeta, Row, RowId, Schema, Value};
 use crate::engine::traits::{
     CatalogStore, IndexStore, PlanningStorageEngine, TableStore, TransactionManager,
 };
@@ -310,6 +310,155 @@ impl CatalogStore for FileStorage {
         Ok(())
     }
 
+    fn replace_schema(&self, transaction_id: TransactionId, schema: Schema) -> Result<()> {
+        self.validate_transaction(transaction_id)?;
+        let mut catalog = self.catalog.borrow_mut();
+        if !catalog.schemas.contains_key(&schema.name) {
+            return Err(DbError::storage(format!("unknown table: {}", schema.name)));
+        }
+        catalog.schemas.insert(schema.name.clone(), schema);
+        Ok(())
+    }
+
+    fn rename_schema(
+        &self,
+        transaction_id: TransactionId,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        self.validate_transaction(transaction_id)?;
+        let mut catalog = self.catalog.borrow_mut();
+        if catalog.schemas.contains_key(new_name) {
+            return Err(DbError::storage(format!(
+                "table already exists: {new_name}"
+            )));
+        }
+        let mut schema = catalog
+            .schemas
+            .remove(old_name)
+            .ok_or_else(|| DbError::storage(format!("unknown table: {old_name}")))?;
+        schema.name = new_name.to_string();
+        catalog.schemas.insert(new_name.to_string(), schema);
+        if let Some(root) = catalog.table_roots.remove(old_name) {
+            catalog.table_roots.insert(new_name.to_string(), root);
+        }
+        if let Some(next_row_id) = catalog.next_row_ids.remove(old_name) {
+            catalog
+                .next_row_ids
+                .insert(new_name.to_string(), next_row_id);
+        }
+        if let Some(indexes) = catalog.indexes.remove(old_name) {
+            catalog.indexes.insert(new_name.to_string(), indexes);
+        }
+        if let Some(index_roots) = catalog.index_roots.remove(old_name) {
+            catalog
+                .index_roots
+                .insert(new_name.to_string(), index_roots);
+        }
+        for schema in catalog.schemas.values_mut() {
+            schema.rename_foreign_key_ref_table(old_name, new_name);
+        }
+        Ok(())
+    }
+
+    fn add_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        column: ColumnDef,
+    ) -> Result<()> {
+        self.validate_transaction(transaction_id)?;
+        let (schema, root_page_id) = self.table_schema_and_root(schema_name)?;
+        if schema.columns.iter().any(|entry| entry.name == column.name) {
+            return Err(DbError::storage(format!(
+                "column already exists on table {schema_name}: {}",
+                column.name
+            )));
+        }
+        let default_value = column.default_value.clone().unwrap_or(Value::Null);
+        let rows = {
+            let pager = self.pager.borrow();
+            let tree = BTree::from_root(root_page_id);
+            tree.scan_all(&pager)?
+        };
+
+        let mut updated_schema = schema;
+        updated_schema.columns.push(column);
+        updated_schema.validate_constraints_metadata()?;
+        for (_, bytes) in &rows {
+            let mut candidate = decode_row(bytes)?;
+            candidate.push(default_value.clone());
+            updated_schema.validate_row_values(&candidate)?;
+            updated_schema.validate_check_constraints(&candidate)?;
+        }
+        {
+            self.catalog
+                .borrow_mut()
+                .schemas
+                .insert(schema_name.to_string(), updated_schema);
+        }
+
+        let mut pager = self.pager.borrow_mut();
+        let mut tree = BTree::from_root(root_page_id);
+        for (row_id, bytes) in rows {
+            let mut row = decode_row(&bytes)?;
+            row.push(default_value.clone());
+            tree.insert(&mut pager, transaction_id.0, row_id, &encode_row(&row)?)?;
+        }
+        if tree.root_page_id() != root_page_id {
+            self.catalog
+                .borrow_mut()
+                .table_roots
+                .insert(schema_name.to_string(), tree.root_page_id());
+        }
+        Ok(())
+    }
+
+    fn rename_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        self.validate_transaction(transaction_id)?;
+        let (schema, _) = self.table_schema_and_root(schema_name)?;
+        if !schema.columns.iter().any(|entry| entry.name == old_name) {
+            return Err(DbError::storage(format!(
+                "unknown column {old_name} on table {schema_name}"
+            )));
+        }
+        if schema.columns.iter().any(|entry| entry.name == new_name) {
+            return Err(DbError::storage(format!(
+                "column already exists on table {schema_name}: {new_name}"
+            )));
+        }
+
+        let mut updated_schema = schema;
+        updated_schema.rename_column_references(old_name, new_name);
+        updated_schema.rename_foreign_key_ref_column(schema_name, old_name, new_name);
+        updated_schema.validate_constraints_metadata()?;
+        let mut catalog = self.catalog.borrow_mut();
+        catalog
+            .schemas
+            .insert(schema_name.to_string(), updated_schema);
+        if let Some(indexes) = catalog.indexes.get_mut(schema_name) {
+            for index in indexes.values_mut() {
+                for column in &mut index.columns {
+                    if column == old_name {
+                        *column = new_name.to_string();
+                    }
+                }
+            }
+        }
+        for (name, schema) in &mut catalog.schemas {
+            if name != schema_name {
+                schema.rename_foreign_key_ref_column(schema_name, old_name, new_name);
+            }
+        }
+        Ok(())
+    }
+
     fn get_schema(&self, transaction_id: TransactionId, name: &str) -> Result<Option<Schema>> {
         self.validate_transaction(transaction_id)?;
         Ok(self.catalog.borrow().schemas.get(name).cloned())
@@ -340,6 +489,7 @@ impl TableStore for FileStorage {
         }
 
         schema.validate_row_values(&row)?;
+        schema.validate_check_constraints(&row)?;
 
         let existing_rows = {
             let pager = self.pager.borrow();
@@ -351,6 +501,28 @@ impl TableStore for FileStorage {
         };
         let existing_refs = existing_rows.iter().collect::<Vec<_>>();
         schema.validate_primary_key_uniqueness(&row, &existing_refs)?;
+
+        for (_, index_meta, root_page_id) in self.indexes_for_table(schema_name)? {
+            let key_values = project_index_key(&schema, &index_meta, &row)?;
+            if !index_meta.enforces_unique_key(&key_values) {
+                continue;
+            }
+
+            let encoded_key = encode_index_key(&key_values)?;
+            let pager = self.pager.borrow();
+            let tree = IndexTree::from_root(root_page_id);
+            if tree
+                .get(&pager, &encoded_key)?
+                .map(|bytes| decode_row_ids(&bytes))
+                .transpose()?
+                .is_some_and(|row_ids| !row_ids.is_empty())
+            {
+                return Err(DbError::storage(format!(
+                    "unique index {} constraint failed",
+                    index_meta.name
+                )));
+            }
+        }
 
         let row_id = {
             let mut catalog = self.catalog.borrow_mut();
@@ -513,26 +685,23 @@ impl IndexStore for FileStorage {
 
         let mut pager = self.pager.borrow_mut();
         let mut tree = IndexTree::create(&mut pager, transaction_id.0)?;
-        let initial_root_page_id = tree.root_page_id();
-
-        {
-            let mut catalog = self.catalog.borrow_mut();
-            catalog
-                .indexes
-                .entry(schema_name.to_string())
-                .or_default()
-                .insert(index.name.clone(), index.clone());
-            catalog
-                .index_roots
-                .entry(schema_name.to_string())
-                .or_default()
-                .insert(index.name.clone(), initial_root_page_id);
-        }
 
         for (row_id, bytes) in existing_rows {
             let row = decode_row(&bytes)?;
             let key_values = project_index_key(&schema, &index, &row)?;
             let encoded_key = encode_index_key(&key_values)?;
+            if index.enforces_unique_key(&key_values)
+                && tree
+                    .get(&pager, &encoded_key)?
+                    .map(|bytes| decode_row_ids(&bytes))
+                    .transpose()?
+                    .is_some_and(|row_ids| !row_ids.is_empty())
+            {
+                return Err(DbError::storage(format!(
+                    "unique index {} constraint failed",
+                    index.name
+                )));
+            }
             Self::upsert_index_entry(
                 &mut tree,
                 &mut pager,
@@ -542,9 +711,14 @@ impl IndexStore for FileStorage {
             )?;
         }
 
-        if tree.root_page_id() != initial_root_page_id {
-            self.catalog
-                .borrow_mut()
+        {
+            let mut catalog = self.catalog.borrow_mut();
+            catalog
+                .indexes
+                .entry(schema_name.to_string())
+                .or_default()
+                .insert(index.name.clone(), index.clone());
+            catalog
                 .index_roots
                 .entry(schema_name.to_string())
                 .or_default()

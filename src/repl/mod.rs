@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use crate::common::error::{DbError, Result};
-use crate::common::types::{ColumnDef, IndexMeta, Schema};
+use crate::common::types::{CheckExpr, CheckOp, ColumnDef, ForeignKey, IndexMeta, Schema, Value};
 use crate::db::{Database, StatementBatchKind};
 use crate::engine::PlanningStorageEngine;
 use crate::sql::ast::{SelectItem, Statement};
@@ -272,13 +272,19 @@ where
 }
 
 fn render_create_table(schema: &Schema) -> String {
-    let columns = schema
+    let mut definitions = schema
         .columns
         .iter()
         .map(render_column_def)
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("CREATE TABLE {} ({});", schema.name, columns)
+        .collect::<Vec<_>>();
+    definitions.extend(
+        schema
+            .checks
+            .iter()
+            .map(|check| format!("CHECK ({})", render_check_expr(&check.expr))),
+    );
+    definitions.extend(schema.foreign_keys.iter().map(render_foreign_key));
+    format!("CREATE TABLE {} ({});", schema.name, definitions.join(", "))
 }
 
 fn render_column_def(column: &ColumnDef) -> String {
@@ -289,12 +295,93 @@ fn render_column_def(column: &ColumnDef) -> String {
     if !column.nullable && !column.primary_key {
         rendered.push_str(" NOT NULL");
     }
+    if let Some(default_value) = &column.default_value {
+        rendered.push_str(" DEFAULT ");
+        rendered.push_str(&render_literal(default_value));
+    }
+    for check in &column.checks {
+        rendered.push_str(" CHECK (");
+        rendered.push_str(&render_check_expr(&check.expr));
+        rendered.push(')');
+    }
+    if let Some(foreign_key) = &column.foreign_key {
+        rendered.push_str(" REFERENCES ");
+        rendered.push_str(&foreign_key.ref_table);
+        rendered.push('(');
+        rendered.push_str(&foreign_key.ref_column);
+        rendered.push(')');
+    }
     rendered
 }
 
-fn render_create_index(table: &str, index: &IndexMeta) -> String {
+fn render_foreign_key(foreign_key: &ForeignKey) -> String {
     format!(
-        "CREATE INDEX {} ON {} ({});",
+        "FOREIGN KEY ({}) REFERENCES {}({})",
+        foreign_key.column, foreign_key.ref_table, foreign_key.ref_column
+    )
+}
+
+fn render_check_expr(expr: &CheckExpr) -> String {
+    match expr {
+        CheckExpr::Compare { column, op, value } => {
+            format!(
+                "{} {} {}",
+                column,
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::IsNull { column, negated } => {
+            if *negated {
+                format!("{column} IS NOT NULL")
+            } else {
+                format!("{column} IS NULL")
+            }
+        }
+        CheckExpr::And(left, right) => {
+            format!(
+                "({}) AND ({})",
+                render_check_expr(left),
+                render_check_expr(right)
+            )
+        }
+        CheckExpr::Or(left, right) => {
+            format!(
+                "({}) OR ({})",
+                render_check_expr(left),
+                render_check_expr(right)
+            )
+        }
+        CheckExpr::Not(expr) => format!("NOT ({})", render_check_expr(expr)),
+    }
+}
+
+fn render_check_op(op: CheckOp) -> &'static str {
+    match op {
+        CheckOp::Eq => "=",
+        CheckOp::Ne => "!=",
+        CheckOp::Gt => ">",
+        CheckOp::Gte => ">=",
+        CheckOp::Lt => "<",
+        CheckOp::Lte => "<=",
+    }
+}
+
+fn render_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(true) => "true".to_string(),
+        Value::Boolean(false) => "false".to_string(),
+        Value::Integer(value) => value.to_string(),
+        Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
+    }
+}
+
+fn render_create_index(table: &str, index: &IndexMeta) -> String {
+    let unique = if index.unique { " UNIQUE" } else { "" };
+    format!(
+        "CREATE{} INDEX {} ON {} ({});",
+        unique,
         index.name,
         table,
         index.columns.join(", ")
@@ -318,6 +405,7 @@ fn infer_headers(statements: &[Statement], row_width: usize) -> Vec<String> {
             SelectItem::Wildcard => "*".to_string(),
             SelectItem::Column(name) => name.clone(),
             SelectItem::AliasedColumn { alias, .. } => alias.clone(),
+            SelectItem::Expr { alias, .. } => alias.clone().unwrap_or_else(|| "expr".to_string()),
             SelectItem::Aggregate { func, arg, alias } => alias.clone().unwrap_or_else(|| {
                 format!(
                     "{}({})",

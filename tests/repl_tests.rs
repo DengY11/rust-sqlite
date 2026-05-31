@@ -94,7 +94,8 @@ fn repl_prints_help_tables_and_schema_meta_commands() {
     let db = Database::memory();
     let input = Cursor::new(
         ".help\n\
-         CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n\
+         CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER DEFAULT 0 CHECK (age >= 0), name TEXT NOT NULL);\n\
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));\n\
          CREATE INDEX idx_users_name ON users (name);\n\
          .tables\n\
          .schema\n\
@@ -110,7 +111,9 @@ fn repl_prints_help_tables_and_schema_meta_commands() {
     assert!(rendered.contains("users"));
     assert!(rendered.contains("CREATE TABLE users"));
     assert!(rendered.contains("id INTEGER PRIMARY KEY"));
+    assert!(rendered.contains("age INTEGER DEFAULT 0 CHECK (age >= 0)"));
     assert!(rendered.contains("name TEXT NOT NULL"));
+    assert!(rendered.contains("user_id INTEGER REFERENCES users(id)"));
     assert!(rendered.contains("CREATE INDEX idx_users_name ON users (name);"));
 }
 
