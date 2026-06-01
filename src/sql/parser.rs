@@ -755,17 +755,19 @@ impl Parser {
             }
         };
         if self.is_subquery_start() {
-            let Some(column) = column else {
-                return Err(DbError::sql(
-                    "subquery comparisons currently require a column reference",
-                ));
-            };
             let query = self.parse_subquery()?;
-            return Ok(Expr::CompareSubquery {
-                column,
-                op,
-                query: Box::new(query),
-            });
+            return match column {
+                Some(column) => Ok(Expr::CompareSubquery {
+                    column,
+                    op,
+                    query: Box::new(query),
+                }),
+                None => Ok(Expr::CompareSubqueryScalar {
+                    left: left_expr,
+                    op,
+                    query: Box::new(query),
+                }),
+            };
         }
         let right_expr = self.parse_scalar_expr()?;
 

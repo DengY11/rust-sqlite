@@ -1753,6 +1753,12 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     self.scalar_subquery_value(transaction_id, query, Some((rowset, row)))?;
                 self.compare_with_operator(&left, op, &right)
             }
+            Expr::CompareSubqueryScalar { left, op, query } => {
+                let left = self.evaluate_filter_scalar_expr(rowset, row, outer, left)?;
+                let right =
+                    self.scalar_subquery_value(transaction_id, query, Some((rowset, row)))?;
+                self.compare_with_operator(&left, op, &right)
+            }
             Expr::ExistsSubquery { query, negated } => {
                 let rows = self.execute_subquery(transaction_id, query, Some((rowset, row)))?;
                 Ok((!rows.rows.is_empty()) ^ *negated)

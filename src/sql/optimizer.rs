@@ -123,6 +123,7 @@ impl IndexSelectionPass {
             | Expr::InSubquery { .. }
             | Expr::InSubqueryScalar { .. }
             | Expr::CompareSubquery { .. }
+            | Expr::CompareSubqueryScalar { .. }
             | Expr::ExistsSubquery { .. } => false,
         }
     }
@@ -279,6 +280,7 @@ impl IndexSelectionPass {
             | Expr::InSubquery { .. }
             | Expr::InSubqueryScalar { .. }
             | Expr::CompareSubquery { .. }
+            | Expr::CompareSubqueryScalar { .. }
             | Expr::ExistsSubquery { .. }
             | Expr::Like { .. }
             | Expr::Between { .. } => true,

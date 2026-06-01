@@ -222,6 +222,11 @@ pub enum Expr {
         op: CompareOp,
         query: Box<SelectStatement>,
     },
+    CompareSubqueryScalar {
+        left: ScalarExpr,
+        op: CompareOp,
+        query: Box<SelectStatement>,
+    },
     ExistsSubquery {
         query: Box<SelectStatement>,
         negated: bool,
