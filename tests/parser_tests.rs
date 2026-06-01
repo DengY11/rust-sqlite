@@ -833,10 +833,10 @@ fn parses_where_scalar_expression_in_subquery() {
                     table_alias: Some("o".to_string()),
                     joins: vec![],
                     filter: Some(Expr::And(
-                        Box::new(Expr::CompareColumns {
-                            left: "o.user_id".to_string(),
+                        Box::new(Expr::CompareScalar {
+                            left: ScalarExpr::Column("o.user_id".to_string()),
                             op: CompareOp::Eq,
-                            right: "u.id".to_string(),
+                            right: ScalarExpr::Column("u.id".to_string()),
                         }),
                         Box::new(Expr::Compare {
                             column: "o.amount".to_string(),
@@ -885,10 +885,10 @@ fn parses_where_scalar_expression_not_in_subquery() {
                     table_alias: Some("o".to_string()),
                     joins: vec![],
                     filter: Some(Expr::And(
-                        Box::new(Expr::CompareColumns {
-                            left: "o.user_id".to_string(),
+                        Box::new(Expr::CompareScalar {
+                            left: ScalarExpr::Column("o.user_id".to_string()),
                             op: CompareOp::Eq,
-                            right: "u.id".to_string(),
+                            right: ScalarExpr::Column("u.id".to_string()),
                         }),
                         Box::new(Expr::Compare {
                             column: "o.amount".to_string(),
@@ -938,10 +938,10 @@ fn parses_where_scalar_expression_compare_subquery() {
                     table_alias: Some("o".to_string()),
                     joins: vec![],
                     filter: Some(Expr::And(
-                        Box::new(Expr::CompareColumns {
-                            left: "o.user_id".to_string(),
+                        Box::new(Expr::CompareScalar {
+                            left: ScalarExpr::Column("o.user_id".to_string()),
                             op: CompareOp::Eq,
-                            right: "u.id".to_string(),
+                            right: ScalarExpr::Column("u.id".to_string()),
                         }),
                         Box::new(Expr::Compare {
                             column: "o.amount".to_string(),
@@ -962,7 +962,7 @@ fn parses_where_scalar_expression_compare_subquery() {
 }
 
 #[test]
-fn parses_where_column_compare_subquery_keeps_legacy_form() {
+fn parses_where_column_compare_subquery_as_scalar_form() {
     let statements = parse_sql(
         "SELECT name FROM users u WHERE u.id = (SELECT user_id FROM orders o WHERE o.user_id = u.id AND o.amount >= 100);",
     )
@@ -974,8 +974,8 @@ fn parses_where_column_compare_subquery_keeps_legacy_form() {
             vec![SelectItem::Column("name".to_string())],
             "users",
             Some("u"),
-            Some(Expr::CompareSubquery {
-                column: "u.id".to_string(),
+            Some(Expr::CompareSubqueryScalar {
+                left: ScalarExpr::Column("u.id".to_string()),
                 op: CompareOp::Eq,
                 query: Box::new(SelectStatement {
                     distinct: false,
@@ -984,10 +984,10 @@ fn parses_where_column_compare_subquery_keeps_legacy_form() {
                     table_alias: Some("o".to_string()),
                     joins: vec![],
                     filter: Some(Expr::And(
-                        Box::new(Expr::CompareColumns {
-                            left: "o.user_id".to_string(),
+                        Box::new(Expr::CompareScalar {
+                            left: ScalarExpr::Column("o.user_id".to_string()),
                             op: CompareOp::Eq,
-                            right: "u.id".to_string(),
+                            right: ScalarExpr::Column("u.id".to_string()),
                         }),
                         Box::new(Expr::Compare {
                             column: "o.amount".to_string(),
@@ -1000,6 +1000,27 @@ fn parses_where_column_compare_subquery_keeps_legacy_form() {
                     order_by: vec![],
                     limit: None,
                 }),
+            }),
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
+fn parses_where_column_column_comparison_as_scalar_form() {
+    let statements = parse_sql("SELECT name FROM users WHERE id = alias_id;").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            Some(Expr::CompareScalar {
+                left: ScalarExpr::Column("id".to_string()),
+                op: CompareOp::Eq,
+                right: ScalarExpr::Column("alias_id".to_string()),
             }),
             vec![],
             None,
@@ -1447,10 +1468,10 @@ fn parses_group_by_join_and_subquery_forms() {
                     kind: JoinKind::Inner,
                     table: "orders".to_string(),
                     table_alias: Some("o".to_string()),
-                    on: Expr::CompareColumns {
-                        left: "u.id".to_string(),
+                    on: Expr::CompareScalar {
+                        left: ScalarExpr::Column("u.id".to_string()),
                         op: CompareOp::Eq,
-                        right: "o.user_id".to_string(),
+                        right: ScalarExpr::Column("o.user_id".to_string()),
                     },
                 }],
                 filter: Some(Expr::Compare {

@@ -756,27 +756,15 @@ impl Parser {
         };
         if self.is_subquery_start() {
             let query = self.parse_subquery()?;
-            return match column {
-                Some(column) => Ok(Expr::CompareSubquery {
-                    column,
-                    op,
-                    query: Box::new(query),
-                }),
-                None => Ok(Expr::CompareSubqueryScalar {
-                    left: left_expr,
-                    op,
-                    query: Box::new(query),
-                }),
-            };
+            return Ok(Expr::CompareSubqueryScalar {
+                left: left_expr,
+                op,
+                query: Box::new(query),
+            });
         }
         let right_expr = self.parse_scalar_expr()?;
 
         match (&left_expr, &right_expr) {
-            (ScalarExpr::Column(left), ScalarExpr::Column(right)) => Ok(Expr::CompareColumns {
-                left: left.clone(),
-                op,
-                right: right.clone(),
-            }),
             (ScalarExpr::Column(column), _) => {
                 if let Some(value) = scalar_expr_literal_value(&right_expr) {
                     Ok(Expr::Compare {
