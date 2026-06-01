@@ -697,6 +697,17 @@ impl Planner {
                 high: high.clone(),
                 negated: *negated,
             },
+            Expr::BetweenScalar {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::BetweenScalar {
+                expr: self.normalize_scalar_expr(schema, table, table_alias, expr)?,
+                low: self.normalize_scalar_expr(schema, table, table_alias, low)?,
+                high: self.normalize_scalar_expr(schema, table, table_alias, high)?,
+                negated: *negated,
+            },
             Expr::Not(expr) => Expr::Not(Box::new(self.normalize_expr(
                 schema,
                 table,
@@ -1054,6 +1065,13 @@ impl Planner {
             Expr::LikeScalar { expr, .. } => {
                 self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
             }
+            Expr::BetweenScalar {
+                expr, low, high, ..
+            } => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)?;
+                self.require_scalar_expr_scope_chain(scope, outer_scope, low)?;
+                self.require_scalar_expr_scope_chain(scope, outer_scope, high)
+            }
             Expr::CompareScalar { left, right, .. } => {
                 self.require_scalar_expr_scope_chain(scope, outer_scope, left)?;
                 self.require_scalar_expr_scope_chain(scope, outer_scope, right)
@@ -1091,6 +1109,7 @@ impl Planner {
             | Expr::LikeScalar { .. }
             | Expr::Like { .. }
             | Expr::Between { .. } => Ok(()),
+            Expr::BetweenScalar { .. } => Ok(()),
         }
     }
 

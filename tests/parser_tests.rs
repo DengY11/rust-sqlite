@@ -702,6 +702,110 @@ fn parses_where_scalar_expression_like() {
 }
 
 #[test]
+fn parses_where_scalar_expression_between() {
+    let statements = parse_sql(
+        "SELECT name FROM users WHERE age + 1 BETWEEN 18 AND 30 AND LENGTH(name) NOT BETWEEN 1 AND 3;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            Some(Expr::And(
+                Box::new(Expr::BetweenScalar {
+                    expr: ScalarExpr::Binary {
+                        left: Box::new(ScalarExpr::Column("age".to_string())),
+                        op: ScalarBinaryOp::Add,
+                        right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                    },
+                    low: ScalarExpr::Literal(Value::Integer(18)),
+                    high: ScalarExpr::Literal(Value::Integer(30)),
+                    negated: false,
+                }),
+                Box::new(Expr::BetweenScalar {
+                    expr: ScalarExpr::Function {
+                        func: ScalarFunc::Length,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    },
+                    low: ScalarExpr::Literal(Value::Integer(1)),
+                    high: ScalarExpr::Literal(Value::Integer(3)),
+                    negated: true,
+                }),
+            )),
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
+fn parses_where_between_keeps_legacy_column_literal_form() {
+    let statements = parse_sql(
+        "SELECT name FROM users WHERE age BETWEEN 18 AND 30 AND age NOT BETWEEN 40 AND 50;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            Some(Expr::And(
+                Box::new(Expr::Between {
+                    column: "age".to_string(),
+                    low: Value::Integer(18),
+                    high: Value::Integer(30),
+                    negated: false,
+                }),
+                Box::new(Expr::Between {
+                    column: "age".to_string(),
+                    low: Value::Integer(40),
+                    high: Value::Integer(50),
+                    negated: true,
+                }),
+            )),
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
+fn parses_where_between_with_scalar_bounds() {
+    let statements =
+        parse_sql("SELECT name FROM users WHERE age BETWEEN 17 + 1 AND 40 - 10;").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            Some(Expr::BetweenScalar {
+                expr: ScalarExpr::Column("age".to_string()),
+                low: ScalarExpr::Binary {
+                    left: Box::new(ScalarExpr::Literal(Value::Integer(17))),
+                    op: ScalarBinaryOp::Add,
+                    right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                },
+                high: ScalarExpr::Binary {
+                    left: Box::new(ScalarExpr::Literal(Value::Integer(40))),
+                    op: ScalarBinaryOp::Subtract,
+                    right: Box::new(ScalarExpr::Literal(Value::Integer(10))),
+                },
+                negated: false,
+            }),
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
 fn parses_boolean_where_expression_with_precedence_and_parentheses() {
     let statements = parse_sql(
         "SELECT id FROM users WHERE name = 'alice' OR active = TRUE AND (id = 1 OR id = 2);",

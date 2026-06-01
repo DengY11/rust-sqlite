@@ -631,20 +631,27 @@ impl Parser {
                 };
             }
             if self.matches(&TokenKind::Between) {
-                let Some(column) = column else {
-                    return Err(DbError::sql(
-                        "BETWEEN currently requires a column reference",
-                    ));
-                };
-                let low = self.parse_literal()?;
+                let low = self.parse_scalar_expr()?;
                 self.expect_keyword(TokenKind::And)?;
-                let high = self.parse_literal()?;
-                return Ok(Expr::Between {
+                let high = self.parse_scalar_expr()?;
+                return match (
                     column,
-                    low,
-                    high,
-                    negated: true,
-                });
+                    scalar_expr_literal_value(&low),
+                    scalar_expr_literal_value(&high),
+                ) {
+                    (Some(column), Some(low), Some(high)) => Ok(Expr::Between {
+                        column,
+                        low,
+                        high,
+                        negated: true,
+                    }),
+                    _ => Ok(Expr::BetweenScalar {
+                        expr: left_expr,
+                        low,
+                        high,
+                        negated: true,
+                    }),
+                };
             }
             self.expect_keyword(TokenKind::In)?;
             let Some(column) = column else {
@@ -684,20 +691,27 @@ impl Parser {
             };
         }
         if self.matches(&TokenKind::Between) {
-            let Some(column) = column else {
-                return Err(DbError::sql(
-                    "BETWEEN currently requires a column reference",
-                ));
-            };
-            let low = self.parse_literal()?;
+            let low = self.parse_scalar_expr()?;
             self.expect_keyword(TokenKind::And)?;
-            let high = self.parse_literal()?;
-            return Ok(Expr::Between {
+            let high = self.parse_scalar_expr()?;
+            return match (
                 column,
-                low,
-                high,
-                negated: false,
-            });
+                scalar_expr_literal_value(&low),
+                scalar_expr_literal_value(&high),
+            ) {
+                (Some(column), Some(low), Some(high)) => Ok(Expr::Between {
+                    column,
+                    low,
+                    high,
+                    negated: false,
+                }),
+                _ => Ok(Expr::BetweenScalar {
+                    expr: left_expr,
+                    low,
+                    high,
+                    negated: false,
+                }),
+            };
         }
 
         let op = match self.peek_kind() {

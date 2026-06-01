@@ -1481,6 +1481,44 @@ fn database_filters_with_scalar_expression_like() {
 }
 
 #[test]
+fn database_filters_with_scalar_expression_between() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+         INSERT INTO users VALUES (1, 'Alice', 17);
+         INSERT INTO users VALUES (2, 'Bo', 29);
+         INSERT INTO users VALUES (3, 'Carol', 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT id
+             FROM users
+             WHERE age + 1 BETWEEN 18 AND 30
+               AND LENGTH(name) NOT BETWEEN 1 AND 3
+             ORDER BY id ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    let scalar_bounds_rows = db
+        .query(
+            "SELECT id
+             FROM users
+             WHERE age BETWEEN 17 + 1 AND 40 - 10
+             ORDER BY id ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        scalar_bounds_rows,
+        vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]
+    );
+}
+
+#[test]
 fn database_supports_exists_and_not_exists_subqueries() {
     let db = Database::memory();
 

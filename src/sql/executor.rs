@@ -1787,6 +1787,25 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     && matches!(high_cmp, Ordering::Less | Ordering::Equal);
                 Ok(matches ^ *negated)
             }
+            Expr::BetweenScalar {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                let value = self.evaluate_filter_scalar_expr(rowset, row, outer, expr)?;
+                let low = self.evaluate_filter_scalar_expr(rowset, row, outer, low)?;
+                let high = self.evaluate_filter_scalar_expr(rowset, row, outer, high)?;
+                let Some(low_cmp) = self.compare(&value, &low)? else {
+                    return Ok(false);
+                };
+                let Some(high_cmp) = self.compare(&value, &high)? else {
+                    return Ok(false);
+                };
+                let matches = matches!(low_cmp, Ordering::Greater | Ordering::Equal)
+                    && matches!(high_cmp, Ordering::Less | Ordering::Equal);
+                Ok(matches ^ *negated)
+            }
             Expr::Not(expr) => Ok(!self.matches_filter(
                 transaction_id,
                 rowset,

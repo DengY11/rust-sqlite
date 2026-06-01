@@ -237,6 +237,12 @@ pub enum Expr {
         high: Value,
         negated: bool,
     },
+    BetweenScalar {
+        expr: ScalarExpr,
+        low: ScalarExpr,
+        high: ScalarExpr,
+        negated: bool,
+    },
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
