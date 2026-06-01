@@ -226,6 +226,11 @@ pub enum Expr {
         pattern: String,
         negated: bool,
     },
+    LikeScalar {
+        expr: ScalarExpr,
+        pattern: String,
+        negated: bool,
+    },
     Between {
         column: String,
         low: Value,

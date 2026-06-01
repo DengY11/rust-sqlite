@@ -662,6 +662,46 @@ fn parses_where_scalar_expression_is_null() {
 }
 
 #[test]
+fn parses_where_scalar_expression_like() {
+    let statements = parse_sql(
+        "SELECT name FROM users WHERE LOWER(name) LIKE 'a%' AND COALESCE(nickname, name) NOT LIKE 'x%';",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            None,
+            Some(Expr::And(
+                Box::new(Expr::LikeScalar {
+                    expr: ScalarExpr::Function {
+                        func: ScalarFunc::Lower,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    },
+                    pattern: "a%".to_string(),
+                    negated: false,
+                }),
+                Box::new(Expr::LikeScalar {
+                    expr: ScalarExpr::Function {
+                        func: ScalarFunc::Coalesce,
+                        args: vec![
+                            ScalarExpr::Column("nickname".to_string()),
+                            ScalarExpr::Column("name".to_string()),
+                        ],
+                    },
+                    pattern: "x%".to_string(),
+                    negated: true,
+                }),
+            )),
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
 fn parses_boolean_where_expression_with_precedence_and_parentheses() {
     let statements = parse_sql(
         "SELECT id FROM users WHERE name = 'alice' OR active = TRUE AND (id = 1 OR id = 2);",

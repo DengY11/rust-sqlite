@@ -1458,6 +1458,29 @@ fn database_filters_with_scalar_expression_is_null() {
 }
 
 #[test]
+fn database_filters_with_scalar_expression_like() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, nickname TEXT);
+         INSERT INTO users VALUES (1, 'Alice', NULL);
+         INSERT INTO users VALUES (2, 'bob', 'bobby');
+         INSERT INTO users VALUES (3, 'carol', 'c');",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT id
+             FROM users
+             WHERE LOWER(name) LIKE 'a%'
+               AND COALESCE(nickname, name) NOT LIKE 'x%';",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+}
+
+#[test]
 fn database_supports_exists_and_not_exists_subqueries() {
     let db = Database::memory();
 

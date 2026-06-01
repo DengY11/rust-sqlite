@@ -616,14 +616,19 @@ impl Parser {
         }
         if self.matches(&TokenKind::Not) {
             if self.matches(&TokenKind::Like) {
-                let Some(column) = column else {
-                    return Err(DbError::sql("LIKE currently requires a column reference"));
+                let pattern = self.parse_string_literal()?;
+                return match column {
+                    Some(column) => Ok(Expr::Like {
+                        column,
+                        pattern,
+                        negated: true,
+                    }),
+                    None => Ok(Expr::LikeScalar {
+                        expr: left_expr,
+                        pattern,
+                        negated: true,
+                    }),
                 };
-                return Ok(Expr::Like {
-                    column,
-                    pattern: self.parse_string_literal()?,
-                    negated: true,
-                });
             }
             if self.matches(&TokenKind::Between) {
                 let Some(column) = column else {
@@ -664,14 +669,19 @@ impl Parser {
             });
         }
         if self.matches(&TokenKind::Like) {
-            let Some(column) = column else {
-                return Err(DbError::sql("LIKE currently requires a column reference"));
+            let pattern = self.parse_string_literal()?;
+            return match column {
+                Some(column) => Ok(Expr::Like {
+                    column,
+                    pattern,
+                    negated: false,
+                }),
+                None => Ok(Expr::LikeScalar {
+                    expr: left_expr,
+                    pattern,
+                    negated: false,
+                }),
             };
-            return Ok(Expr::Like {
-                column,
-                pattern: self.parse_string_literal()?,
-                negated: false,
-            });
         }
         if self.matches(&TokenKind::Between) {
             let Some(column) = column else {

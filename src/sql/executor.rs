@@ -1758,6 +1758,18 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 };
                 Ok(Self::matches_like_pattern(&value, pattern) ^ *negated)
             }
+            Expr::LikeScalar {
+                expr,
+                pattern,
+                negated,
+            } => {
+                let Value::Text(value) =
+                    self.evaluate_filter_scalar_expr(rowset, row, outer, expr)?
+                else {
+                    return Ok(false);
+                };
+                Ok(Self::matches_like_pattern(&value, pattern) ^ *negated)
+            }
             Expr::Between {
                 column,
                 low,
