@@ -1519,6 +1519,55 @@ fn database_filters_with_scalar_expression_between() {
 }
 
 #[test]
+fn database_filters_with_scalar_expression_in_subquery() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, alias_id INTEGER);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL);
+         INSERT INTO users VALUES (1, 'alice', NULL);
+         INSERT INTO users VALUES (2, 'bob', 99);
+         INSERT INTO users VALUES (3, 'carol', NULL);
+         INSERT INTO orders VALUES (1, 1, 120);
+         INSERT INTO orders VALUES (2, 2, 5);
+         INSERT INTO orders VALUES (3, 3, 200);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT name
+             FROM users u
+             WHERE COALESCE(alias_id, id) IN (
+                 SELECT user_id
+                 FROM orders o
+                 WHERE o.user_id = u.id AND o.amount >= 100
+             )
+             ORDER BY name ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![vec![Value::from("alice")], vec![Value::from("carol")]]
+    );
+
+    let not_in_rows = db
+        .query(
+            "SELECT name
+             FROM users u
+             WHERE COALESCE(alias_id, id) NOT IN (
+                 SELECT user_id
+                 FROM orders o
+                 WHERE o.user_id = u.id AND o.amount >= 100
+             )
+             ORDER BY name ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(not_in_rows, vec![vec![Value::from("bob")]]);
+}
+
+#[test]
 fn database_supports_exists_and_not_exists_subqueries() {
     let db = Database::memory();
 

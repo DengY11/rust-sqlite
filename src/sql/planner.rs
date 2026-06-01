@@ -659,6 +659,15 @@ impl Planner {
                 query: query.clone(),
                 negated: *negated,
             },
+            Expr::InSubqueryScalar {
+                expr,
+                query,
+                negated,
+            } => Expr::InSubqueryScalar {
+                expr: self.normalize_scalar_expr(schema, table, table_alias, expr)?,
+                query: query.clone(),
+                negated: *negated,
+            },
             Expr::CompareSubquery { column, op, query } => Expr::CompareSubquery {
                 column: self.normalize_column_reference(schema, table, table_alias, column)?,
                 op: *op,
@@ -1054,6 +1063,9 @@ impl Planner {
                 .resolve_column_in_scope_chain(scope, outer_scope, column)
                 .map(|_| ()),
             Expr::ExistsSubquery { .. } => Ok(()),
+            Expr::InSubqueryScalar { expr, .. } => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
+            }
             Expr::CompareColumns { left, right, .. } => {
                 self.resolve_column_in_scope_chain(scope, outer_scope, left)?;
                 self.resolve_column_in_scope_chain(scope, outer_scope, right)
@@ -1092,6 +1104,7 @@ impl Planner {
     ) -> Result<()> {
         match filter {
             Expr::InSubquery { query, .. }
+            | Expr::InSubqueryScalar { query, .. }
             | Expr::CompareSubquery { query, .. }
             | Expr::ExistsSubquery { query, .. } => {
                 self.validate_select_subquery(query, context, outer_scope)

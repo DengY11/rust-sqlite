@@ -350,6 +350,136 @@ fn optimizer_does_not_rewrite_scalar_between_filter_to_index_scan() {
 }
 
 #[test]
+fn optimizer_does_not_rewrite_scalar_in_subquery_filter_to_index_scan() {
+    let optimizer = Optimizer::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            rustsql::common::types::Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("alias_id", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::from([(
+            "users".to_string(),
+            vec![rustsql::common::types::IndexMeta {
+                name: "idx_users_alias_id".to_string(),
+                columns: vec!["alias_id".to_string()],
+                unique: false,
+            }],
+        )]),
+    );
+    let plan = Plan::SeqScan {
+        table: "users".to_string(),
+        table_alias: Some("u".to_string()),
+        columns: vec![SelectItem::Column("id".to_string())],
+        filter: Some(Expr::InSubqueryScalar {
+            expr: ScalarExpr::Function {
+                func: rustsql::sql::ast::ScalarFunc::Coalesce,
+                args: vec![
+                    ScalarExpr::Column("alias_id".to_string()),
+                    ScalarExpr::Column("id".to_string()),
+                ],
+            },
+            query: Box::new(rustsql::sql::ast::SelectStatement {
+                distinct: false,
+                columns: vec![SelectItem::Column("user_id".to_string())],
+                table: "orders".to_string(),
+                table_alias: Some("o".to_string()),
+                joins: vec![],
+                filter: Some(Expr::CompareColumns {
+                    left: "o.user_id".to_string(),
+                    op: CompareOp::Eq,
+                    right: "u.id".to_string(),
+                }),
+                group_by: vec![],
+                having: None,
+                order_by: vec![],
+                limit: None,
+            }),
+            negated: false,
+        }),
+        order_by: vec![],
+        limit: None,
+        distinct: false,
+    };
+
+    let optimized = optimizer
+        .optimize_with_context(plan.clone(), &context)
+        .unwrap();
+
+    assert_eq!(optimized, plan);
+}
+
+#[test]
+fn optimizer_does_not_rewrite_scalar_not_in_subquery_filter_to_index_scan() {
+    let optimizer = Optimizer::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            rustsql::common::types::Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("alias_id", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::from([(
+            "users".to_string(),
+            vec![rustsql::common::types::IndexMeta {
+                name: "idx_users_alias_id".to_string(),
+                columns: vec!["alias_id".to_string()],
+                unique: false,
+            }],
+        )]),
+    );
+    let plan = Plan::SeqScan {
+        table: "users".to_string(),
+        table_alias: Some("u".to_string()),
+        columns: vec![SelectItem::Column("id".to_string())],
+        filter: Some(Expr::InSubqueryScalar {
+            expr: ScalarExpr::Function {
+                func: rustsql::sql::ast::ScalarFunc::Coalesce,
+                args: vec![
+                    ScalarExpr::Column("alias_id".to_string()),
+                    ScalarExpr::Column("id".to_string()),
+                ],
+            },
+            query: Box::new(rustsql::sql::ast::SelectStatement {
+                distinct: false,
+                columns: vec![SelectItem::Column("user_id".to_string())],
+                table: "orders".to_string(),
+                table_alias: Some("o".to_string()),
+                joins: vec![],
+                filter: Some(Expr::CompareColumns {
+                    left: "o.user_id".to_string(),
+                    op: CompareOp::Eq,
+                    right: "u.id".to_string(),
+                }),
+                group_by: vec![],
+                having: None,
+                order_by: vec![],
+                limit: None,
+            }),
+            negated: true,
+        }),
+        order_by: vec![],
+        limit: None,
+        distinct: false,
+    };
+
+    let optimized = optimizer
+        .optimize_with_context(plan.clone(), &context)
+        .unwrap();
+
+    assert_eq!(optimized, plan);
+}
+
+#[test]
 fn optimizer_rewrites_between_filter_to_index_range_scan() {
     let optimizer = Optimizer::new();
     let context = PlanningContext::new(

@@ -654,26 +654,34 @@ impl Parser {
                 };
             }
             self.expect_keyword(TokenKind::In)?;
-            let Some(column) = column else {
-                return Err(DbError::sql("IN currently requires a column reference"));
-            };
             let query = self.parse_subquery()?;
-            return Ok(Expr::InSubquery {
-                column,
-                query: Box::new(query),
-                negated: true,
-            });
+            return match column {
+                Some(column) => Ok(Expr::InSubquery {
+                    column,
+                    query: Box::new(query),
+                    negated: true,
+                }),
+                None => Ok(Expr::InSubqueryScalar {
+                    expr: left_expr,
+                    query: Box::new(query),
+                    negated: true,
+                }),
+            };
         }
         if self.matches(&TokenKind::In) {
-            let Some(column) = column else {
-                return Err(DbError::sql("IN currently requires a column reference"));
-            };
             let query = self.parse_subquery()?;
-            return Ok(Expr::InSubquery {
-                column,
-                query: Box::new(query),
-                negated: false,
-            });
+            return match column {
+                Some(column) => Ok(Expr::InSubquery {
+                    column,
+                    query: Box::new(query),
+                    negated: false,
+                }),
+                None => Ok(Expr::InSubqueryScalar {
+                    expr: left_expr,
+                    query: Box::new(query),
+                    negated: false,
+                }),
+            };
         }
         if self.matches(&TokenKind::Like) {
             let pattern = self.parse_string_literal()?;

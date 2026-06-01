@@ -1737,6 +1737,16 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 let contains = rows.rows.iter().any(|row| row.first() == Some(&left));
                 Ok(contains ^ *negated)
             }
+            Expr::InSubqueryScalar {
+                expr,
+                query,
+                negated,
+            } => {
+                let left = self.evaluate_filter_scalar_expr(rowset, row, outer, expr)?;
+                let rows = self.execute_subquery(transaction_id, query, Some((rowset, row)))?;
+                let contains = rows.rows.iter().any(|row| row.first() == Some(&left));
+                Ok(contains ^ *negated)
+            }
             Expr::CompareSubquery { column, op, query } => {
                 let left = self.lookup_filter_value(rowset, row, outer, column)?;
                 let right =

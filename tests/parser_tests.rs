@@ -806,6 +806,110 @@ fn parses_where_between_with_scalar_bounds() {
 }
 
 #[test]
+fn parses_where_scalar_expression_in_subquery() {
+    let statements = parse_sql(
+        "SELECT name FROM users u WHERE COALESCE(alias_id, id) IN (SELECT user_id FROM orders o WHERE o.user_id = u.id AND o.amount >= 100);",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            Some("u"),
+            Some(Expr::InSubqueryScalar {
+                expr: ScalarExpr::Function {
+                    func: ScalarFunc::Coalesce,
+                    args: vec![
+                        ScalarExpr::Column("alias_id".to_string()),
+                        ScalarExpr::Column("id".to_string()),
+                    ],
+                },
+                query: Box::new(SelectStatement {
+                    distinct: false,
+                    columns: vec![SelectItem::Column("user_id".to_string())],
+                    table: "orders".to_string(),
+                    table_alias: Some("o".to_string()),
+                    joins: vec![],
+                    filter: Some(Expr::And(
+                        Box::new(Expr::CompareColumns {
+                            left: "o.user_id".to_string(),
+                            op: CompareOp::Eq,
+                            right: "u.id".to_string(),
+                        }),
+                        Box::new(Expr::Compare {
+                            column: "o.amount".to_string(),
+                            op: CompareOp::Gte,
+                            value: Value::Integer(100),
+                        }),
+                    )),
+                    group_by: vec![],
+                    having: None,
+                    order_by: vec![],
+                    limit: None,
+                }),
+                negated: false,
+            }),
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
+fn parses_where_scalar_expression_not_in_subquery() {
+    let statements = parse_sql(
+        "SELECT name FROM users u WHERE COALESCE(alias_id, id) NOT IN (SELECT user_id FROM orders o WHERE o.user_id = u.id AND o.amount >= 100);",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![SelectItem::Column("name".to_string())],
+            "users",
+            Some("u"),
+            Some(Expr::InSubqueryScalar {
+                expr: ScalarExpr::Function {
+                    func: ScalarFunc::Coalesce,
+                    args: vec![
+                        ScalarExpr::Column("alias_id".to_string()),
+                        ScalarExpr::Column("id".to_string()),
+                    ],
+                },
+                query: Box::new(SelectStatement {
+                    distinct: false,
+                    columns: vec![SelectItem::Column("user_id".to_string())],
+                    table: "orders".to_string(),
+                    table_alias: Some("o".to_string()),
+                    joins: vec![],
+                    filter: Some(Expr::And(
+                        Box::new(Expr::CompareColumns {
+                            left: "o.user_id".to_string(),
+                            op: CompareOp::Eq,
+                            right: "u.id".to_string(),
+                        }),
+                        Box::new(Expr::Compare {
+                            column: "o.amount".to_string(),
+                            op: CompareOp::Gte,
+                            value: Value::Integer(100),
+                        }),
+                    )),
+                    group_by: vec![],
+                    having: None,
+                    order_by: vec![],
+                    limit: None,
+                }),
+                negated: true,
+            }),
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
 fn parses_boolean_where_expression_with_precedence_and_parentheses() {
     let statements = parse_sql(
         "SELECT id FROM users WHERE name = 'alice' OR active = TRUE AND (id = 1 OR id = 2);",

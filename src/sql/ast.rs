@@ -212,6 +212,11 @@ pub enum Expr {
         query: Box<SelectStatement>,
         negated: bool,
     },
+    InSubqueryScalar {
+        expr: ScalarExpr,
+        query: Box<SelectStatement>,
+        negated: bool,
+    },
     CompareSubquery {
         column: String,
         op: CompareOp,
