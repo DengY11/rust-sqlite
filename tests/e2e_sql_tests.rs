@@ -1331,7 +1331,7 @@ fn database_orders_by_scalar_expressions() {
 }
 
 #[test]
-fn database_rejects_aggregate_order_by_scalar_expressions_without_panic() {
+fn database_orders_aggregate_rows_by_scalar_expression() {
     let db = Database::memory();
     db.execute(
         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN);
@@ -1341,21 +1341,164 @@ fn database_rejects_aggregate_order_by_scalar_expressions_without_panic() {
     )
     .unwrap();
 
-    let error = db
+    let rows = db
         .query(
             "SELECT active, COUNT(*) AS total
              FROM users
              GROUP BY active
              ORDER BY total + 1 DESC;",
         )
-        .unwrap_err();
+        .unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("ORDER BY scalar expressions are not supported with aggregate queries"),
-        "unexpected error: {error}"
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Boolean(true), Value::Integer(2)],
+            vec![Value::Boolean(false), Value::Integer(1)],
+        ]
     );
+}
+
+#[test]
+fn database_groups_by_scalar_expression_and_orders_by_aggregate_expression() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+         INSERT INTO users VALUES (1, 'alice', 20);
+         INSERT INTO users VALUES (2, 'bob', 20);
+         INSERT INTO users VALUES (3, 'carol', 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT age + 1 AS bucket, COUNT(*) AS total
+             FROM users
+             GROUP BY age + 1
+             HAVING bucket > 20
+             ORDER BY total + 1 DESC, bucket DESC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(21), Value::Integer(2)],
+            vec![Value::Integer(31), Value::Integer(1)],
+        ]
+    );
+}
+
+#[test]
+fn database_aggregates_scalar_expression_arguments() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+         INSERT INTO users VALUES (1, 'alice', 20);
+         INSERT INTO users VALUES (2, 'bob', 20);
+         INSERT INTO users VALUES (3, 'carol', 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT SUM(age + 1) AS total, AVG(age + 1) AS avg_total, COUNT(DISTINCT age + 1) AS distinct_total
+             FROM users;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(73),
+            Value::Integer(24),
+            Value::Integer(2),
+        ]]
+    );
+}
+
+#[test]
+fn database_groups_with_scalar_projection_and_scalar_aggregate_argument() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO users VALUES (2, 20);
+         INSERT INTO users VALUES (3, 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT age + 1 AS bucket, SUM(age + 1) AS total
+             FROM users
+             GROUP BY age + 1
+             ORDER BY bucket ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(21), Value::Integer(42)],
+            vec![Value::Integer(31), Value::Integer(31)],
+        ]
+    );
+}
+
+#[test]
+fn database_having_and_order_by_can_reference_group_expression_without_alias() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO users VALUES (2, 20);
+         INSERT INTO users VALUES (3, 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT age + 1 AS bucket, COUNT(*) AS total
+             FROM users
+             GROUP BY age + 1
+             HAVING age + 1 > 20
+             ORDER BY age + 1 DESC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(31), Value::Integer(1)],
+            vec![Value::Integer(21), Value::Integer(2)],
+        ]
+    );
+}
+
+#[test]
+fn database_joins_with_scalar_expression_on_clause() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
+         INSERT INTO users VALUES (1, 'alice');
+         INSERT INTO users VALUES (2, 'bob');
+         INSERT INTO orders VALUES (10, 2, 80);
+         INSERT INTO orders VALUES (11, 4, 90);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT u.name, o.amount
+             FROM users u
+             JOIN orders o ON u.id + 1 = o.user_id
+             ORDER BY u.name ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::from("alice"), Value::Integer(80)]]);
 }
 
 #[test]

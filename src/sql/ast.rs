@@ -8,7 +8,7 @@ pub struct SelectStatement {
     pub table_alias: Option<String>,
     pub joins: Vec<JoinClause>,
     pub filter: Option<Expr>,
-    pub group_by: Vec<String>,
+    pub group_by: Vec<ScalarExpr>,
     pub having: Option<Expr>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
@@ -73,7 +73,7 @@ pub enum AggregateFunc {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArg {
     Wildcard,
-    Column { name: String, distinct: bool },
+    Expr { expr: ScalarExpr, distinct: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

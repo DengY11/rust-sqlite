@@ -418,11 +418,11 @@ fn infer_headers(statements: &[Statement], row_width: usize) -> Vec<String> {
                     },
                     match arg {
                         crate::sql::ast::AggregateArg::Wildcard => "*".to_string(),
-                        crate::sql::ast::AggregateArg::Column { name, distinct } => {
+                        crate::sql::ast::AggregateArg::Expr { expr, distinct } => {
                             if *distinct {
-                                format!("DISTINCT {name}")
+                                format!("DISTINCT {}", scalar_expr_label(expr))
                             } else {
-                                name.clone()
+                                scalar_expr_label(expr)
                             }
                         }
                     }
@@ -430,6 +430,41 @@ fn infer_headers(statements: &[Statement], row_width: usize) -> Vec<String> {
             }),
         })
         .collect()
+}
+
+fn scalar_expr_label(expr: &crate::sql::ast::ScalarExpr) -> String {
+    match expr {
+        crate::sql::ast::ScalarExpr::Literal(value) => value.to_string(),
+        crate::sql::ast::ScalarExpr::Column(name) => name.clone(),
+        crate::sql::ast::ScalarExpr::UnaryMinus(expr) => format!("-{}", scalar_expr_label(expr)),
+        crate::sql::ast::ScalarExpr::Binary { left, op, right } => format!(
+            "{} {} {}",
+            scalar_expr_label(left),
+            match op {
+                crate::sql::ast::ScalarBinaryOp::Add => "+",
+                crate::sql::ast::ScalarBinaryOp::Subtract => "-",
+                crate::sql::ast::ScalarBinaryOp::Multiply => "*",
+                crate::sql::ast::ScalarBinaryOp::Divide => "/",
+                crate::sql::ast::ScalarBinaryOp::Concat => "||",
+            },
+            scalar_expr_label(right)
+        ),
+        crate::sql::ast::ScalarExpr::Function { func, args } => format!(
+            "{}({})",
+            match func {
+                crate::sql::ast::ScalarFunc::Length => "LENGTH",
+                crate::sql::ast::ScalarFunc::Lower => "LOWER",
+                crate::sql::ast::ScalarFunc::Upper => "UPPER",
+                crate::sql::ast::ScalarFunc::Abs => "ABS",
+                crate::sql::ast::ScalarFunc::Coalesce => "COALESCE",
+                crate::sql::ast::ScalarFunc::IfNull => "IFNULL",
+            },
+            args.iter()
+                .map(scalar_expr_label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn generic_headers(width: usize) -> Vec<String> {

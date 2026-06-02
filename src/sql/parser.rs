@@ -513,8 +513,8 @@ impl Parser {
             AggregateArg::Wildcard
         } else {
             let distinct = self.matches(&TokenKind::Distinct);
-            AggregateArg::Column {
-                name: self.parse_identifier()?,
+            AggregateArg::Expr {
+                expr: self.parse_scalar_expr()?,
                 distinct,
             }
         };
@@ -1016,10 +1016,10 @@ impl Parser {
         Ok(items)
     }
 
-    fn parse_group_by_items(&mut self) -> Result<Vec<String>> {
+    fn parse_group_by_items(&mut self) -> Result<Vec<ScalarExpr>> {
         let mut items = Vec::new();
         loop {
-            items.push(self.parse_identifier()?);
+            items.push(self.parse_scalar_expr()?);
             if !self.matches(&TokenKind::Comma) {
                 break;
             }

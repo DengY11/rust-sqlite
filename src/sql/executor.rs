@@ -41,7 +41,7 @@ enum AggregateState {
 
 struct AggregateExecOptions<'a> {
     columns: &'a [SelectItem],
-    group_by: &'a [String],
+    group_by: &'a [ScalarExpr],
     having: Option<&'a Expr>,
     order_by: &'a [OrderBy],
     limit: Option<usize>,
@@ -1071,6 +1071,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             limit,
         } = options;
         let output_columns = self.aggregate_output_columns(columns);
+        let visible_width = output_columns.len();
+        let (aggregate_eval_columns, hidden_group_indexes) =
+            self.aggregate_eval_columns(&output_columns, group_by);
         let has_aggregates = columns
             .iter()
             .any(|item| matches!(item, SelectItem::Aggregate { .. }));
@@ -1083,7 +1086,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         for row in &source.rows {
             let key = group_by
                 .iter()
-                .map(|column| self.lookup_value(&source.columns, row, column).cloned())
+                .map(|expr| self.evaluate_scalar_expr(&source, row, expr))
                 .collect::<Result<Vec<_>>>()?;
             let states = groups
                 .entry(key)
@@ -1098,22 +1101,24 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
             let aggregate_row =
                 self.finalize_aggregate_row(&source, columns, group_by, &key, &states)?;
+            let aggregate_eval_row =
+                self.aggregate_eval_row(aggregate_row.clone(), &key, &hidden_group_indexes);
             if let Some(having) = having {
                 let aggregate_rowset = RowSet {
-                    columns: output_columns.clone(),
+                    columns: aggregate_eval_columns.clone(),
                     rows: Vec::new(),
                 };
                 if !self.matches_filter(
                     _transaction_id,
                     &aggregate_rowset,
-                    &aggregate_row,
+                    &aggregate_eval_row,
                     Some(having),
                     None,
                 )? {
                     continue;
                 }
             }
-            rows.push(aggregate_row);
+            rows.push(aggregate_eval_row);
         }
 
         let mut output = RowSet {
@@ -1122,13 +1127,21 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         };
 
         if !order_by.is_empty() {
+            let output_source = RowSet {
+                columns: aggregate_eval_columns,
+                rows: Vec::new(),
+            };
             output.rows.sort_by(|left, right| {
-                self.compare_aggregate_order(columns, order_by, left, right)
+                self.compare_aggregate_order(&output_source, order_by, left, right)
             });
         }
         if let Some(limit) = limit {
             output.rows.truncate(limit);
         }
+        output
+            .rows
+            .iter_mut()
+            .for_each(|row| row.truncate(visible_width));
         Ok(output)
     }
 
@@ -1137,18 +1150,18 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             .iter()
             .filter_map(|item| match item {
                 SelectItem::Aggregate { func, arg, .. } => Some(match (func, arg) {
-                    (AggregateFunc::Count, AggregateArg::Column { distinct: true, .. }) => {
+                    (AggregateFunc::Count, AggregateArg::Expr { distinct: true, .. }) => {
                         AggregateState::CountDistinct(BTreeSet::new())
                     }
                     (AggregateFunc::Count, _) => AggregateState::Count(0),
-                    (AggregateFunc::Sum, AggregateArg::Column { distinct: true, .. }) => {
+                    (AggregateFunc::Sum, AggregateArg::Expr { distinct: true, .. }) => {
                         AggregateState::SumDistinct(BTreeSet::new())
                     }
                     (AggregateFunc::Sum, _) => AggregateState::Sum {
                         sum: 0,
                         seen: false,
                     },
-                    (AggregateFunc::Avg, AggregateArg::Column { distinct: true, .. }) => {
+                    (AggregateFunc::Avg, AggregateArg::Expr { distinct: true, .. }) => {
                         AggregateState::AvgDistinct(BTreeSet::new())
                     }
                     (AggregateFunc::Avg, _) => AggregateState::Avg { sum: 0, count: 0 },
@@ -1180,78 +1193,74 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 (
                     AggregateState::Count(count),
                     AggregateFunc::Count,
-                    AggregateArg::Column { name: column, .. },
-                ) if self.lookup_value(&source.columns, row, column)? != &Value::Null => {
+                    AggregateArg::Expr { expr, .. },
+                ) if self.evaluate_scalar_expr(source, row, expr)? != Value::Null => {
                     *count += 1;
                 }
                 (
                     AggregateState::CountDistinct(values),
                     AggregateFunc::Count,
-                    AggregateArg::Column { name: column, .. },
+                    AggregateArg::Expr { expr, .. },
                 ) => {
-                    let value = self.lookup_value(&source.columns, row, column)?;
-                    if value != &Value::Null {
-                        values.insert(value.clone());
+                    let value = self.evaluate_scalar_expr(source, row, expr)?;
+                    if value != Value::Null {
+                        values.insert(value);
                     }
                 }
-                (AggregateState::Count(_), AggregateFunc::Count, AggregateArg::Column { .. }) => {}
+                (AggregateState::Count(_), AggregateFunc::Count, AggregateArg::Expr { .. }) => {}
                 (
                     AggregateState::Sum { sum, seen },
                     AggregateFunc::Sum,
-                    AggregateArg::Column { name: column, .. },
+                    AggregateArg::Expr { expr, .. },
                 ) => {
-                    if let Value::Integer(value) =
-                        self.lookup_value(&source.columns, row, column)?
-                    {
-                        *sum += i128::from(*value);
+                    if let Value::Integer(value) = self.evaluate_scalar_expr(source, row, expr)? {
+                        *sum += i128::from(value);
                         *seen = true;
                     }
                 }
                 (
                     AggregateState::SumDistinct(values),
                     AggregateFunc::Sum,
-                    AggregateArg::Column { name: column, .. },
+                    AggregateArg::Expr { expr, .. },
                 ) => {
-                    let value = self.lookup_value(&source.columns, row, column)?;
+                    let value = self.evaluate_scalar_expr(source, row, expr)?;
                     if matches!(value, Value::Integer(_)) {
-                        values.insert(value.clone());
+                        values.insert(value);
                     }
                 }
                 (
                     AggregateState::Avg { sum, count },
                     AggregateFunc::Avg,
-                    AggregateArg::Column { name: column, .. },
+                    AggregateArg::Expr { expr, .. },
                 ) => {
-                    if let Value::Integer(value) =
-                        self.lookup_value(&source.columns, row, column)?
-                    {
-                        *sum += i128::from(*value);
+                    if let Value::Integer(value) = self.evaluate_scalar_expr(source, row, expr)? {
+                        *sum += i128::from(value);
                         *count += 1;
                     }
                 }
                 (
                     AggregateState::AvgDistinct(values),
                     AggregateFunc::Avg,
-                    AggregateArg::Column { name: column, .. },
+                    AggregateArg::Expr { expr, .. },
                 ) => {
-                    let value = self.lookup_value(&source.columns, row, column)?;
+                    let value = self.evaluate_scalar_expr(source, row, expr)?;
                     if matches!(value, Value::Integer(_)) {
-                        values.insert(value.clone());
+                        values.insert(value);
                     }
                 }
                 (
                     AggregateState::Min(current),
                     AggregateFunc::Min,
-                    AggregateArg::Column { name: column, .. },
+                    AggregateArg::Expr { expr, .. },
                 ) => {
-                    let value = self.lookup_value(&source.columns, row, column)?;
-                    if value != &Value::Null {
+                    let value = self.evaluate_scalar_expr(source, row, expr)?;
+                    if value != Value::Null {
                         match current.as_ref() {
-                            None => *current = Some(value.clone()),
+                            None => *current = Some(value),
                             Some(existing)
-                                if self.compare(existing, value)? == Some(Ordering::Greater) =>
+                                if self.compare(existing, &value)? == Some(Ordering::Greater) =>
                             {
-                                *current = Some(value.clone())
+                                *current = Some(value)
                             }
                             _ => {}
                         }
@@ -1260,16 +1269,16 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 (
                     AggregateState::Max(current),
                     AggregateFunc::Max,
-                    AggregateArg::Column { name: column, .. },
+                    AggregateArg::Expr { expr, .. },
                 ) => {
-                    let value = self.lookup_value(&source.columns, row, column)?;
-                    if value != &Value::Null {
+                    let value = self.evaluate_scalar_expr(source, row, expr)?;
+                    if value != Value::Null {
                         match current.as_ref() {
-                            None => *current = Some(value.clone()),
+                            None => *current = Some(value),
                             Some(existing)
-                                if self.compare(existing, value)? == Some(Ordering::Less) =>
+                                if self.compare(existing, &value)? == Some(Ordering::Less) =>
                             {
-                                *current = Some(value.clone())
+                                *current = Some(value)
                             }
                             _ => {}
                         }
@@ -1287,7 +1296,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         &self,
         source: &RowSet,
         columns: &[SelectItem],
-        group_by: &[String],
+        group_by: &[ScalarExpr],
         key: &[Value],
         states: &[AggregateState],
     ) -> Result<Row> {
@@ -1299,10 +1308,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     let key_index = self.group_key_index(source, group_by, name)?;
                     row.push(key[key_index].clone());
                 }
-                SelectItem::Expr { .. } => {
-                    return Err(DbError::plan(
-                        "scalar expressions cannot be used with GROUP BY or aggregate projections",
-                    ));
+                SelectItem::Expr { expr, .. } => {
+                    let key_index = self.group_expr_index(source, group_by, expr)?;
+                    row.push(key[key_index].clone());
                 }
                 SelectItem::Aggregate { .. } => {
                     row.push(self.aggregate_state_value(&states[state_index])?);
@@ -1390,18 +1398,83 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             .collect()
     }
 
-    fn group_key_index(&self, source: &RowSet, group_by: &[String], name: &str) -> Result<usize> {
-        if let Some(index) = group_by.iter().position(|column| column == name) {
-            return Ok(index);
+    fn aggregate_eval_columns(
+        &self,
+        output_columns: &[ColumnMeta],
+        group_by: &[ScalarExpr],
+    ) -> (Vec<ColumnMeta>, Vec<usize>) {
+        let mut columns = output_columns.to_vec();
+        let mut hidden_group_indexes = Vec::new();
+
+        for (index, expr) in group_by.iter().enumerate() {
+            let label = self.scalar_expr_name(expr);
+            if columns
+                .iter()
+                .any(|column| column.name == label || column.output_name == label)
+            {
+                continue;
+            }
+            columns.push(ColumnMeta {
+                table: None,
+                alias: None,
+                name: label.clone(),
+                output_name: label,
+            });
+            hidden_group_indexes.push(index);
         }
+
+        (columns, hidden_group_indexes)
+    }
+
+    fn aggregate_eval_row(
+        &self,
+        mut visible_row: Row,
+        group_key: &[Value],
+        hidden_group_indexes: &[usize],
+    ) -> Row {
+        for index in hidden_group_indexes {
+            visible_row.push(group_key[*index].clone());
+        }
+        visible_row
+    }
+
+    fn group_key_index(
+        &self,
+        source: &RowSet,
+        group_by: &[ScalarExpr],
+        name: &str,
+    ) -> Result<usize> {
         let target = self.resolve_column_index(&source.columns, name)?;
-        for (index, column) in group_by.iter().enumerate() {
+        for (index, expr) in group_by.iter().enumerate() {
+            let ScalarExpr::Column(column) = expr else {
+                continue;
+            };
             if self.resolve_column_index(&source.columns, column)? == target {
                 return Ok(index);
             }
         }
         Err(DbError::plan(format!(
             "non-aggregate column {name} must appear in GROUP BY"
+        )))
+    }
+
+    fn group_expr_index(
+        &self,
+        source: &RowSet,
+        group_by: &[ScalarExpr],
+        expr: &ScalarExpr,
+    ) -> Result<usize> {
+        if let Some(index) = group_by.iter().position(|group_expr| group_expr == expr) {
+            return Ok(index);
+        }
+
+        if let ScalarExpr::Column(name) = expr {
+            return self.group_key_index(source, group_by, name);
+        }
+
+        Err(DbError::plan(format!(
+            "non-aggregate expression {} must appear in GROUP BY",
+            self.scalar_expr_name(expr)
         )))
     }
 
@@ -1490,16 +1563,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
 
     fn compare_aggregate_order(
         &self,
-        columns: &[SelectItem],
+        source: &RowSet,
         order_by: &[OrderBy],
         left: &Row,
         right: &Row,
     ) -> Ordering {
         for item in order_by {
-            let mut ordering = Ordering::Equal;
             if let OrderByExpr::Position(position) = item.expr {
                 let index = position.saturating_sub(1);
-                ordering = match (left.get(index), right.get(index)) {
+                let ordering = match (left.get(index), right.get(index)) {
                     (Some(left), Some(right)) => {
                         self.compare_order_values(left, right, item.nulls, item.descending)
                     }
@@ -1510,40 +1582,26 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 }
                 continue;
             }
-            let OrderByExpr::Column(order_column) = &item.expr else {
-                unreachable!();
+            let left_value = match &item.expr {
+                OrderByExpr::Column(column) => self
+                    .try_lookup_value(&source.columns, left, column)
+                    .cloned(),
+                OrderByExpr::Expr(expr) => self.evaluate_scalar_expr(source, left, expr).ok(),
+                OrderByExpr::Position(_) => unreachable!(),
             };
-            for (index, select_item) in columns.iter().enumerate() {
-                let output_name = self.output_name(select_item);
-                let matches = match select_item {
-                    SelectItem::Column(name) => {
-                        name == order_column || output_name == *order_column
-                    }
-                    SelectItem::AliasedColumn { name, alias } => {
-                        name == order_column
-                            || alias == order_column
-                            || output_name == *order_column
-                    }
-                    SelectItem::Expr { alias, .. } => {
-                        alias.as_ref().is_some_and(|alias| alias == order_column)
-                            || output_name == *order_column
-                    }
-                    SelectItem::Aggregate { alias, .. } => {
-                        alias.as_ref().is_some_and(|alias| alias == order_column)
-                            || output_name == *order_column
-                    }
-                    SelectItem::Wildcard => false,
-                };
-                if matches {
-                    ordering = match (left.get(index), right.get(index)) {
-                        (Some(left), Some(right)) => {
-                            self.compare_order_values(left, right, item.nulls, item.descending)
-                        }
-                        _ => Ordering::Equal,
-                    };
-                    break;
+            let right_value = match &item.expr {
+                OrderByExpr::Column(column) => self
+                    .try_lookup_value(&source.columns, right, column)
+                    .cloned(),
+                OrderByExpr::Expr(expr) => self.evaluate_scalar_expr(source, right, expr).ok(),
+                OrderByExpr::Position(_) => unreachable!(),
+            };
+            let ordering = match (left_value.as_ref(), right_value.as_ref()) {
+                (Some(left), Some(right)) => {
+                    self.compare_order_values(left, right, item.nulls, item.descending)
                 }
-            }
+                _ => Ordering::Equal,
+            };
             if ordering != Ordering::Equal {
                 return ordering;
             }
@@ -2310,11 +2368,11 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     },
                     match arg {
                         AggregateArg::Wildcard => "*".to_string(),
-                        AggregateArg::Column { name, distinct } => {
+                        AggregateArg::Expr { expr, distinct } => {
                             if *distinct {
-                                format!("DISTINCT {name}")
+                                format!("DISTINCT {}", self.scalar_expr_name(expr))
                             } else {
-                                name.clone()
+                                self.scalar_expr_name(expr)
                             }
                         }
                     }

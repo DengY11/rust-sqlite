@@ -1,6 +1,7 @@
 use crate::common::types::{ColumnDef, Value};
 use crate::sql::ast::{
-    AlterTableAction, Assignment, CompareOp, Expr, JoinKind, OrderBy, SelectItem, TableConstraint,
+    AlterTableAction, Assignment, CompareOp, Expr, JoinKind, OrderBy, ScalarExpr, SelectItem,
+    TableConstraint,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +122,7 @@ pub enum Plan {
     Aggregate {
         source: Box<Plan>,
         columns: Vec<SelectItem>,
-        group_by: Vec<String>,
+        group_by: Vec<ScalarExpr>,
         having: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,

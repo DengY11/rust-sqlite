@@ -5,7 +5,7 @@ use rustsql::common::types::{
 };
 use rustsql::sql::ast::{
     AggregateArg, AggregateFunc, AlterTableAction, CompareOp, Expr, JoinClause, JoinKind, OrderBy,
-    OrderByExpr, SelectItem, SelectStatement, Statement, TableConstraint,
+    OrderByExpr, ScalarExpr, SelectItem, SelectStatement, Statement, TableConstraint,
 };
 use rustsql::sql::optimizer::Optimizer;
 use rustsql::sql::plan::{IndexBound, IndexRange, IndexScanMode, IndexScanSpec, JoinPlan, Plan};
@@ -1053,7 +1053,7 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
         table_alias: None,
         joins: vec![],
         filter: None,
-        group_by: vec!["active".to_string()],
+        group_by: vec![ScalarExpr::Column("active".to_string())],
         order_by: vec![OrderBy {
             expr: OrderByExpr::Column("total".to_string()),
             descending: true,
@@ -1086,7 +1086,7 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
                     alias: Some("total".to_string()),
                 },
             ],
-            group_by: vec!["active".to_string()],
+            group_by: vec![ScalarExpr::Column("active".to_string())],
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("total".to_string()),
                 descending: true,
@@ -1095,6 +1095,215 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
             limit: Some(2),
             having: None,
         }
+    );
+}
+
+#[test]
+fn plans_aggregate_scalar_expression_arguments() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = Statement::Select(SelectStatement {
+        columns: vec![SelectItem::Aggregate {
+            func: AggregateFunc::Sum,
+            arg: AggregateArg::Expr {
+                expr: ScalarExpr::Binary {
+                    left: Box::new(ScalarExpr::Column("age".to_string())),
+                    op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                    right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                },
+                distinct: false,
+            },
+            alias: Some("total".to_string()),
+        }],
+        table: "users".to_string(),
+        table_alias: None,
+        joins: vec![],
+        filter: None,
+        group_by: vec![],
+        order_by: vec![],
+        limit: None,
+        distinct: false,
+        having: None,
+    });
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::Aggregate {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            columns: vec![SelectItem::Aggregate {
+                func: AggregateFunc::Sum,
+                arg: AggregateArg::Expr {
+                    expr: ScalarExpr::Binary {
+                        left: Box::new(ScalarExpr::Column("age".to_string())),
+                        op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                        right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                    },
+                    distinct: false,
+                },
+                alias: Some("total".to_string()),
+            }],
+            group_by: vec![],
+            order_by: vec![],
+            limit: None,
+            having: None,
+        }
+    );
+}
+
+#[test]
+fn planner_rejects_having_reference_to_ungrouped_source_column() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                    ColumnDef::new("name", ColumnType::Text),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = Statement::Select(SelectStatement {
+        columns: vec![SelectItem::Aggregate {
+            func: AggregateFunc::Count,
+            arg: AggregateArg::Wildcard,
+            alias: Some("total".to_string()),
+        }],
+        table: "users".to_string(),
+        table_alias: None,
+        joins: vec![],
+        filter: None,
+        group_by: vec![],
+        order_by: vec![],
+        limit: None,
+        distinct: false,
+        having: Some(Expr::Compare {
+            column: "age".to_string(),
+            op: CompareOp::Gt,
+            value: Value::Integer(20),
+        }),
+    });
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert!(
+        error.to_string().contains("age"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn planner_rejects_order_by_ungrouped_source_column_in_grouped_projection() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = Statement::Select(SelectStatement {
+        columns: vec![SelectItem::Column("age".to_string())],
+        table: "users".to_string(),
+        table_alias: None,
+        joins: vec![],
+        filter: None,
+        group_by: vec![ScalarExpr::Column("age".to_string())],
+        order_by: vec![OrderBy {
+            expr: OrderByExpr::Column("id".to_string()),
+            descending: true,
+            nulls: None,
+        }],
+        limit: None,
+        distinct: false,
+        having: None,
+    });
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert!(
+        error.to_string().contains("id"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn planner_rejects_sum_non_integer_scalar_expression_argument() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("name", ColumnType::Text),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = Statement::Select(SelectStatement {
+        columns: vec![SelectItem::Aggregate {
+            func: AggregateFunc::Sum,
+            arg: AggregateArg::Expr {
+                expr: ScalarExpr::Binary {
+                    left: Box::new(ScalarExpr::Column("name".to_string())),
+                    op: rustsql::sql::ast::ScalarBinaryOp::Concat,
+                    right: Box::new(ScalarExpr::Literal(Value::Text("x".to_string()))),
+                },
+                distinct: false,
+            },
+            alias: Some("total".to_string()),
+        }],
+        table: "users".to_string(),
+        table_alias: None,
+        joins: vec![],
+        filter: None,
+        group_by: vec![],
+        order_by: vec![],
+        limit: None,
+        distinct: false,
+        having: None,
+    });
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "plan error: SUM only supports INTEGER columns"
     );
 }
 
@@ -1189,6 +1398,118 @@ fn plans_join_query_as_nested_loop_join() {
 }
 
 #[test]
+fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = Statement::Select(SelectStatement {
+        columns: vec![
+            SelectItem::Expr {
+                expr: ScalarExpr::Binary {
+                    left: Box::new(ScalarExpr::Column("age".to_string())),
+                    op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                    right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                },
+                alias: Some("bucket".to_string()),
+            },
+            SelectItem::Aggregate {
+                func: AggregateFunc::Count,
+                arg: AggregateArg::Wildcard,
+                alias: Some("total".to_string()),
+            },
+        ],
+        table: "users".to_string(),
+        table_alias: None,
+        joins: vec![],
+        filter: None,
+        group_by: vec![ScalarExpr::Binary {
+            left: Box::new(ScalarExpr::Column("age".to_string())),
+            op: rustsql::sql::ast::ScalarBinaryOp::Add,
+            right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+        }],
+        order_by: vec![OrderBy {
+            expr: OrderByExpr::Expr(ScalarExpr::Binary {
+                left: Box::new(ScalarExpr::Column("total".to_string())),
+                op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+            }),
+            descending: true,
+            nulls: None,
+        }],
+        limit: None,
+        distinct: false,
+        having: Some(Expr::Compare {
+            column: "bucket".to_string(),
+            op: CompareOp::Gt,
+            value: Value::Integer(20),
+        }),
+    });
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::Aggregate {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            columns: vec![
+                SelectItem::Expr {
+                    expr: ScalarExpr::Binary {
+                        left: Box::new(ScalarExpr::Column("age".to_string())),
+                        op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                        right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                    },
+                    alias: Some("bucket".to_string()),
+                },
+                SelectItem::Aggregate {
+                    func: AggregateFunc::Count,
+                    arg: AggregateArg::Wildcard,
+                    alias: Some("total".to_string()),
+                },
+            ],
+            group_by: vec![ScalarExpr::Binary {
+                left: Box::new(ScalarExpr::Column("age".to_string())),
+                op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+            }],
+            having: Some(Expr::Compare {
+                column: "bucket".to_string(),
+                op: CompareOp::Gt,
+                value: Value::Integer(20),
+            }),
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Expr(ScalarExpr::Binary {
+                    left: Box::new(ScalarExpr::Column("total".to_string())),
+                    op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                    right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                }),
+                descending: true,
+                nulls: None,
+            }],
+            limit: None,
+        }
+    );
+}
+
+#[test]
 fn planner_rejects_unknown_qualified_column_in_correlated_subquery() {
     let planner = Planner::new();
     let context = PlanningContext::new(
@@ -1241,4 +1562,72 @@ fn planner_rejects_unknown_qualified_column_in_correlated_subquery() {
     let error = planner.plan_statement(&statement, &context).unwrap_err();
 
     assert_eq!(error.to_string(), "plan error: unknown column x.id");
+}
+
+#[test]
+fn planner_rejects_join_condition_reference_to_future_join_alias() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([
+            ("users".to_string(), user_schema()),
+            (
+                "orders".to_string(),
+                Schema::new(
+                    "orders",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("user_id", ColumnType::Integer),
+                    ],
+                ),
+            ),
+            (
+                "payments".to_string(),
+                Schema::new(
+                    "payments",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("order_id", ColumnType::Integer),
+                    ],
+                ),
+            ),
+        ]),
+        HashMap::new(),
+    );
+    let statement = Statement::Select(SelectStatement {
+        columns: vec![SelectItem::Column("u.name".to_string())],
+        table: "users".to_string(),
+        table_alias: Some("u".to_string()),
+        joins: vec![
+            JoinClause {
+                table: "orders".to_string(),
+                table_alias: Some("o".to_string()),
+                on: Expr::CompareScalar {
+                    left: rustsql::sql::ast::ScalarExpr::Column("u.id".to_string()),
+                    op: CompareOp::Eq,
+                    right: rustsql::sql::ast::ScalarExpr::Column("p.order_id".to_string()),
+                },
+                kind: JoinKind::Inner,
+            },
+            JoinClause {
+                table: "payments".to_string(),
+                table_alias: Some("p".to_string()),
+                on: Expr::CompareScalar {
+                    left: rustsql::sql::ast::ScalarExpr::Column("o.id".to_string()),
+                    op: CompareOp::Eq,
+                    right: rustsql::sql::ast::ScalarExpr::Column("p.order_id".to_string()),
+                },
+                kind: JoinKind::Inner,
+            },
+        ],
+        filter: None,
+        group_by: vec![],
+        order_by: vec![],
+        limit: None,
+        distinct: false,
+        having: None,
+    });
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert_eq!(error.to_string(), "plan error: unknown column p.order_id");
 }

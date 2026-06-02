@@ -283,13 +283,22 @@ impl Planner {
             let source = self.plan_join_source(select, context, outer_scope)?;
             if has_aggregates || !select.group_by.is_empty() {
                 self.validate_aggregate_projection(select, context)?;
-                self.reject_aggregate_order_by_scalar_expressions(&select.order_by)?;
+                let rewritten_having = select.having.as_ref().map(|expr| {
+                    self.rewrite_aggregate_expr_group_references(expr, &select.group_by)
+                });
+                let rewritten_order_by = select
+                    .order_by
+                    .iter()
+                    .map(|item| {
+                        self.rewrite_aggregate_order_by_group_references(item, &select.group_by)
+                    })
+                    .collect();
                 return Ok(Plan::Aggregate {
                     source: Box::new(source),
                     columns: select.columns.clone(),
                     group_by: select.group_by.clone(),
-                    having: select.having.clone(),
-                    order_by: select.order_by.clone(),
+                    having: rewritten_having,
+                    order_by: rewritten_order_by,
                     limit: select.limit,
                 });
             }
@@ -317,7 +326,49 @@ impl Planner {
 
         if has_aggregates || !select.group_by.is_empty() {
             self.validate_aggregate_projection(select, context)?;
-            self.reject_aggregate_order_by_scalar_expressions(&select.order_by)?;
+            let schema = self.require_schema(context, &select.table)?;
+            let columns = self.normalize_aggregate_select_items(
+                &select.table,
+                select.table_alias.as_deref(),
+                &select.columns,
+                context,
+            )?;
+            let group_by = self.normalize_group_by(
+                &select.table,
+                select.table_alias.as_deref(),
+                &select.group_by,
+                context,
+            )?;
+            let having = select
+                .having
+                .as_ref()
+                .map(|expr| {
+                    self.normalize_aggregate_expr(
+                        schema,
+                        &select.table,
+                        select.table_alias.as_deref(),
+                        &columns,
+                        &group_by,
+                        expr,
+                    )
+                    .map(|expr| self.rewrite_aggregate_expr_group_references(&expr, &group_by))
+                })
+                .transpose()?;
+            let order_by = select
+                .order_by
+                .iter()
+                .map(|item| {
+                    self.normalize_aggregate_order_by(
+                        schema,
+                        &select.table,
+                        select.table_alias.as_deref(),
+                        &columns,
+                        &group_by,
+                        item,
+                    )
+                    .map(|item| self.rewrite_aggregate_order_by_group_references(&item, &group_by))
+                })
+                .collect::<Result<Vec<_>>>()?;
             let source = self.plan_single_table_source(
                 SingleTablePlanInput {
                     table: &select.table,
@@ -333,20 +384,10 @@ impl Planner {
             )?;
             return Ok(Plan::Aggregate {
                 source: Box::new(source),
-                columns: self.normalize_aggregate_select_items(
-                    &select.table,
-                    select.table_alias.as_deref(),
-                    &select.columns,
-                    context,
-                )?,
-                group_by: self.normalize_group_by(
-                    &select.table,
-                    select.table_alias.as_deref(),
-                    &select.group_by,
-                    context,
-                )?,
-                having: select.having.clone(),
-                order_by: select.order_by.clone(),
+                columns,
+                group_by,
+                having,
+                order_by,
                 limit: select.limit,
             });
         }
@@ -437,10 +478,11 @@ impl Planner {
             self.require_scope_columns_with_outer(&scope, outer_scope, filter)?;
             self.validate_subqueries(filter, context, &scope)?;
         }
-        for join in &select.joins {
+        for (index, join) in select.joins.iter().enumerate() {
             self.require_schema(context, &join.table)?;
-            self.require_scope_columns_with_outer(&scope, outer_scope, &join.on)?;
-            self.validate_subqueries(&join.on, context, &scope)?;
+            let join_scope = self.build_join_scope(select, context, index)?;
+            self.require_scope_columns_with_outer(&join_scope, outer_scope, &join.on)?;
+            self.validate_subqueries(&join.on, context, &join_scope)?;
         }
         for item in &select.order_by {
             self.require_order_by_scope(&scope, &select.columns, item)?;
@@ -550,8 +592,8 @@ impl Planner {
                 func: *func,
                 arg: match arg {
                     AggregateArg::Wildcard => AggregateArg::Wildcard,
-                    AggregateArg::Column { name, distinct } => AggregateArg::Column {
-                        name: self.normalize_column_reference(schema, table, table_alias, name)?,
+                    AggregateArg::Expr { expr, distinct } => AggregateArg::Expr {
+                        expr: self.normalize_scalar_expr(schema, table, table_alias, expr)?,
                         distinct: *distinct,
                     },
                 },
@@ -598,6 +640,44 @@ impl Planner {
                 table_alias,
                 column,
             )?),
+            descending: item.descending,
+            nulls: item.nulls,
+        })
+    }
+
+    fn normalize_aggregate_order_by(
+        &self,
+        schema: &Schema,
+        table: &str,
+        table_alias: Option<&str>,
+        columns: &[SelectItem],
+        group_by: &[ScalarExpr],
+        item: &OrderBy,
+    ) -> Result<OrderBy> {
+        Ok(OrderBy {
+            expr: match &item.expr {
+                OrderByExpr::Column(column) => {
+                    OrderByExpr::Column(self.normalize_aggregate_column_reference(
+                        schema,
+                        table,
+                        table_alias,
+                        columns,
+                        group_by,
+                        column,
+                    )?)
+                }
+                OrderByExpr::Expr(expr) => {
+                    OrderByExpr::Expr(self.normalize_aggregate_scalar_expr(
+                        schema,
+                        table,
+                        table_alias,
+                        columns,
+                        group_by,
+                        expr,
+                    )?)
+                }
+                OrderByExpr::Position(position) => OrderByExpr::Position(*position),
+            },
             descending: item.descending,
             nulls: item.nulls,
         })
@@ -739,6 +819,366 @@ impl Planner {
         })
     }
 
+    fn normalize_aggregate_expr(
+        &self,
+        schema: &Schema,
+        table: &str,
+        table_alias: Option<&str>,
+        columns: &[SelectItem],
+        group_by: &[ScalarExpr],
+        expr: &Expr,
+    ) -> Result<Expr> {
+        Ok(match expr {
+            Expr::Compare { column, op, value } => Expr::Compare {
+                column: self.normalize_aggregate_column_reference(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    column,
+                )?,
+                op: *op,
+                value: value.clone(),
+            },
+            Expr::CompareColumns { left, op, right } => Expr::CompareColumns {
+                left: self.normalize_aggregate_column_reference(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    left,
+                )?,
+                op: *op,
+                right: self.normalize_aggregate_column_reference(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    right,
+                )?,
+            },
+            Expr::CompareScalar { left, op, right } => Expr::CompareScalar {
+                left: self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    left,
+                )?,
+                op: *op,
+                right: self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    right,
+                )?,
+            },
+            Expr::IsNull { column, negated } => Expr::IsNull {
+                column: self.normalize_aggregate_column_reference(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    column,
+                )?,
+                negated: *negated,
+            },
+            Expr::IsNullScalar { expr, negated } => Expr::IsNullScalar {
+                expr: self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    expr,
+                )?,
+                negated: *negated,
+            },
+            Expr::InSubquery {
+                column,
+                query,
+                negated,
+            } => Expr::InSubquery {
+                column: self.normalize_aggregate_column_reference(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    column,
+                )?,
+                query: query.clone(),
+                negated: *negated,
+            },
+            Expr::InSubqueryScalar {
+                expr,
+                query,
+                negated,
+            } => Expr::InSubqueryScalar {
+                expr: self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    expr,
+                )?,
+                query: query.clone(),
+                negated: *negated,
+            },
+            Expr::CompareSubquery { column, op, query } => Expr::CompareSubquery {
+                column: self.normalize_aggregate_column_reference(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    column,
+                )?,
+                op: *op,
+                query: query.clone(),
+            },
+            Expr::CompareSubqueryScalar { left, op, query } => Expr::CompareSubqueryScalar {
+                left: self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    left,
+                )?,
+                op: *op,
+                query: query.clone(),
+            },
+            Expr::ExistsSubquery { query, negated } => Expr::ExistsSubquery {
+                query: query.clone(),
+                negated: *negated,
+            },
+            Expr::Like {
+                column,
+                pattern,
+                negated,
+            } => Expr::Like {
+                column: self.normalize_aggregate_column_reference(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    column,
+                )?,
+                pattern: pattern.clone(),
+                negated: *negated,
+            },
+            Expr::LikeScalar {
+                expr,
+                pattern,
+                negated,
+            } => Expr::LikeScalar {
+                expr: self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    expr,
+                )?,
+                pattern: pattern.clone(),
+                negated: *negated,
+            },
+            Expr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                column: self.normalize_aggregate_column_reference(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    column,
+                )?,
+                low: low.clone(),
+                high: high.clone(),
+                negated: *negated,
+            },
+            Expr::BetweenScalar {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::BetweenScalar {
+                expr: self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    expr,
+                )?,
+                low: self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    low,
+                )?,
+                high: self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    high,
+                )?,
+                negated: *negated,
+            },
+            Expr::Not(expr) => Expr::Not(Box::new(self.normalize_aggregate_expr(
+                schema,
+                table,
+                table_alias,
+                columns,
+                group_by,
+                expr,
+            )?)),
+            Expr::And(left, right) => Expr::And(
+                Box::new(self.normalize_aggregate_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    left,
+                )?),
+                Box::new(self.normalize_aggregate_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    right,
+                )?),
+            ),
+            Expr::Or(left, right) => Expr::Or(
+                Box::new(self.normalize_aggregate_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    left,
+                )?),
+                Box::new(self.normalize_aggregate_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    right,
+                )?),
+            ),
+        })
+    }
+
+    fn normalize_aggregate_column_reference(
+        &self,
+        schema: &Schema,
+        table: &str,
+        table_alias: Option<&str>,
+        columns: &[SelectItem],
+        group_by: &[ScalarExpr],
+        column: &str,
+    ) -> Result<String> {
+        if self
+            .aggregate_reference_names(columns, group_by)
+            .iter()
+            .any(|name| name == column)
+        {
+            Ok(column.to_string())
+        } else {
+            self.normalize_column_reference(schema, table, table_alias, column)
+        }
+    }
+
+    fn normalize_aggregate_scalar_expr(
+        &self,
+        schema: &Schema,
+        table: &str,
+        table_alias: Option<&str>,
+        columns: &[SelectItem],
+        group_by: &[ScalarExpr],
+        expr: &ScalarExpr,
+    ) -> Result<ScalarExpr> {
+        Ok(match expr {
+            ScalarExpr::Literal(value) => ScalarExpr::Literal(value.clone()),
+            ScalarExpr::Column(name) => {
+                ScalarExpr::Column(self.normalize_aggregate_column_reference(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    name,
+                )?)
+            }
+            ScalarExpr::UnaryMinus(expr) => {
+                ScalarExpr::UnaryMinus(Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    expr,
+                )?))
+            }
+            ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+                left: Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    left,
+                )?),
+                op: *op,
+                right: Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    right,
+                )?),
+            },
+            ScalarExpr::Function { func, args } => ScalarExpr::Function {
+                func: *func,
+                args: args
+                    .iter()
+                    .map(|arg| {
+                        self.normalize_aggregate_scalar_expr(
+                            schema,
+                            table,
+                            table_alias,
+                            columns,
+                            group_by,
+                            arg,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            },
+        })
+    }
+
     fn normalize_column_reference(
         &self,
         schema: &Schema,
@@ -834,18 +1274,6 @@ impl Planner {
             .any(|column| matches!(column, SelectItem::Aggregate { .. }))
     }
 
-    fn reject_aggregate_order_by_scalar_expressions(&self, order_by: &[OrderBy]) -> Result<()> {
-        if order_by
-            .iter()
-            .any(|item| matches!(item.expr, OrderByExpr::Expr(_)))
-        {
-            return Err(DbError::plan(
-                "ORDER BY scalar expressions are not supported with aggregate queries",
-            ));
-        }
-        Ok(())
-    }
-
     fn require_select_item_columns(&self, schema: &Schema, item: &SelectItem) -> Result<()> {
         match item {
             SelectItem::Wildcard => Ok(()),
@@ -863,7 +1291,7 @@ impl Planner {
                         ))
                     }
                 }
-                AggregateArg::Column { name, .. } => self.require_column(schema, name),
+                AggregateArg::Expr { expr, .. } => self.require_scalar_expr_columns(schema, expr),
             },
         }
     }
@@ -886,13 +1314,13 @@ impl Planner {
         &self,
         table: &str,
         table_alias: Option<&str>,
-        group_by: &[String],
+        group_by: &[ScalarExpr],
         context: &PlanningContext,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<ScalarExpr>> {
         let schema = self.require_schema(context, table)?;
         group_by
             .iter()
-            .map(|column| self.normalize_column_reference(schema, table, table_alias, column))
+            .map(|expr| self.normalize_scalar_expr(schema, table, table_alias, expr))
             .collect()
     }
 
@@ -914,14 +1342,52 @@ impl Planner {
             &select.group_by,
             context,
         )?;
+        let normalized_having = select
+            .having
+            .as_ref()
+            .map(|expr| {
+                self.normalize_aggregate_expr(
+                    schema,
+                    &select.table,
+                    select.table_alias.as_deref(),
+                    &normalized_columns,
+                    &normalized_group_by,
+                    expr,
+                )
+            })
+            .transpose()?;
+        let normalized_order_by = select
+            .order_by
+            .iter()
+            .map(|item| {
+                self.normalize_aggregate_order_by(
+                    schema,
+                    &select.table,
+                    select.table_alias.as_deref(),
+                    &normalized_columns,
+                    &normalized_group_by,
+                    item,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         if !select.joins.is_empty() {
             let scope = self.build_scope(select, context)?;
-            for item in &select.columns {
-                self.require_join_select_item(&scope, item)?;
+            for expr in &select.group_by {
+                self.require_scalar_expr_scope(&scope, expr)?;
             }
-            for column in &select.group_by {
-                self.resolve_column_in_scope(&scope, column)?;
+            for item in &select.columns {
+                self.require_aggregate_select_item_in_scope(&scope, &select.group_by, item)?;
+            }
+            if let Some(having) = &select.having {
+                self.require_aggregate_expr_references(having, &select.columns, &select.group_by)?;
+            }
+            for item in &select.order_by {
+                self.require_aggregate_order_by_references(
+                    item,
+                    &select.columns,
+                    &select.group_by,
+                )?;
             }
             return Ok(());
         }
@@ -935,20 +1401,26 @@ impl Planner {
                     ));
                 }
                 SelectItem::Column(name) | SelectItem::AliasedColumn { name, .. } => {
-                    if !normalized_group_by.iter().any(|column| column == name) {
+                    if !self.group_by_contains_expr(
+                        &normalized_group_by,
+                        &ScalarExpr::Column(name.clone()),
+                    ) {
                         return Err(DbError::plan(format!(
                             "non-aggregate column {name} must appear in GROUP BY"
                         )));
                     }
                 }
-                SelectItem::Expr { .. } => {
-                    return Err(DbError::plan(
-                        "scalar expressions cannot be used with GROUP BY or aggregate projections",
-                    ));
+                SelectItem::Expr { expr, .. } => {
+                    if !self.group_by_contains_expr(&normalized_group_by, expr) {
+                        return Err(DbError::plan(format!(
+                            "non-aggregate expression {} must appear in GROUP BY",
+                            self.scalar_expr_display(expr)
+                        )));
+                    }
                 }
                 SelectItem::Aggregate { func, arg, .. } => {
                     if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg)
-                        && matches!(arg, AggregateArg::Column { name: column, .. } if !schema.columns.iter().any(|entry| entry.name == *column && matches!(entry.column_type, crate::common::types::ColumnType::Integer)))
+                        && matches!(arg, AggregateArg::Expr { expr, .. } if !self.scalar_expr_returns_integer(schema, expr))
                     {
                         return Err(DbError::plan(format!(
                             "{} only supports INTEGER columns",
@@ -963,11 +1435,49 @@ impl Planner {
             }
         }
 
-        if !normalized_group_by.is_empty() && !self.select_has_aggregates(&normalized_columns) {
-            return Ok(());
+        if let Some(having) = &normalized_having {
+            self.require_aggregate_expr_references(
+                having,
+                &normalized_columns,
+                &normalized_group_by,
+            )?;
+        }
+        for item in &normalized_order_by {
+            self.require_aggregate_order_by_references(
+                item,
+                &normalized_columns,
+                &normalized_group_by,
+            )?;
         }
 
         Ok(())
+    }
+
+    fn scalar_expr_returns_integer(&self, schema: &Schema, expr: &ScalarExpr) -> bool {
+        match expr {
+            ScalarExpr::Literal(Value::Integer(_)) => true,
+            ScalarExpr::Literal(_) => false,
+            ScalarExpr::Column(column) => schema.columns.iter().any(|entry| {
+                entry.name == *column
+                    && matches!(entry.column_type, crate::common::types::ColumnType::Integer)
+            }),
+            ScalarExpr::UnaryMinus(expr) => self.scalar_expr_returns_integer(schema, expr),
+            ScalarExpr::Binary { left, op, right } => {
+                !matches!(op, crate::sql::ast::ScalarBinaryOp::Concat)
+                    && self.scalar_expr_returns_integer(schema, left)
+                    && self.scalar_expr_returns_integer(schema, right)
+            }
+            ScalarExpr::Function { func, args } => match func {
+                crate::sql::ast::ScalarFunc::Abs => args
+                    .iter()
+                    .all(|arg| self.scalar_expr_returns_integer(schema, arg)),
+                crate::sql::ast::ScalarFunc::Length => true,
+                crate::sql::ast::ScalarFunc::Coalesce | crate::sql::ast::ScalarFunc::IfNull => args
+                    .iter()
+                    .all(|arg| self.scalar_expr_returns_integer(schema, arg)),
+                crate::sql::ast::ScalarFunc::Lower | crate::sql::ast::ScalarFunc::Upper => false,
+            },
+        }
     }
 
     fn build_scope(
@@ -982,6 +1492,28 @@ impl Planner {
             schema: self.require_schema(context, &select.table)?.clone(),
         });
         for join in &select.joins {
+            bindings.push(TableBinding {
+                table: join.table.clone(),
+                alias: join.table_alias.clone(),
+                schema: self.require_schema(context, &join.table)?.clone(),
+            });
+        }
+        Ok(QueryScope { bindings })
+    }
+
+    fn build_join_scope(
+        &self,
+        select: &SelectStatement,
+        context: &PlanningContext,
+        join_index: usize,
+    ) -> Result<QueryScope> {
+        let mut bindings = Vec::with_capacity(join_index + 2);
+        bindings.push(TableBinding {
+            table: select.table.clone(),
+            alias: select.table_alias.clone(),
+            schema: self.require_schema(context, &select.table)?.clone(),
+        });
+        for join in select.joins.iter().take(join_index + 1) {
             bindings.push(TableBinding {
                 table: join.table.clone(),
                 alias: join.table_alias.clone(),
@@ -1023,10 +1555,94 @@ impl Planner {
                         ))
                     }
                 }
-                AggregateArg::Column { name, .. } => {
-                    self.resolve_column_in_scope(scope, name).map(|_| ())
-                }
+                AggregateArg::Expr { expr, .. } => self.require_scalar_expr_scope(scope, expr),
             },
+        }
+    }
+
+    fn require_aggregate_select_item_in_scope(
+        &self,
+        scope: &QueryScope,
+        group_by: &[ScalarExpr],
+        item: &SelectItem,
+    ) -> Result<()> {
+        match item {
+            SelectItem::Wildcard => Err(DbError::plan(
+                "wildcard cannot be used with GROUP BY or aggregate projections",
+            )),
+            SelectItem::Column(name) | SelectItem::AliasedColumn { name, .. } => {
+                self.resolve_column_in_scope(scope, name)?;
+                if !self.group_by_contains_expr(group_by, &ScalarExpr::Column(name.clone())) {
+                    return Err(DbError::plan(format!(
+                        "non-aggregate column {name} must appear in GROUP BY"
+                    )));
+                }
+                Ok(())
+            }
+            SelectItem::Expr { expr, .. } => {
+                self.require_scalar_expr_scope(scope, expr)?;
+                if !self.group_by_contains_expr(group_by, expr) {
+                    return Err(DbError::plan(format!(
+                        "non-aggregate expression {} must appear in GROUP BY",
+                        self.scalar_expr_display(expr)
+                    )));
+                }
+                Ok(())
+            }
+            SelectItem::Aggregate { arg, func, .. } => match arg {
+                AggregateArg::Wildcard => {
+                    if *func == AggregateFunc::Count {
+                        Ok(())
+                    } else {
+                        Err(DbError::plan(
+                            "only COUNT supports wildcard aggregate argument",
+                        ))
+                    }
+                }
+                AggregateArg::Expr { expr, .. } => self.require_scalar_expr_scope(scope, expr),
+            },
+        }
+    }
+
+    fn group_by_contains_expr(&self, group_by: &[ScalarExpr], expr: &ScalarExpr) -> bool {
+        group_by.iter().any(|group_expr| {
+            group_expr == expr
+                || matches!((group_expr, expr), (ScalarExpr::Column(left), ScalarExpr::Column(right)) if left == right)
+        })
+    }
+
+    fn scalar_expr_display(&self, expr: &ScalarExpr) -> String {
+        match expr {
+            ScalarExpr::Literal(value) => value.to_string(),
+            ScalarExpr::Column(name) => name.clone(),
+            ScalarExpr::UnaryMinus(expr) => format!("-{}", self.scalar_expr_display(expr)),
+            ScalarExpr::Binary { left, op, right } => format!(
+                "{} {} {}",
+                self.scalar_expr_display(left),
+                match op {
+                    crate::sql::ast::ScalarBinaryOp::Add => "+",
+                    crate::sql::ast::ScalarBinaryOp::Subtract => "-",
+                    crate::sql::ast::ScalarBinaryOp::Multiply => "*",
+                    crate::sql::ast::ScalarBinaryOp::Divide => "/",
+                    crate::sql::ast::ScalarBinaryOp::Concat => "||",
+                },
+                self.scalar_expr_display(right)
+            ),
+            ScalarExpr::Function { func, args } => format!(
+                "{}({})",
+                match func {
+                    crate::sql::ast::ScalarFunc::Length => "LENGTH",
+                    crate::sql::ast::ScalarFunc::Lower => "LOWER",
+                    crate::sql::ast::ScalarFunc::Upper => "UPPER",
+                    crate::sql::ast::ScalarFunc::Abs => "ABS",
+                    crate::sql::ast::ScalarFunc::Coalesce => "COALESCE",
+                    crate::sql::ast::ScalarFunc::IfNull => "IFNULL",
+                },
+                args.iter()
+                    .map(|arg| self.scalar_expr_display(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 
@@ -1050,6 +1666,304 @@ impl Planner {
             OrderByExpr::Expr(expr) => self.require_scalar_expr_scope(scope, expr),
             OrderByExpr::Position(_) => Ok(()),
         }
+    }
+
+    fn require_aggregate_order_by_references(
+        &self,
+        item: &OrderBy,
+        columns: &[SelectItem],
+        group_by: &[ScalarExpr],
+    ) -> Result<()> {
+        match &item.expr {
+            OrderByExpr::Column(column) => {
+                self.require_aggregate_column_reference(column, columns, group_by)
+            }
+            OrderByExpr::Expr(expr) => {
+                self.require_aggregate_scalar_reference(expr, columns, group_by)
+            }
+            OrderByExpr::Position(_) => Ok(()),
+        }
+    }
+
+    fn require_aggregate_expr_references(
+        &self,
+        expr: &Expr,
+        columns: &[SelectItem],
+        group_by: &[ScalarExpr],
+    ) -> Result<()> {
+        match expr {
+            Expr::Compare { column, .. }
+            | Expr::IsNull { column, .. }
+            | Expr::Like { column, .. }
+            | Expr::Between { column, .. }
+            | Expr::InSubquery { column, .. }
+            | Expr::CompareSubquery { column, .. } => {
+                self.require_aggregate_column_reference(column, columns, group_by)
+            }
+            Expr::CompareColumns { left, right, .. } => {
+                self.require_aggregate_column_reference(left, columns, group_by)?;
+                self.require_aggregate_column_reference(right, columns, group_by)
+            }
+            Expr::CompareScalar { left, right, .. } => {
+                self.require_aggregate_scalar_reference(left, columns, group_by)?;
+                self.require_aggregate_scalar_reference(right, columns, group_by)
+            }
+            Expr::IsNullScalar { expr, .. }
+            | Expr::LikeScalar { expr, .. }
+            | Expr::InSubqueryScalar { expr, .. } => {
+                self.require_aggregate_scalar_reference(expr, columns, group_by)
+            }
+            Expr::BetweenScalar {
+                expr, low, high, ..
+            } => {
+                self.require_aggregate_scalar_reference(expr, columns, group_by)?;
+                self.require_aggregate_scalar_reference(low, columns, group_by)?;
+                self.require_aggregate_scalar_reference(high, columns, group_by)
+            }
+            Expr::CompareSubqueryScalar { left, .. } => {
+                self.require_aggregate_scalar_reference(left, columns, group_by)
+            }
+            Expr::ExistsSubquery { .. } => Ok(()),
+            Expr::Not(expr) => self.require_aggregate_expr_references(expr, columns, group_by),
+            Expr::And(left, right) | Expr::Or(left, right) => {
+                self.require_aggregate_expr_references(left, columns, group_by)?;
+                self.require_aggregate_expr_references(right, columns, group_by)
+            }
+        }
+    }
+
+    fn require_aggregate_scalar_reference(
+        &self,
+        expr: &ScalarExpr,
+        columns: &[SelectItem],
+        group_by: &[ScalarExpr],
+    ) -> Result<()> {
+        if self.group_by_contains_expr(group_by, expr) {
+            return Ok(());
+        }
+
+        match expr {
+            ScalarExpr::Literal(_) => Ok(()),
+            ScalarExpr::Column(name) => {
+                self.require_aggregate_column_reference(name, columns, group_by)
+            }
+            ScalarExpr::UnaryMinus(expr) => {
+                self.require_aggregate_scalar_reference(expr, columns, group_by)
+            }
+            ScalarExpr::Binary { left, right, .. } => {
+                self.require_aggregate_scalar_reference(left, columns, group_by)?;
+                self.require_aggregate_scalar_reference(right, columns, group_by)
+            }
+            ScalarExpr::Function { args, .. } => {
+                for arg in args {
+                    self.require_aggregate_scalar_reference(arg, columns, group_by)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn require_aggregate_column_reference(
+        &self,
+        column: &str,
+        columns: &[SelectItem],
+        group_by: &[ScalarExpr],
+    ) -> Result<()> {
+        if self
+            .aggregate_reference_names(columns, group_by)
+            .iter()
+            .any(|name| name == column)
+        {
+            Ok(())
+        } else {
+            Err(DbError::plan(format!("unknown column {column}")))
+        }
+    }
+
+    fn aggregate_reference_names(
+        &self,
+        columns: &[SelectItem],
+        group_by: &[ScalarExpr],
+    ) -> Vec<String> {
+        let mut names = self.select_aliases(columns);
+
+        for item in columns {
+            match item {
+                SelectItem::Column(name) => names.push(name.clone()),
+                SelectItem::AliasedColumn { name, alias } => {
+                    names.push(name.clone());
+                    names.push(alias.clone());
+                }
+                SelectItem::Expr { expr, alias } => {
+                    names.push(
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| self.scalar_expr_display(expr)),
+                    );
+                }
+                SelectItem::Aggregate { func, arg, alias } => {
+                    names.push(
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| self.aggregate_output_name(*func, arg)),
+                    );
+                }
+                SelectItem::Wildcard => {}
+            }
+        }
+
+        for expr in group_by {
+            names.push(self.scalar_expr_display(expr));
+        }
+
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn rewrite_aggregate_order_by_group_references(
+        &self,
+        item: &OrderBy,
+        group_by: &[ScalarExpr],
+    ) -> OrderBy {
+        OrderBy {
+            expr: match &item.expr {
+                OrderByExpr::Column(column) => OrderByExpr::Column(column.clone()),
+                OrderByExpr::Expr(expr) => OrderByExpr::Expr(
+                    self.rewrite_aggregate_scalar_group_references(expr, group_by),
+                ),
+                OrderByExpr::Position(position) => OrderByExpr::Position(*position),
+            },
+            descending: item.descending,
+            nulls: item.nulls,
+        }
+    }
+
+    fn rewrite_aggregate_expr_group_references(
+        &self,
+        expr: &Expr,
+        group_by: &[ScalarExpr],
+    ) -> Expr {
+        match expr {
+            Expr::Compare { .. }
+            | Expr::CompareColumns { .. }
+            | Expr::IsNull { .. }
+            | Expr::InSubquery { .. }
+            | Expr::CompareSubquery { .. }
+            | Expr::ExistsSubquery { .. }
+            | Expr::Like { .. }
+            | Expr::Between { .. } => expr.clone(),
+            Expr::CompareScalar { left, op, right } => Expr::CompareScalar {
+                left: self.rewrite_aggregate_scalar_group_references(left, group_by),
+                op: *op,
+                right: self.rewrite_aggregate_scalar_group_references(right, group_by),
+            },
+            Expr::IsNullScalar { expr, negated } => Expr::IsNullScalar {
+                expr: self.rewrite_aggregate_scalar_group_references(expr, group_by),
+                negated: *negated,
+            },
+            Expr::InSubqueryScalar {
+                expr,
+                query,
+                negated,
+            } => Expr::InSubqueryScalar {
+                expr: self.rewrite_aggregate_scalar_group_references(expr, group_by),
+                query: query.clone(),
+                negated: *negated,
+            },
+            Expr::CompareSubqueryScalar { left, op, query } => Expr::CompareSubqueryScalar {
+                left: self.rewrite_aggregate_scalar_group_references(left, group_by),
+                op: *op,
+                query: query.clone(),
+            },
+            Expr::LikeScalar {
+                expr,
+                pattern,
+                negated,
+            } => Expr::LikeScalar {
+                expr: self.rewrite_aggregate_scalar_group_references(expr, group_by),
+                pattern: pattern.clone(),
+                negated: *negated,
+            },
+            Expr::BetweenScalar {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::BetweenScalar {
+                expr: self.rewrite_aggregate_scalar_group_references(expr, group_by),
+                low: self.rewrite_aggregate_scalar_group_references(low, group_by),
+                high: self.rewrite_aggregate_scalar_group_references(high, group_by),
+                negated: *negated,
+            },
+            Expr::Not(expr) => Expr::Not(Box::new(
+                self.rewrite_aggregate_expr_group_references(expr, group_by),
+            )),
+            Expr::And(left, right) => Expr::And(
+                Box::new(self.rewrite_aggregate_expr_group_references(left, group_by)),
+                Box::new(self.rewrite_aggregate_expr_group_references(right, group_by)),
+            ),
+            Expr::Or(left, right) => Expr::Or(
+                Box::new(self.rewrite_aggregate_expr_group_references(left, group_by)),
+                Box::new(self.rewrite_aggregate_expr_group_references(right, group_by)),
+            ),
+        }
+    }
+
+    fn rewrite_aggregate_scalar_group_references(
+        &self,
+        expr: &ScalarExpr,
+        group_by: &[ScalarExpr],
+    ) -> ScalarExpr {
+        if let Some(label) = group_by
+            .iter()
+            .find(|group_expr| *group_expr == expr)
+            .map(|group_expr| self.scalar_expr_display(group_expr))
+        {
+            return ScalarExpr::Column(label);
+        }
+
+        match expr {
+            ScalarExpr::Literal(_) | ScalarExpr::Column(_) => expr.clone(),
+            ScalarExpr::UnaryMinus(expr) => ScalarExpr::UnaryMinus(Box::new(
+                self.rewrite_aggregate_scalar_group_references(expr, group_by),
+            )),
+            ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+                left: Box::new(self.rewrite_aggregate_scalar_group_references(left, group_by)),
+                op: *op,
+                right: Box::new(self.rewrite_aggregate_scalar_group_references(right, group_by)),
+            },
+            ScalarExpr::Function { func, args } => ScalarExpr::Function {
+                func: *func,
+                args: args
+                    .iter()
+                    .map(|arg| self.rewrite_aggregate_scalar_group_references(arg, group_by))
+                    .collect(),
+            },
+        }
+    }
+
+    fn aggregate_output_name(&self, func: AggregateFunc, arg: &AggregateArg) -> String {
+        format!(
+            "{}({})",
+            match func {
+                AggregateFunc::Count => "COUNT",
+                AggregateFunc::Sum => "SUM",
+                AggregateFunc::Avg => "AVG",
+                AggregateFunc::Min => "MIN",
+                AggregateFunc::Max => "MAX",
+            },
+            match arg {
+                AggregateArg::Wildcard => "*".to_string(),
+                AggregateArg::Expr { expr, distinct } => {
+                    if *distinct {
+                        format!("DISTINCT {}", self.scalar_expr_display(expr))
+                    } else {
+                        self.scalar_expr_display(expr)
+                    }
+                }
+            }
+        )
     }
 
     fn require_scope_columns_with_outer(

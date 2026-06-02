@@ -519,6 +519,51 @@ fn parses_scalar_function_expressions() {
 }
 
 #[test]
+fn parses_aggregate_scalar_expression_arguments() {
+    let statements = parse_sql(
+        "SELECT SUM(age + 1) AS total, COUNT(DISTINCT age + 1) AS distinct_total FROM users;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![select_statement(
+            vec![
+                SelectItem::Aggregate {
+                    func: AggregateFunc::Sum,
+                    arg: AggregateArg::Expr {
+                        expr: ScalarExpr::Binary {
+                            left: Box::new(ScalarExpr::Column("age".to_string())),
+                            op: ScalarBinaryOp::Add,
+                            right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                        },
+                        distinct: false,
+                    },
+                    alias: Some("total".to_string()),
+                },
+                SelectItem::Aggregate {
+                    func: AggregateFunc::Count,
+                    arg: AggregateArg::Expr {
+                        expr: ScalarExpr::Binary {
+                            left: Box::new(ScalarExpr::Column("age".to_string())),
+                            op: ScalarBinaryOp::Add,
+                            right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                        },
+                        distinct: true,
+                    },
+                    alias: Some("distinct_total".to_string()),
+                },
+            ],
+            "users",
+            None,
+            None,
+            vec![],
+            None,
+        )]
+    );
+}
+
+#[test]
 fn parses_order_by_scalar_expressions() {
     let statements =
         parse_sql("SELECT name FROM users ORDER BY LENGTH(name) DESC, LOWER(name) ASC NULLS LAST;")
@@ -551,6 +596,106 @@ fn parses_order_by_scalar_expressions() {
             ],
             None,
         )]
+    );
+}
+
+#[test]
+fn parses_group_by_and_aggregate_order_by_scalar_expressions() {
+    let statements = parse_sql(
+        "SELECT age + 1 AS bucket, COUNT(*) AS total
+         FROM users
+         GROUP BY age + 1
+         HAVING bucket > 20
+         ORDER BY total + 1 DESC;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::Select(SelectStatement {
+            distinct: false,
+            columns: vec![
+                SelectItem::Expr {
+                    expr: ScalarExpr::Binary {
+                        left: Box::new(ScalarExpr::Column("age".to_string())),
+                        op: ScalarBinaryOp::Add,
+                        right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                    },
+                    alias: Some("bucket".to_string()),
+                },
+                SelectItem::Aggregate {
+                    func: AggregateFunc::Count,
+                    arg: AggregateArg::Wildcard,
+                    alias: Some("total".to_string()),
+                },
+            ],
+            table: "users".to_string(),
+            table_alias: None,
+            joins: vec![],
+            filter: None,
+            group_by: vec![ScalarExpr::Binary {
+                left: Box::new(ScalarExpr::Column("age".to_string())),
+                op: ScalarBinaryOp::Add,
+                right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+            }],
+            having: Some(Expr::Compare {
+                column: "bucket".to_string(),
+                op: CompareOp::Gt,
+                value: Value::Integer(20),
+            }),
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Expr(ScalarExpr::Binary {
+                    left: Box::new(ScalarExpr::Column("total".to_string())),
+                    op: ScalarBinaryOp::Add,
+                    right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                }),
+                descending: true,
+                nulls: None,
+            }],
+            limit: None,
+        })]
+    );
+}
+
+#[test]
+fn parses_join_on_scalar_expression() {
+    let statements = parse_sql(
+        "SELECT u.name, o.amount
+         FROM users u
+         JOIN orders o ON u.id + 1 = o.user_id;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::Select(SelectStatement {
+            distinct: false,
+            columns: vec![
+                SelectItem::Column("u.name".to_string()),
+                SelectItem::Column("o.amount".to_string()),
+            ],
+            table: "users".to_string(),
+            table_alias: Some("u".to_string()),
+            joins: vec![JoinClause {
+                kind: JoinKind::Inner,
+                table: "orders".to_string(),
+                table_alias: Some("o".to_string()),
+                on: Expr::CompareScalar {
+                    left: ScalarExpr::Binary {
+                        left: Box::new(ScalarExpr::Column("u.id".to_string())),
+                        op: ScalarBinaryOp::Add,
+                        right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                    },
+                    op: CompareOp::Eq,
+                    right: ScalarExpr::Column("o.user_id".to_string()),
+                },
+            }],
+            filter: None,
+            group_by: vec![],
+            having: None,
+            order_by: vec![],
+            limit: None,
+        })]
     );
 }
 
@@ -1447,7 +1592,7 @@ fn parses_group_by_join_and_subquery_forms() {
                 table_alias: None,
                 joins: vec![],
                 filter: None,
-                group_by: vec!["active".to_string()],
+                group_by: vec![ScalarExpr::Column("active".to_string())],
                 having: None,
                 order_by: vec![OrderBy {
                     expr: OrderByExpr::Column("total".to_string()),
