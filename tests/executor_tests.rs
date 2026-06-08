@@ -1,19 +1,23 @@
 use std::cell::Cell;
 
 use rustsql::common::types::{ColumnDef, ColumnType, Value};
-use rustsql::sql::ast::{CompareOp, Expr, SelectItem, SelectStatement, Statement};
+use rustsql::sql::ast::{CompareOp, Expr, FromItem, SelectItem, SelectStatement, Statement};
 use rustsql::sql::executor::Executor;
 use rustsql::sql::optimizer::Optimizer;
-use rustsql::sql::plan::{IndexBound, IndexRange, IndexScanMode, IndexScanSpec, Plan};
+use rustsql::sql::plan::{IndexBound, IndexRange, IndexScanMode, IndexScanSpec, JoinPlan, Plan};
 use rustsql::sql::planner::Planner;
 use rustsql::storage::memory::MemoryStorage;
 
 fn select_statement(columns: Vec<SelectItem>, table: &str, filter: Option<Expr>) -> Statement {
     Statement::Select(SelectStatement {
+        with: None,
         columns,
-        table: table.to_string(),
-        table_alias: None,
+        from: FromItem::Table {
+            name: table.to_string(),
+            alias: None,
+        },
         joins: vec![],
+        compounds: vec![],
         filter,
         group_by: vec![],
         order_by: vec![],
@@ -266,6 +270,101 @@ fn executor_rechecks_full_filter_after_prefix_index_scan() {
 
     let rows = executor.execute(plan).unwrap();
     assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+}
+
+#[test]
+fn executor_rejects_qualified_duplicate_output_from_joined_wildcard_derived_source() {
+    let storage = MemoryStorage::new();
+    let current_txn = Cell::new(None);
+    let executor = Executor::new(&storage, &current_txn);
+
+    executor
+        .execute(Plan::CreateTable {
+            name: "users".to_string(),
+            columns: vec![
+                ColumnDef::primary_key("id", ColumnType::Integer),
+                ColumnDef::new("age", ColumnType::Integer),
+            ],
+            constraints: vec![],
+        })
+        .unwrap();
+    executor
+        .execute(Plan::CreateTable {
+            name: "orders".to_string(),
+            columns: vec![
+                ColumnDef::primary_key("id", ColumnType::Integer),
+                ColumnDef::new("user_id", ColumnType::Integer),
+            ],
+            constraints: vec![],
+        })
+        .unwrap();
+    executor
+        .execute(Plan::Insert {
+            table: "users".to_string(),
+            values: vec![Value::Integer(1), Value::Integer(20)],
+        })
+        .unwrap();
+    executor
+        .execute(Plan::Insert {
+            table: "orders".to_string(),
+            values: vec![Value::Integer(10), Value::Integer(1)],
+        })
+        .unwrap();
+
+    let error = executor
+        .execute(Plan::DerivedSource {
+            source: Box::new(Plan::NestedLoopJoin {
+                source: Box::new(Plan::SeqScan {
+                    table: "users".to_string(),
+                    table_alias: Some("u".to_string()),
+                    columns: vec![SelectItem::Wildcard],
+                    filter: None,
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
+                joins: vec![JoinPlan {
+                    source: Box::new(Plan::SeqScan {
+                        table: "orders".to_string(),
+                        table_alias: Some("o".to_string()),
+                        columns: vec![SelectItem::Wildcard],
+                        filter: None,
+                        order_by: vec![],
+                        limit: None,
+                        distinct: false,
+                    }),
+                    on: Expr::CompareColumns {
+                        left: "u.id".to_string(),
+                        op: CompareOp::Eq,
+                        right: "o.user_id".to_string(),
+                    },
+                    kind: rustsql::sql::ast::JoinKind::Inner,
+                }],
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            alias: "t".to_string(),
+            output_columns: vec![
+                "id".to_string(),
+                "age".to_string(),
+                "id".to_string(),
+                "user_id".to_string(),
+            ],
+            columns: vec![SelectItem::Column("t.id".to_string())],
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            distinct: false,
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "plan error: ambiguous column reference: t.id"
+    );
 }
 
 #[test]

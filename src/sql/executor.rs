@@ -63,11 +63,11 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
 
     pub fn execute(&self, plan: Plan) -> Result<Vec<Row>> {
         match plan {
-            Plan::BeginTxn => {
+            Plan::BeginTxn { isolation_level } => {
                 if self.current_txn.get().is_some() {
                     return Err(DbError::txn("transaction already active"));
                 }
-                let transaction_id = self.storage.begin()?;
+                let transaction_id = self.storage.begin_with_isolation(isolation_level)?;
                 self.current_txn.set(Some(transaction_id));
                 Ok(Vec::new())
             }
@@ -256,8 +256,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 )?;
 
                 for (row_id, _, updated) in pending_updates {
-                    self.storage.delete_row(transaction_id, &table, row_id)?;
-                    self.storage.insert_row(transaction_id, &table, updated)?;
+                    self.storage.update_row(transaction_id, &table, row_id, updated)?;
                 }
                 Ok(Vec::new())
             }
@@ -635,9 +634,36 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 )?;
                 self.finish_projection(transaction_id, source, &columns, &order_by, limit, distinct)
             }
+            Plan::Union {
+                left,
+                right,
+                all,
+                order_by,
+                limit,
+            } => {
+                let left = self.execute_query_plan_with_outer(transaction_id, *left, outer)?;
+                let right = self.execute_query_plan_with_outer(transaction_id, *right, outer)?;
+                if left.columns.len() != right.columns.len() {
+                    return Err(DbError::plan("compound query output width mismatch"));
+                }
+
+                let mut rows = left.rows;
+                rows.extend(right.rows);
+                if !all {
+                    rows = Self::deduplicate_rows(rows);
+                }
+
+                self.sort_and_limit_rows(
+                    RowSet {
+                        columns: left.columns,
+                        rows,
+                    },
+                    &order_by,
+                    limit,
+                )
+            }
             Plan::NestedLoopJoin {
-                table,
-                table_alias,
+                source,
                 joins,
                 columns,
                 filter,
@@ -647,8 +673,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             } => {
                 let source = self.execute_join_plan(
                     transaction_id,
-                    &table,
-                    table_alias.as_deref(),
+                    *source,
                     &joins,
                     filter.as_ref(),
                     outer,
@@ -676,8 +701,57 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     },
                 )
             }
+            Plan::DerivedSource {
+                source,
+                alias,
+                output_columns,
+                columns,
+                filter,
+                order_by,
+                limit,
+                distinct,
+            } => {
+                let mut source =
+                    self.execute_query_plan_with_outer(transaction_id, *source, outer)?;
+                if source.columns.len() != output_columns.len() {
+                    return Err(DbError::plan("derived source output width mismatch"));
+                }
+
+                source.columns = output_columns
+                    .iter()
+                    .map(|name| ColumnMeta {
+                        table: Some(alias.clone()),
+                        alias: Some(alias.clone()),
+                        name: name.clone(),
+                        output_name: name.clone(),
+                    })
+                    .collect();
+
+                if let Some(filter) = filter.as_ref() {
+                    let rows = source
+                        .rows
+                        .iter()
+                        .filter_map(|row| {
+                            match self.matches_filter(
+                                transaction_id,
+                                &source,
+                                row,
+                                Some(filter),
+                                outer,
+                            ) {
+                                Ok(true) => Some(Ok(row.clone())),
+                                Ok(false) => None,
+                                Err(error) => Some(Err(error)),
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    source.rows = rows;
+                }
+
+                self.finish_projection(transaction_id, source, &columns, &order_by, limit, distinct)
+            }
             Plan::ExplainQueryPlan { plan } => Ok(self.explain_query_plan(&plan)),
-            Plan::BeginTxn | Plan::CommitTxn | Plan::RollbackTxn => Err(DbError::txn(
+            Plan::BeginTxn { .. } | Plan::CommitTxn | Plan::RollbackTxn => Err(DbError::txn(
                 "transaction control plan reached data execution path",
             )),
             other => Err(DbError::plan(format!("unexpected query plan: {other:?}"))),
@@ -753,14 +827,39 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     ]);
                 }
             }
-            Plan::NestedLoopJoin { table, joins, .. } => rows.push(vec![
+            Plan::Union {
+                left, right, all, ..
+            } => {
+                rows.push(vec![
+                    Value::from(format!("{indent}Union")),
+                    Value::from(format!("all={all}")),
+                ]);
+                Self::collect_plan_rows(left, depth + 1, rows);
+                Self::collect_plan_rows(right, depth + 1, rows);
+            }
+            Plan::NestedLoopJoin { joins, .. } => rows.push(vec![
                 Value::from(format!("{indent}NestedLoopJoin")),
-                Value::from(format!("table={table} joins={}", joins.len())),
+                Value::from(format!("joins={}", joins.len())),
             ]),
             Plan::Aggregate { source, .. } => {
                 rows.push(vec![
                     Value::from(format!("{indent}Aggregate")),
                     Value::from("grouped"),
+                ]);
+                Self::collect_plan_rows(source, depth + 1, rows);
+            }
+            Plan::DerivedSource {
+                alias,
+                source,
+                output_columns,
+                ..
+            } => {
+                rows.push(vec![
+                    Value::from(format!("{indent}DerivedSource")),
+                    Value::from(format!(
+                        "alias={alias} output_columns={}",
+                        output_columns.join(",")
+                    )),
                 ]);
                 Self::collect_plan_rows(source, depth + 1, rows);
             }
@@ -785,10 +884,12 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             Plan::SeqScan { .. } => "SeqScan",
             Plan::IndexScan { .. } => "IndexScan",
             Plan::IndexUnion { .. } => "IndexUnion",
+            Plan::Union { .. } => "Union",
             Plan::NestedLoopJoin { .. } => "NestedLoopJoin",
             Plan::Aggregate { .. } => "Aggregate",
+            Plan::DerivedSource { .. } => "DerivedSource",
             Plan::ExplainQueryPlan { .. } => "ExplainQueryPlan",
-            Plan::BeginTxn => "BeginTxn",
+            Plan::BeginTxn { .. } => "BeginTxn",
             Plan::CommitTxn => "CommitTxn",
             Plan::RollbackTxn => "RollbackTxn",
         }
@@ -900,23 +1001,16 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     fn execute_join_plan(
         &self,
         transaction_id: TransactionId,
-        table: &str,
-        table_alias: Option<&str>,
+        source: Plan,
         joins: &[JoinPlan],
         filter: Option<&Expr>,
         outer: Option<(&RowSet, &Row)>,
     ) -> Result<RowSet> {
-        let mut current =
-            self.scan_table_rowset(transaction_id, table, table_alias, None, outer)?;
+        let mut current = self.execute_query_plan_with_outer(transaction_id, source, outer)?;
 
         for join in joins {
-            let right = self.scan_table_rowset(
-                transaction_id,
-                &join.table,
-                join.table_alias.as_deref(),
-                None,
-                outer,
-            )?;
+            let right =
+                self.execute_query_plan_with_outer(transaction_id, (*join.source).clone(), outer)?;
             let joined_columns = current
                 .columns
                 .iter()
@@ -1989,15 +2083,24 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
 
     fn resolve_column_index(&self, columns: &[ColumnMeta], column: &str) -> Result<usize> {
         if let Some((prefix, suffix)) = column.split_once('.') {
-            return columns
+            let matches = columns
                 .iter()
-                .position(|entry| {
-                    entry.name == suffix
-                        && (entry.table.as_deref() == Some(prefix)
-                            || entry.alias.as_deref() == Some(prefix)
-                            || entry.output_name == column)
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.output_name == column
+                        || (entry.name == suffix
+                            && (entry.table.as_deref() == Some(prefix)
+                                || entry.alias.as_deref() == Some(prefix)))
                 })
-                .ok_or_else(|| DbError::plan(format!("unknown column {column}")));
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            return match matches.as_slice() {
+                [] => Err(DbError::plan(format!("unknown column {column}"))),
+                [index] => Ok(*index),
+                _ => Err(DbError::plan(format!(
+                    "ambiguous column reference: {column}"
+                ))),
+            };
         }
 
         let matches = columns

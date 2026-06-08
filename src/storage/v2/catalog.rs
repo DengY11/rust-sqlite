@@ -8,7 +8,7 @@ use crate::common::types::{IndexMeta, RowId, Schema};
 use super::page::{PageId, PageKind, decode_payload, encode_payload_page};
 use super::pager::Pager;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogState {
     pub schemas: BTreeMap<String, Schema>,
     pub table_roots: BTreeMap<String, PageId>,

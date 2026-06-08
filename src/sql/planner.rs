@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use crate::common::error::{DbError, Result};
-use crate::common::types::{IndexMeta, Schema, Value};
+use crate::common::types::{ColumnDef, ColumnType, IndexMeta, Schema, Value};
 use crate::sql::ast::{
-    AggregateArg, AggregateFunc, AlterTableAction, Assignment, Expr, OrderBy, OrderByExpr,
-    ScalarExpr, SelectItem, SelectStatement, Statement,
+    AggregateArg, AggregateFunc, AlterTableAction, Assignment, CompoundOperator, Expr, FromItem,
+    IsolationLevel, OrderBy, OrderByExpr, ScalarExpr, SelectItem, SelectStatement, Statement,
 };
 use crate::sql::plan::{JoinPlan, Plan};
 
@@ -23,6 +23,19 @@ struct SingleTablePlanInput<'a> {
     limit: Option<usize>,
     distinct: bool,
 }
+
+struct DerivedSourcePlanInput<'a> {
+    alias: &'a str,
+    source: Plan,
+    output_columns: Vec<String>,
+    columns: &'a [SelectItem],
+    filter: &'a Option<Expr>,
+    order_by: &'a [OrderBy],
+    limit: Option<usize>,
+    distinct: bool,
+}
+
+type CteRegistry = HashMap<String, SelectStatement>;
 
 impl PlanningContext {
     #[must_use]
@@ -130,7 +143,9 @@ impl Planner {
             Statement::ExplainQueryPlan(statement) => Ok(Plan::ExplainQueryPlan {
                 plan: Box::new(self.plan_statement(statement, context)?),
             }),
-            Statement::Begin => Ok(Plan::BeginTxn),
+            Statement::Begin { isolation_level } => Ok(Plan::BeginTxn {
+                isolation_level: isolation_level.unwrap_or(IsolationLevel::ReadCommitted),
+            }),
             Statement::Commit => Ok(Plan::CommitTxn),
             Statement::Rollback => Ok(Plan::RollbackTxn),
         }
@@ -268,7 +283,140 @@ impl Planner {
     }
 
     fn plan_select(&self, select: &SelectStatement, context: &PlanningContext) -> Result<Plan> {
-        self.plan_select_with_outer(select, context, None)
+        let lowered = self.lower_top_level_ctes(select)?;
+        self.plan_select_with_outer(&lowered, context, None)
+    }
+
+    fn lower_top_level_ctes(&self, select: &SelectStatement) -> Result<SelectStatement> {
+        let mut ctes = CteRegistry::new();
+        if let Some(with) = &select.with {
+            for cte in &with.ctes {
+                if ctes.contains_key(&cte.name) {
+                    return Err(DbError::plan(format!("duplicate CTE name: {}", cte.name)));
+                }
+                let lowered = self.lower_cte_references(cte.query.as_ref(), &ctes)?;
+                ctes.insert(cte.name.clone(), lowered);
+            }
+        }
+
+        let mut lowered = self.lower_cte_references(select, &ctes)?;
+        lowered.with = None;
+        Ok(lowered)
+    }
+
+    fn lower_cte_references(
+        &self,
+        select: &SelectStatement,
+        ctes: &CteRegistry,
+    ) -> Result<SelectStatement> {
+        Ok(SelectStatement {
+            with: None,
+            distinct: select.distinct,
+            columns: select.columns.clone(),
+            from: self.lower_cte_from_item(&select.from, ctes)?,
+            joins: select
+                .joins
+                .iter()
+                .map(|join| {
+                    Ok(crate::sql::ast::JoinClause {
+                        kind: join.kind,
+                        source: self.lower_cte_from_item(&join.source, ctes)?,
+                        on: self.lower_cte_expr(&join.on, ctes)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            filter: select
+                .filter
+                .as_ref()
+                .map(|expr| self.lower_cte_expr(expr, ctes))
+                .transpose()?,
+            group_by: select.group_by.clone(),
+            having: select
+                .having
+                .as_ref()
+                .map(|expr| self.lower_cte_expr(expr, ctes))
+                .transpose()?,
+            compounds: select
+                .compounds
+                .iter()
+                .map(|compound| {
+                    Ok(crate::sql::ast::CompoundSelect {
+                        operator: compound.operator,
+                        select: Box::new(
+                            self.lower_cte_references(compound.select.as_ref(), ctes)?,
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            order_by: select.order_by.clone(),
+            limit: select.limit,
+        })
+    }
+
+    fn lower_cte_from_item(&self, from: &FromItem, ctes: &CteRegistry) -> Result<FromItem> {
+        match from {
+            FromItem::Table { name, alias } => {
+                if let Some(query) = ctes.get(name) {
+                    Ok(FromItem::Subquery {
+                        query: Box::new(query.clone()),
+                        alias: alias.clone().unwrap_or_else(|| name.clone()),
+                    })
+                } else {
+                    Ok(from.clone())
+                }
+            }
+            FromItem::Subquery { query, alias } => Ok(FromItem::Subquery {
+                query: Box::new(self.lower_cte_references(query, ctes)?),
+                alias: alias.clone(),
+            }),
+        }
+    }
+
+    fn lower_cte_expr(&self, expr: &Expr, ctes: &CteRegistry) -> Result<Expr> {
+        match expr {
+            Expr::InSubquery {
+                column,
+                query,
+                negated,
+            } => Ok(Expr::InSubquery {
+                column: column.clone(),
+                query: Box::new(self.lower_cte_references(query, ctes)?),
+                negated: *negated,
+            }),
+            Expr::InSubqueryScalar {
+                expr,
+                query,
+                negated,
+            } => Ok(Expr::InSubqueryScalar {
+                expr: expr.clone(),
+                query: Box::new(self.lower_cte_references(query, ctes)?),
+                negated: *negated,
+            }),
+            Expr::CompareSubquery { column, op, query } => Ok(Expr::CompareSubquery {
+                column: column.clone(),
+                op: *op,
+                query: Box::new(self.lower_cte_references(query, ctes)?),
+            }),
+            Expr::CompareSubqueryScalar { left, op, query } => Ok(Expr::CompareSubqueryScalar {
+                left: left.clone(),
+                op: *op,
+                query: Box::new(self.lower_cte_references(query, ctes)?),
+            }),
+            Expr::ExistsSubquery { query, negated } => Ok(Expr::ExistsSubquery {
+                query: Box::new(self.lower_cte_references(query, ctes)?),
+                negated: *negated,
+            }),
+            Expr::Not(inner) => Ok(Expr::Not(Box::new(self.lower_cte_expr(inner, ctes)?))),
+            Expr::And(left, right) => Ok(Expr::And(
+                Box::new(self.lower_cte_expr(left, ctes)?),
+                Box::new(self.lower_cte_expr(right, ctes)?),
+            )),
+            Expr::Or(left, right) => Ok(Expr::Or(
+                Box::new(self.lower_cte_expr(left, ctes)?),
+                Box::new(self.lower_cte_expr(right, ctes)?),
+            )),
+            _ => Ok(expr.clone()),
+        }
     }
 
     fn plan_select_with_outer(
@@ -277,45 +425,126 @@ impl Planner {
         context: &PlanningContext,
         outer_scope: Option<&QueryScope>,
     ) -> Result<Plan> {
+        if !select.compounds.is_empty() {
+            return self.plan_compound_select(select, context, outer_scope);
+        }
+
         let has_aggregates = self.select_has_aggregates(&select.columns);
 
-        if !select.joins.is_empty() {
-            let source = self.plan_join_source(select, context, outer_scope)?;
-            if has_aggregates || !select.group_by.is_empty() {
-                self.validate_aggregate_projection(select, context)?;
-                let rewritten_having = select.having.as_ref().map(|expr| {
-                    self.rewrite_aggregate_expr_group_references(expr, &select.group_by)
-                });
-                let rewritten_order_by = select
+        if has_aggregates || !select.group_by.is_empty() {
+            self.validate_aggregate_projection(select, context)?;
+
+            if self.select_is_simple_base_table_source(select) {
+                let (table, table_alias) = select
+                    .base_table()
+                    .ok_or_else(|| DbError::plan("subquery sources are not supported yet"))?;
+                let schema = self.require_schema(context, table)?;
+                let columns = self.normalize_aggregate_select_items(
+                    table,
+                    table_alias,
+                    &select.columns,
+                    context,
+                )?;
+                let group_by =
+                    self.normalize_group_by(table, table_alias, &select.group_by, context)?;
+                let having = select
+                    .having
+                    .as_ref()
+                    .map(|expr| {
+                        self.normalize_aggregate_expr(
+                            schema,
+                            table,
+                            table_alias,
+                            &columns,
+                            &group_by,
+                            expr,
+                        )
+                        .map(|expr| self.rewrite_aggregate_expr_group_references(&expr, &group_by))
+                    })
+                    .transpose()?;
+                let order_by = select
                     .order_by
                     .iter()
                     .map(|item| {
-                        self.rewrite_aggregate_order_by_group_references(item, &select.group_by)
+                        self.normalize_aggregate_order_by(
+                            schema,
+                            table,
+                            table_alias,
+                            &columns,
+                            &group_by,
+                            item,
+                        )
+                        .map(|item| {
+                            self.rewrite_aggregate_order_by_group_references(&item, &group_by)
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
+                let source = self.plan_single_table_source(
+                    SingleTablePlanInput {
+                        table,
+                        table_alias,
+                        columns: &[SelectItem::Wildcard],
+                        filter: &select.filter,
+                        order_by: &[],
+                        limit: None,
+                        distinct: false,
+                    },
+                    context,
+                    outer_scope,
+                )?;
                 return Ok(Plan::Aggregate {
                     source: Box::new(source),
-                    columns: select.columns.clone(),
-                    group_by: select.group_by.clone(),
-                    having: rewritten_having,
-                    order_by: rewritten_order_by,
+                    columns,
+                    group_by,
+                    having,
+                    order_by,
                     limit: select.limit,
                 });
             }
 
+            let source = self.plan_aggregate_source(select, context, outer_scope)?;
+            let rewritten_having = select
+                .having
+                .as_ref()
+                .map(|expr| self.rewrite_aggregate_expr_group_references(expr, &select.group_by));
+            let rewritten_order_by = select
+                .order_by
+                .iter()
+                .map(|item| {
+                    self.rewrite_aggregate_order_by_group_references(item, &select.group_by)
+                })
+                .collect();
+            return Ok(Plan::Aggregate {
+                source: Box::new(source),
+                columns: select.columns.clone(),
+                group_by: select.group_by.clone(),
+                having: rewritten_having,
+                order_by: rewritten_order_by,
+                limit: select.limit,
+            });
+        }
+
+        if !select.joins.is_empty() {
+            let scope = self.build_scope(select, context)?;
+            for item in &select.columns {
+                self.require_join_select_item(&scope, item)?;
+            }
+            if let Some(filter) = &select.filter {
+                self.require_scope_columns_with_outer(&scope, outer_scope, filter)?;
+                self.validate_subqueries(filter, context, &scope)?;
+            }
+            for (index, join) in select.joins.iter().enumerate() {
+                let join_scope = self.build_join_scope(select, context, index)?;
+                self.require_scope_columns_with_outer(&join_scope, outer_scope, &join.on)?;
+                self.validate_subqueries(&join.on, context, &join_scope)?;
+            }
+            for item in &select.order_by {
+                self.require_order_by_scope(&scope, &select.columns, item)?;
+            }
+
             return Ok(Plan::NestedLoopJoin {
-                table: select.table.clone(),
-                table_alias: select.table_alias.clone(),
-                joins: select
-                    .joins
-                    .iter()
-                    .map(|join| JoinPlan {
-                        kind: join.kind,
-                        table: join.table.clone(),
-                        table_alias: join.table_alias.clone(),
-                        on: join.on.clone(),
-                    })
-                    .collect(),
+                source: Box::new(self.plan_source_item(&select.from, context, outer_scope)?),
+                joins: self.plan_join_clauses(&select.joins, context, outer_scope)?,
                 columns: select.columns.clone(),
                 filter: select.filter.clone(),
                 order_by: select.order_by.clone(),
@@ -324,78 +553,44 @@ impl Planner {
             });
         }
 
-        if has_aggregates || !select.group_by.is_empty() {
-            self.validate_aggregate_projection(select, context)?;
-            let schema = self.require_schema(context, &select.table)?;
-            let columns = self.normalize_aggregate_select_items(
-                &select.table,
-                select.table_alias.as_deref(),
-                &select.columns,
-                context,
-            )?;
-            let group_by = self.normalize_group_by(
-                &select.table,
-                select.table_alias.as_deref(),
-                &select.group_by,
-                context,
-            )?;
-            let having = select
-                .having
-                .as_ref()
-                .map(|expr| {
-                    self.normalize_aggregate_expr(
-                        schema,
-                        &select.table,
-                        select.table_alias.as_deref(),
-                        &columns,
-                        &group_by,
-                        expr,
-                    )
-                    .map(|expr| self.rewrite_aggregate_expr_group_references(&expr, &group_by))
-                })
-                .transpose()?;
-            let order_by = select
-                .order_by
-                .iter()
-                .map(|item| {
-                    self.normalize_aggregate_order_by(
-                        schema,
-                        &select.table,
-                        select.table_alias.as_deref(),
-                        &columns,
-                        &group_by,
-                        item,
-                    )
-                    .map(|item| self.rewrite_aggregate_order_by_group_references(&item, &group_by))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let source = self.plan_single_table_source(
-                SingleTablePlanInput {
-                    table: &select.table,
-                    table_alias: select.table_alias.as_deref(),
-                    columns: &[SelectItem::Wildcard],
-                    filter: &select.filter,
-                    order_by: &[],
-                    limit: None,
-                    distinct: false,
-                },
-                context,
-                outer_scope,
-            )?;
-            return Ok(Plan::Aggregate {
-                source: Box::new(source),
-                columns,
-                group_by,
-                having,
-                order_by,
+        if let FromItem::Subquery { query, alias } = &select.from {
+            let source = self.plan_select_with_outer(query, context, outer_scope)?;
+            let output_columns = self.derived_output_columns(query, context)?;
+            let derived_scope = self.build_derived_scope(alias, &output_columns);
+
+            for item in &select.columns {
+                self.require_join_select_item(&derived_scope, item)?;
+            }
+
+            if let Some(filter) = &select.filter {
+                self.require_scope_columns_with_outer(&derived_scope, outer_scope, filter)?;
+                self.validate_subqueries(filter, context, &derived_scope)?;
+            }
+
+            for item in &select.order_by {
+                self.require_order_by_scope(&derived_scope, &select.columns, item)?;
+            }
+
+            return self.plan_derived_source(DerivedSourcePlanInput {
+                alias,
+                source,
+                output_columns,
+                columns: &select.columns,
+                filter: &select.filter,
+                order_by: &select.order_by,
                 limit: select.limit,
+                distinct: select.distinct,
             });
         }
 
+        let (table, table_alias) = select
+            .base_table()
+            .ok_or_else(|| DbError::plan("subquery sources are not supported yet"))?;
+
         self.plan_single_table_source(
             SingleTablePlanInput {
-                table: &select.table,
-                table_alias: select.table_alias.as_deref(),
+                table,
+                table_alias,
                 columns: &select.columns,
                 filter: &select.filter,
                 order_by: &select.order_by,
@@ -405,6 +600,109 @@ impl Planner {
             context,
             outer_scope,
         )
+    }
+
+    fn plan_compound_select(
+        &self,
+        select: &SelectStatement,
+        context: &PlanningContext,
+        outer_scope: Option<&QueryScope>,
+    ) -> Result<Plan> {
+        let output_columns = self.derived_output_columns(select, context)?;
+        let expected_width = output_columns.len();
+        let compound_scope = self.build_derived_scope("__compound__", &output_columns);
+
+        for item in &select.order_by {
+            self.require_order_by_scope(&compound_scope, &select.columns, item)?;
+        }
+
+        let mut left_branch = select.clone();
+        left_branch.compounds.clear();
+        left_branch.order_by.clear();
+        left_branch.limit = None;
+        let mut plan = self.plan_select_with_outer(&left_branch, context, outer_scope)?;
+
+        for (index, compound) in select.compounds.iter().enumerate() {
+            let rhs_width = self
+                .derived_output_columns(compound.select.as_ref(), context)?
+                .len();
+            if rhs_width != expected_width {
+                return Err(DbError::plan(
+                    "UNION branches must return the same number of columns",
+                ));
+            }
+
+            let is_last = index + 1 == select.compounds.len();
+            plan = Plan::Union {
+                left: Box::new(plan),
+                right: Box::new(self.plan_select_with_outer(
+                    compound.select.as_ref(),
+                    context,
+                    outer_scope,
+                )?),
+                all: matches!(compound.operator, CompoundOperator::UnionAll),
+                order_by: if is_last {
+                    select.order_by.clone()
+                } else {
+                    vec![]
+                },
+                limit: if is_last { select.limit } else { None },
+            };
+        }
+
+        Ok(plan)
+    }
+
+    fn plan_aggregate_source(
+        &self,
+        select: &SelectStatement,
+        context: &PlanningContext,
+        outer_scope: Option<&QueryScope>,
+    ) -> Result<Plan> {
+        if !select.joins.is_empty() {
+            return self.plan_join_source(select, context, outer_scope);
+        }
+
+        match &select.from {
+            FromItem::Table { name, alias } => self.plan_single_table_source(
+                SingleTablePlanInput {
+                    table: name,
+                    table_alias: alias.as_deref(),
+                    columns: &[SelectItem::Wildcard],
+                    filter: &select.filter,
+                    order_by: &[],
+                    limit: None,
+                    distinct: false,
+                },
+                context,
+                outer_scope,
+            ),
+            FromItem::Subquery { query, alias } => {
+                let source = self.plan_select_with_outer(query, context, outer_scope)?;
+                let output_columns = self.derived_output_columns(query, context)?;
+                let derived_scope = self.build_derived_scope(alias, &output_columns);
+
+                if let Some(filter) = &select.filter {
+                    self.require_scope_columns_with_outer(&derived_scope, outer_scope, filter)?;
+                    self.validate_subqueries(filter, context, &derived_scope)?;
+                }
+
+                self.plan_derived_source(DerivedSourcePlanInput {
+                    alias,
+                    source,
+                    output_columns,
+                    columns: &[SelectItem::Wildcard],
+                    filter: &select.filter,
+                    order_by: &[],
+                    limit: None,
+                    distinct: false,
+                })
+            }
+        }
+    }
+
+    fn select_is_simple_base_table_source(&self, select: &SelectStatement) -> bool {
+        select.joins.is_empty() && matches!(select.from, FromItem::Table { .. })
     }
 
     fn plan_single_table_source(
@@ -462,13 +760,36 @@ impl Planner {
         })
     }
 
+    fn plan_derived_source(&self, input: DerivedSourcePlanInput<'_>) -> Result<Plan> {
+        let DerivedSourcePlanInput {
+            alias,
+            source,
+            output_columns,
+            columns,
+            filter,
+            order_by,
+            limit,
+            distinct,
+        } = input;
+
+        Ok(Plan::DerivedSource {
+            source: Box::new(source),
+            alias: alias.to_string(),
+            output_columns,
+            columns: columns.to_vec(),
+            filter: filter.clone(),
+            order_by: order_by.to_vec(),
+            limit,
+            distinct,
+        })
+    }
+
     fn plan_join_source(
         &self,
         select: &SelectStatement,
         context: &PlanningContext,
         outer_scope: Option<&QueryScope>,
     ) -> Result<Plan> {
-        self.require_schema(context, &select.table)?;
         let scope = self.build_scope(select, context)?;
 
         for item in &select.columns {
@@ -479,7 +800,6 @@ impl Planner {
             self.validate_subqueries(filter, context, &scope)?;
         }
         for (index, join) in select.joins.iter().enumerate() {
-            self.require_schema(context, &join.table)?;
             let join_scope = self.build_join_scope(select, context, index)?;
             self.require_scope_columns_with_outer(&join_scope, outer_scope, &join.on)?;
             self.validate_subqueries(&join.on, context, &join_scope)?;
@@ -489,18 +809,8 @@ impl Planner {
         }
 
         Ok(Plan::NestedLoopJoin {
-            table: select.table.clone(),
-            table_alias: select.table_alias.clone(),
-            joins: select
-                .joins
-                .iter()
-                .map(|join| JoinPlan {
-                    kind: join.kind,
-                    table: join.table.clone(),
-                    table_alias: join.table_alias.clone(),
-                    on: join.on.clone(),
-                })
-                .collect(),
+            source: Box::new(self.plan_source_item(&select.from, context, outer_scope)?),
+            joins: self.plan_join_clauses(&select.joins, context, outer_scope)?,
             columns: vec![SelectItem::Wildcard],
             filter: select.filter.clone(),
             order_by: vec![],
@@ -1329,49 +1639,7 @@ impl Planner {
         select: &SelectStatement,
         context: &PlanningContext,
     ) -> Result<()> {
-        let schema = self.require_schema(context, &select.table)?;
-        let normalized_columns = self.normalize_aggregate_select_items(
-            &select.table,
-            select.table_alias.as_deref(),
-            &select.columns,
-            context,
-        )?;
-        let normalized_group_by = self.normalize_group_by(
-            &select.table,
-            select.table_alias.as_deref(),
-            &select.group_by,
-            context,
-        )?;
-        let normalized_having = select
-            .having
-            .as_ref()
-            .map(|expr| {
-                self.normalize_aggregate_expr(
-                    schema,
-                    &select.table,
-                    select.table_alias.as_deref(),
-                    &normalized_columns,
-                    &normalized_group_by,
-                    expr,
-                )
-            })
-            .transpose()?;
-        let normalized_order_by = select
-            .order_by
-            .iter()
-            .map(|item| {
-                self.normalize_aggregate_order_by(
-                    schema,
-                    &select.table,
-                    select.table_alias.as_deref(),
-                    &normalized_columns,
-                    &normalized_group_by,
-                    item,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        if !select.joins.is_empty() {
+        if !select.joins.is_empty() || matches!(select.from, FromItem::Subquery { .. }) {
             let scope = self.build_scope(select, context)?;
             for expr in &select.group_by {
                 self.require_scalar_expr_scope(&scope, expr)?;
@@ -1391,6 +1659,43 @@ impl Planner {
             }
             return Ok(());
         }
+
+        let (table, table_alias) = select
+            .base_table()
+            .ok_or_else(|| DbError::plan("subquery sources are not supported yet"))?;
+        let schema = self.require_schema(context, table)?;
+        let normalized_columns =
+            self.normalize_aggregate_select_items(table, table_alias, &select.columns, context)?;
+        let normalized_group_by =
+            self.normalize_group_by(table, table_alias, &select.group_by, context)?;
+        let normalized_having = select
+            .having
+            .as_ref()
+            .map(|expr| {
+                self.normalize_aggregate_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    &normalized_columns,
+                    &normalized_group_by,
+                    expr,
+                )
+            })
+            .transpose()?;
+        let normalized_order_by = select
+            .order_by
+            .iter()
+            .map(|item| {
+                self.normalize_aggregate_order_by(
+                    schema,
+                    table,
+                    table_alias,
+                    &normalized_columns,
+                    &normalized_group_by,
+                    item,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         for item in &normalized_columns {
             self.require_select_item_columns(schema, item)?;
@@ -1486,19 +1791,21 @@ impl Planner {
         context: &PlanningContext,
     ) -> Result<QueryScope> {
         let mut bindings = Vec::with_capacity(select.joins.len() + 1);
-        bindings.push(TableBinding {
-            table: select.table.clone(),
-            alias: select.table_alias.clone(),
-            schema: self.require_schema(context, &select.table)?.clone(),
-        });
+        bindings.push(self.binding_from_from_item(&select.from, context)?);
         for join in &select.joins {
-            bindings.push(TableBinding {
-                table: join.table.clone(),
-                alias: join.table_alias.clone(),
-                schema: self.require_schema(context, &join.table)?.clone(),
-            });
+            bindings.push(self.binding_from_from_item(&join.source, context)?);
         }
         Ok(QueryScope { bindings })
+    }
+
+    fn build_derived_scope(&self, alias: &str, columns: &[String]) -> QueryScope {
+        QueryScope {
+            bindings: vec![TableBinding {
+                table: alias.to_string(),
+                alias: Some(alias.to_string()),
+                schema: Schema::new(alias, self.derived_output_schema(columns)),
+            }],
+        }
     }
 
     fn build_join_scope(
@@ -1508,19 +1815,33 @@ impl Planner {
         join_index: usize,
     ) -> Result<QueryScope> {
         let mut bindings = Vec::with_capacity(join_index + 2);
-        bindings.push(TableBinding {
-            table: select.table.clone(),
-            alias: select.table_alias.clone(),
-            schema: self.require_schema(context, &select.table)?.clone(),
-        });
+        bindings.push(self.binding_from_from_item(&select.from, context)?);
         for join in select.joins.iter().take(join_index + 1) {
-            bindings.push(TableBinding {
-                table: join.table.clone(),
-                alias: join.table_alias.clone(),
-                schema: self.require_schema(context, &join.table)?.clone(),
-            });
+            bindings.push(self.binding_from_from_item(&join.source, context)?);
         }
         Ok(QueryScope { bindings })
+    }
+
+    fn binding_from_from_item(
+        &self,
+        from: &FromItem,
+        context: &PlanningContext,
+    ) -> Result<TableBinding> {
+        match from {
+            FromItem::Table { name, alias } => Ok(TableBinding {
+                table: name.clone(),
+                alias: alias.clone(),
+                schema: self.require_schema(context, name)?.clone(),
+            }),
+            FromItem::Subquery { query, alias } => Ok(TableBinding {
+                table: alias.clone(),
+                alias: Some(alias.clone()),
+                schema: Schema::new(
+                    alias,
+                    self.derived_output_schema(&self.derived_output_columns(query, context)?),
+                ),
+            }),
+        }
     }
 
     fn build_single_table_scope(
@@ -1536,6 +1857,154 @@ impl Planner {
                 schema: self.require_schema(context, table)?.clone(),
             }],
         })
+    }
+
+    fn derived_output_schema(&self, columns: &[String]) -> Vec<ColumnDef> {
+        columns
+            .iter()
+            .cloned()
+            .map(|name| ColumnDef::new(name, ColumnType::Text))
+            .collect()
+    }
+
+    fn derived_output_columns(
+        &self,
+        select: &SelectStatement,
+        context: &PlanningContext,
+    ) -> Result<Vec<String>> {
+        let wildcard_columns = select
+            .columns
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard))
+            .then(|| self.visible_source_output_columns(select, context))
+            .transpose()?;
+
+        let mut output_columns = Vec::new();
+        for item in &select.columns {
+            match item {
+                SelectItem::Wildcard => output_columns.extend(
+                    wildcard_columns
+                        .as_ref()
+                        .expect("wildcard output columns must be precomputed")
+                        .iter()
+                        .cloned(),
+                ),
+                _ => output_columns.push(
+                    self.select_item_output_name(item)
+                        .expect("non-wildcard select items must expose an output name"),
+                ),
+            }
+        }
+
+        Ok(output_columns)
+    }
+
+    fn visible_source_output_columns(
+        &self,
+        select: &SelectStatement,
+        context: &PlanningContext,
+    ) -> Result<Vec<String>> {
+        let mut columns = self.visible_from_item_output_columns(&select.from, context)?;
+        for join in &select.joins {
+            columns.extend(self.visible_from_item_output_columns(&join.source, context)?);
+        }
+        Ok(columns)
+    }
+
+    fn visible_from_item_output_columns(
+        &self,
+        from: &FromItem,
+        context: &PlanningContext,
+    ) -> Result<Vec<String>> {
+        match from {
+            FromItem::Table { name, .. } => Ok(self
+                .require_schema(context, name)?
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()),
+            FromItem::Subquery { query, .. } => self.derived_output_columns(query, context),
+        }
+    }
+
+    fn plan_source_item(
+        &self,
+        from: &FromItem,
+        context: &PlanningContext,
+        outer_scope: Option<&QueryScope>,
+    ) -> Result<Plan> {
+        let wildcard = [SelectItem::Wildcard];
+        let no_filter = None;
+        match from {
+            FromItem::Table { name, alias } => self.plan_single_table_source(
+                SingleTablePlanInput {
+                    table: name,
+                    table_alias: alias.as_deref(),
+                    columns: &wildcard,
+                    filter: &no_filter,
+                    order_by: &[],
+                    limit: None,
+                    distinct: false,
+                },
+                context,
+                outer_scope,
+            ),
+            FromItem::Subquery { query, alias } => {
+                let source = self.plan_select_with_outer(query, context, outer_scope)?;
+                let output_columns = self.derived_output_columns(query, context)?;
+                self.plan_derived_source(DerivedSourcePlanInput {
+                    alias,
+                    source,
+                    output_columns,
+                    columns: &wildcard,
+                    filter: &no_filter,
+                    order_by: &[],
+                    limit: None,
+                    distinct: false,
+                })
+            }
+        }
+    }
+
+    fn plan_join_clauses(
+        &self,
+        joins: &[crate::sql::ast::JoinClause],
+        context: &PlanningContext,
+        outer_scope: Option<&QueryScope>,
+    ) -> Result<Vec<JoinPlan>> {
+        joins
+            .iter()
+            .map(|join| {
+                Ok(JoinPlan {
+                    kind: join.kind,
+                    source: Box::new(self.plan_source_item(&join.source, context, outer_scope)?),
+                    on: join.on.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn select_item_output_name(&self, item: &SelectItem) -> Option<String> {
+        match item {
+            SelectItem::Wildcard => None,
+            SelectItem::Column(name) => Some(
+                name.rsplit('.')
+                    .next()
+                    .expect("column names should never be empty")
+                    .to_string(),
+            ),
+            SelectItem::AliasedColumn { alias, .. } => Some(alias.clone()),
+            SelectItem::Expr { expr, alias } => Some(
+                alias
+                    .clone()
+                    .unwrap_or_else(|| self.scalar_expr_display(expr)),
+            ),
+            SelectItem::Aggregate { func, arg, alias } => Some(
+                alias
+                    .clone()
+                    .unwrap_or_else(|| self.aggregate_output_name(*func, arg)),
+            ),
+        }
     }
 
     fn require_join_select_item(&self, scope: &QueryScope, item: &SelectItem) -> Result<()> {
@@ -2070,7 +2539,7 @@ impl Planner {
     ) -> Result<(String, String)> {
         match self.resolve_column_in_scope(scope, column) {
             Ok(resolved) => Ok(resolved),
-            Err(_) => {
+            Err(DbError::Plan(message)) if message == format!("unknown column {column}") => {
                 if let Some(outer_scope) = outer_scope {
                     self.resolve_column_in_scope(outer_scope, column)
                 } else if self.allow_unresolved_outer_refs && column.contains('.') {
@@ -2079,6 +2548,7 @@ impl Planner {
                     Err(DbError::plan(format!("unknown column {column}")))
                 }
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -2115,36 +2585,56 @@ impl Planner {
         column: &str,
     ) -> Result<(String, String)> {
         if let Some((prefix, suffix)) = column.split_once('.') {
+            let mut resolved_table = None;
+            let mut match_count = 0;
             for binding in &scope.bindings {
-                if (binding.table == prefix || binding.alias.as_deref() == Some(prefix))
-                    && binding
-                        .schema
-                        .columns
-                        .iter()
-                        .any(|entry| entry.name == suffix)
-                {
-                    return Ok((binding.table.clone(), suffix.to_string()));
+                if binding.table != prefix && binding.alias.as_deref() != Some(prefix) {
+                    continue;
+                }
+                for entry in &binding.schema.columns {
+                    if entry.name == suffix {
+                        match_count += 1;
+                        if resolved_table.is_none() {
+                            resolved_table = Some(binding.table.clone());
+                        }
+                    }
                 }
             }
-            return Err(DbError::plan(format!("unknown column {column}")));
+            return match match_count {
+                0 => Err(DbError::plan(format!("unknown column {column}"))),
+                1 => Ok((
+                    resolved_table.expect("qualified column match must include a binding table"),
+                    suffix.to_string(),
+                )),
+                _ => Err(DbError::plan(format!(
+                    "ambiguous column reference: {column}"
+                ))),
+            };
         }
 
-        let mut matches = scope.bindings.iter().filter(|binding| {
-            binding
-                .schema
-                .columns
-                .iter()
-                .any(|entry| entry.name == column)
-        });
-        let Some(first) = matches.next() else {
-            return Err(DbError::plan(format!("unknown column {column}")));
-        };
-        if matches.next().is_some() {
-            return Err(DbError::plan(format!(
-                "ambiguous column reference: {column}"
-            )));
+        let mut resolved_table = None;
+        let mut match_count = 0;
+        for binding in &scope.bindings {
+            for entry in &binding.schema.columns {
+                if entry.name == column {
+                    match_count += 1;
+                    if resolved_table.is_none() {
+                        resolved_table = Some(binding.table.clone());
+                    }
+                }
+            }
         }
-        Ok((first.table.clone(), column.to_string()))
+
+        match match_count {
+            0 => Err(DbError::plan(format!("unknown column {column}"))),
+            1 => Ok((
+                resolved_table.expect("unqualified column match must include a binding table"),
+                column.to_string(),
+            )),
+            _ => Err(DbError::plan(format!(
+                "ambiguous column reference: {column}"
+            ))),
+        }
     }
 
     fn require_schema<'a>(&self, context: &'a PlanningContext, table: &str) -> Result<&'a Schema> {

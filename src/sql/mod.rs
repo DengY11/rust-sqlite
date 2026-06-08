@@ -16,6 +16,11 @@ mod tests {
     #[test]
     fn sql_module_reexports_parse_sql() {
         let statements = parse_sql("BEGIN;").unwrap();
-        assert_eq!(statements, vec![Statement::Begin]);
+        assert_eq!(
+            statements,
+            vec![Statement::Begin {
+                isolation_level: None,
+            }]
+        );
     }
 }

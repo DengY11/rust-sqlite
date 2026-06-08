@@ -13,8 +13,10 @@ mod tests {
     #[test]
     fn library_root_exposes_primary_modules() {
         let value = Value::Integer(42);
-        let statement = Statement::Begin;
+        let statement = Statement::Begin {
+            isolation_level: None,
+        };
         assert_eq!(value.to_string(), "42");
-        assert_eq!(format!("{statement:?}"), "Begin");
+        assert!(format!("{statement:?}").contains("Begin"));
     }
 }

@@ -87,6 +87,19 @@ impl OptimizerPass for IndexSelectionPass {
                 order_by,
                 limit,
             }),
+            Plan::Union {
+                left,
+                right,
+                all,
+                order_by,
+                limit,
+            } => Ok(Plan::Union {
+                left: Box::new(self.optimize(*left, context)?),
+                right: Box::new(self.optimize(*right, context)?),
+                all,
+                order_by,
+                limit,
+            }),
             Plan::ExplainQueryPlan { plan } => Ok(Plan::ExplainQueryPlan {
                 plan: Box::new(self.optimize(*plan, context)?),
             }),

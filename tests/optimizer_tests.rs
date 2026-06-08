@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use rustsql::common::types::{ColumnDef, ColumnType, Value};
-use rustsql::sql::ast::{Assignment, CompareOp, Expr, ScalarBinaryOp, ScalarExpr, SelectItem};
+use rustsql::sql::ast::{
+    Assignment, CompareOp, Expr, FromItem, ScalarBinaryOp, ScalarExpr, SelectItem,
+};
 use rustsql::sql::optimizer::Optimizer;
 use rustsql::sql::plan::{IndexBound, IndexRange, IndexScanMode, Plan};
 use rustsql::sql::planner::PlanningContext;
@@ -64,7 +66,9 @@ fn optimizer_accepts_all_top_level_statement_plans() {
             limit: None,
             distinct: false,
         },
-        Plan::BeginTxn,
+        Plan::BeginTxn {
+            isolation_level: rustsql::sql::ast::IsolationLevel::ReadCommitted,
+        },
         Plan::CommitTxn,
         Plan::RollbackTxn,
     ];
@@ -385,11 +389,15 @@ fn optimizer_does_not_rewrite_scalar_in_subquery_filter_to_index_scan() {
                 ],
             },
             query: Box::new(rustsql::sql::ast::SelectStatement {
+                with: None,
                 distinct: false,
                 columns: vec![SelectItem::Column("user_id".to_string())],
-                table: "orders".to_string(),
-                table_alias: Some("o".to_string()),
+                from: FromItem::Table {
+                    name: "orders".to_string(),
+                    alias: Some("o".to_string()),
+                },
                 joins: vec![],
+                compounds: vec![],
                 filter: Some(Expr::CompareColumns {
                     left: "o.user_id".to_string(),
                     op: CompareOp::Eq,
@@ -450,11 +458,15 @@ fn optimizer_does_not_rewrite_scalar_not_in_subquery_filter_to_index_scan() {
                 ],
             },
             query: Box::new(rustsql::sql::ast::SelectStatement {
+                with: None,
                 distinct: false,
                 columns: vec![SelectItem::Column("user_id".to_string())],
-                table: "orders".to_string(),
-                table_alias: Some("o".to_string()),
+                from: FromItem::Table {
+                    name: "orders".to_string(),
+                    alias: Some("o".to_string()),
+                },
                 joins: vec![],
+                compounds: vec![],
                 filter: Some(Expr::CompareColumns {
                     left: "o.user_id".to_string(),
                     op: CompareOp::Eq,
@@ -516,11 +528,15 @@ fn optimizer_does_not_rewrite_scalar_compare_subquery_filter_to_index_scan() {
             },
             op: CompareOp::Eq,
             query: Box::new(rustsql::sql::ast::SelectStatement {
+                with: None,
                 distinct: false,
                 columns: vec![SelectItem::Column("user_id".to_string())],
-                table: "orders".to_string(),
-                table_alias: Some("o".to_string()),
+                from: FromItem::Table {
+                    name: "orders".to_string(),
+                    alias: Some("o".to_string()),
+                },
                 joins: vec![],
+                compounds: vec![],
                 filter: Some(Expr::CompareColumns {
                     left: "o.user_id".to_string(),
                     op: CompareOp::Eq,

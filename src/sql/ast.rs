@@ -1,17 +1,71 @@
 use crate::common::types::{CheckConstraint, ColumnDef, ForeignKey, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FromItem {
+    Table {
+        name: String,
+        alias: Option<String>,
+    },
+    Subquery {
+        query: Box<SelectStatement>,
+        alias: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectStatement {
+    pub with: Option<WithClause>,
     pub distinct: bool,
     pub columns: Vec<SelectItem>,
-    pub table: String,
-    pub table_alias: Option<String>,
+    pub from: FromItem,
     pub joins: Vec<JoinClause>,
     pub filter: Option<Expr>,
     pub group_by: Vec<ScalarExpr>,
     pub having: Option<Expr>,
+    pub compounds: Vec<CompoundSelect>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompoundSelect {
+    pub operator: CompoundOperator,
+    pub select: Box<SelectStatement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompoundOperator {
+    Union,
+    UnionAll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithClause {
+    pub recursive: bool,
+    pub ctes: Vec<CommonTableExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommonTableExpr {
+    pub name: String,
+    pub query: Box<SelectStatement>,
+}
+
+impl SelectStatement {
+    #[must_use]
+    pub fn base_table(&self) -> Option<(&str, Option<&str>)> {
+        match &self.from {
+            FromItem::Table { name, alias } => Some((name.as_str(), alias.as_deref())),
+            FromItem::Subquery { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,8 +77,7 @@ pub enum JoinKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinClause {
     pub kind: JoinKind,
-    pub table: String,
-    pub table_alias: Option<String>,
+    pub source: FromItem,
     pub on: Expr,
 }
 
@@ -76,6 +129,7 @@ pub enum AggregateArg {
     Expr { expr: ScalarExpr, distinct: bool },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     CreateTable {
@@ -117,7 +171,9 @@ pub enum Statement {
     },
     Select(SelectStatement),
     ExplainQueryPlan(Box<Statement>),
-    Begin,
+    Begin {
+        isolation_level: Option<IsolationLevel>,
+    },
     Commit,
     Rollback,
 }
@@ -273,7 +329,8 @@ mod tests {
     use crate::common::types::{ColumnDef, ColumnType, Value};
 
     use super::{
-        AggregateArg, AggregateFunc, CompareOp, Expr, SelectItem, SelectStatement, Statement,
+        AggregateArg, AggregateFunc, CompareOp, Expr, FromItem, SelectItem, SelectStatement,
+        Statement,
     };
 
     #[test]
@@ -347,26 +404,34 @@ mod tests {
         );
         assert_eq!(
             Statement::Select(SelectStatement {
+                with: None,
                 distinct: false,
                 columns: vec![SelectItem::Column("id".to_string())],
-                table: "users".to_string(),
-                table_alias: None,
+                from: FromItem::Table {
+                    name: "users".to_string(),
+                    alias: None,
+                },
                 joins: vec![],
                 filter: None,
                 group_by: vec![],
                 having: None,
+                compounds: vec![],
                 order_by: vec![],
                 limit: None,
             }),
             Statement::Select(SelectStatement {
+                with: None,
                 distinct: false,
                 columns: vec![SelectItem::Column("id".to_string())],
-                table: "users".to_string(),
-                table_alias: None,
+                from: FromItem::Table {
+                    name: "users".to_string(),
+                    alias: None,
+                },
                 joins: vec![],
                 filter: None,
                 group_by: vec![],
                 having: None,
+                compounds: vec![],
                 order_by: vec![],
                 limit: None,
             })

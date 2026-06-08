@@ -543,6 +543,83 @@ impl TableStore for FileStorage {
 
         Ok(())
     }
+
+    fn update_row(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        row_id: RowId,
+        row: Row,
+    ) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+
+        let schema = inner.require_schema(schema_name)?.clone();
+        if row.len() != schema.columns.len() {
+            return Err(DbError::storage(format!(
+                "update {schema_name} expected {} values but got {}",
+                schema.columns.len(),
+                row.len()
+            )));
+        }
+
+        let Some(existing_row) = inner
+            .state
+            .rows
+            .get(schema_name)
+            .and_then(|rows| rows.get(&row_id))
+            .cloned()
+        else {
+            return Ok(());
+        };
+
+        if existing_row == row {
+            return Ok(());
+        }
+
+        schema.validate_row_values(&row)?;
+        schema.validate_check_constraints(&row)?;
+        {
+            let existing_rows = inner
+                .state
+                .rows
+                .get(schema_name)
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|(candidate_row_id, _)| **candidate_row_id != row_id)
+                        .map(|(_, existing_row)| existing_row)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            schema.validate_primary_key_uniqueness(&row, &existing_rows)?;
+        }
+
+        if let Some(indexes) = inner.state.indexes.get(schema_name) {
+            for index in indexes.values() {
+                let key = FileStorageInner::project_index_key(&schema, &index.meta, &row)?;
+                if index.meta.enforces_unique_key(&key)
+                    && index.entries.get(&key).is_some_and(|row_ids| {
+                        row_ids.iter().any(|candidate_row_id| *candidate_row_id != row_id)
+                    })
+                {
+                    return Err(DbError::storage(format!(
+                        "unique index {} constraint failed",
+                        index.meta.name
+                    )));
+                }
+            }
+        }
+
+        inner.remove_row_from_indexes(schema_name, row_id, &existing_row)?;
+        inner
+            .state
+            .rows
+            .entry(schema_name.to_string())
+            .or_default()
+            .insert(row_id, row.clone());
+        inner.add_row_to_indexes(schema_name, row_id, &row)?;
+        Ok(())
+    }
 }
 
 impl IndexStore for FileStorage {

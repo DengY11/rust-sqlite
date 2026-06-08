@@ -1,8 +1,8 @@
 use rustsql::common::types::{ColumnDef, ColumnType, Value};
 use rustsql::sql::ast::{
-    AggregateArg, AggregateFunc, AlterTableAction, Assignment, CompareOp, Expr, JoinClause,
-    JoinKind, NullOrder, OrderBy, OrderByExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, SelectItem,
-    SelectStatement, Statement,
+    AggregateArg, AggregateFunc, AlterTableAction, Assignment, CommonTableExpr, CompareOp, Expr,
+    FromItem, JoinClause, JoinKind, NullOrder, OrderBy, OrderByExpr, ScalarBinaryOp, ScalarExpr,
+    ScalarFunc, SelectItem, SelectStatement, Statement, WithClause,
 };
 use rustsql::sql::lexer::{TokenKind, lex};
 use rustsql::sql::parser::parse_sql;
@@ -16,17 +16,39 @@ fn select_statement(
     limit: Option<usize>,
 ) -> Statement {
     Statement::Select(SelectStatement {
+        with: None,
         distinct: false,
         columns,
-        table: table.to_string(),
-        table_alias: table_alias.map(str::to_string),
+        from: FromItem::Table {
+            name: table.to_string(),
+            alias: table_alias.map(str::to_string),
+        },
         joins: vec![],
         filter,
         group_by: vec![],
         having: None,
+        compounds: vec![],
         order_by,
         limit,
     })
+}
+
+fn token_kind_debugs(sql: &str) -> Vec<String> {
+    lex(sql)
+        .unwrap()
+        .into_iter()
+        .map(|token| format!("{:?}", token.kind))
+        .collect()
+}
+
+fn single_statement_debug(sql: &str) -> String {
+    let statements = parse_sql(sql).unwrap();
+    assert_eq!(
+        statements.len(),
+        1,
+        "unexpected statements: {statements:#?}"
+    );
+    format!("{:#?}", statements[0])
 }
 
 #[test]
@@ -291,6 +313,64 @@ fn parses_select_statement_with_where_clause() {
 }
 
 #[test]
+fn parses_from_subquery_with_alias() {
+    let statements =
+        parse_sql("SELECT bucket FROM (SELECT age + 1 AS bucket FROM users) t;").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::Select(SelectStatement {
+            with: None,
+            distinct: false,
+            columns: vec![SelectItem::Column("bucket".to_string())],
+            from: FromItem::Subquery {
+                query: Box::new(SelectStatement {
+                    with: None,
+                    distinct: false,
+                    columns: vec![SelectItem::Expr {
+                        expr: ScalarExpr::Binary {
+                            left: Box::new(ScalarExpr::Column("age".to_string())),
+                            op: ScalarBinaryOp::Add,
+                            right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                        },
+                        alias: Some("bucket".to_string()),
+                    }],
+                    from: FromItem::Table {
+                        name: "users".to_string(),
+                        alias: None,
+                    },
+                    joins: vec![],
+                    filter: None,
+                    group_by: vec![],
+                    having: None,
+                    compounds: vec![],
+                    order_by: vec![],
+                    limit: None,
+                }),
+                alias: "t".to_string(),
+            },
+            joins: vec![],
+            filter: None,
+            group_by: vec![],
+            having: None,
+            compounds: vec![],
+            order_by: vec![],
+            limit: None,
+        })],
+    );
+}
+
+#[test]
+fn rejects_from_subquery_without_alias() {
+    let error = parse_sql("SELECT bucket FROM (SELECT age + 1 AS bucket FROM users);").unwrap_err();
+
+    assert!(
+        error.to_string().contains("alias"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn parses_delete_update_order_by_limit_and_aliases() {
     let statements = parse_sql(
         "DELETE FROM users AS u WHERE u.id = 1;
@@ -331,6 +411,8 @@ fn parses_delete_update_order_by_limit_and_aliases() {
                 }),
             },
             Statement::Select(SelectStatement {
+                with: None,
+                distinct: false,
                 columns: vec![
                     SelectItem::AliasedColumn {
                         name: "u.name".to_string(),
@@ -341,8 +423,10 @@ fn parses_delete_update_order_by_limit_and_aliases() {
                         alias: "user_id".to_string(),
                     },
                 ],
-                table: "users".to_string(),
-                table_alias: Some("u".to_string()),
+                from: FromItem::Table {
+                    name: "users".to_string(),
+                    alias: Some("u".to_string()),
+                },
                 joins: vec![],
                 filter: Some(Expr::Compare {
                     column: "u.active".to_string(),
@@ -350,6 +434,8 @@ fn parses_delete_update_order_by_limit_and_aliases() {
                     value: Value::Boolean(true),
                 }),
                 group_by: vec![],
+                having: None,
+                compounds: vec![],
                 order_by: vec![
                     OrderBy {
                         expr: OrderByExpr::Column("username".to_string()),
@@ -363,8 +449,6 @@ fn parses_delete_update_order_by_limit_and_aliases() {
                     },
                 ],
                 limit: Some(5),
-                distinct: false,
-                having: None,
             }),
         ]
     );
@@ -613,6 +697,7 @@ fn parses_group_by_and_aggregate_order_by_scalar_expressions() {
     assert_eq!(
         statements,
         vec![Statement::Select(SelectStatement {
+            with: None,
             distinct: false,
             columns: vec![
                 SelectItem::Expr {
@@ -629,8 +714,10 @@ fn parses_group_by_and_aggregate_order_by_scalar_expressions() {
                     alias: Some("total".to_string()),
                 },
             ],
-            table: "users".to_string(),
-            table_alias: None,
+            from: FromItem::Table {
+                name: "users".to_string(),
+                alias: None,
+            },
             joins: vec![],
             filter: None,
             group_by: vec![ScalarExpr::Binary {
@@ -643,6 +730,7 @@ fn parses_group_by_and_aggregate_order_by_scalar_expressions() {
                 op: CompareOp::Gt,
                 value: Value::Integer(20),
             }),
+            compounds: vec![],
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Expr(ScalarExpr::Binary {
                     left: Box::new(ScalarExpr::Column("total".to_string())),
@@ -669,17 +757,22 @@ fn parses_join_on_scalar_expression() {
     assert_eq!(
         statements,
         vec![Statement::Select(SelectStatement {
+            with: None,
             distinct: false,
             columns: vec![
                 SelectItem::Column("u.name".to_string()),
                 SelectItem::Column("o.amount".to_string()),
             ],
-            table: "users".to_string(),
-            table_alias: Some("u".to_string()),
+            from: FromItem::Table {
+                name: "users".to_string(),
+                alias: Some("u".to_string()),
+            },
             joins: vec![JoinClause {
                 kind: JoinKind::Inner,
-                table: "orders".to_string(),
-                table_alias: Some("o".to_string()),
+                source: FromItem::Table {
+                    name: "orders".to_string(),
+                    alias: Some("o".to_string()),
+                },
                 on: Expr::CompareScalar {
                     left: ScalarExpr::Binary {
                         left: Box::new(ScalarExpr::Column("u.id".to_string())),
@@ -693,6 +786,145 @@ fn parses_join_on_scalar_expression() {
             filter: None,
             group_by: vec![],
             having: None,
+            compounds: vec![],
+            order_by: vec![],
+            limit: None,
+        })]
+    );
+}
+
+#[test]
+fn parses_join_with_derived_source_on_right() {
+    let statements = parse_sql(
+        "SELECT u.id, t.bucket
+         FROM users u
+         JOIN (SELECT id, age + 1 AS bucket FROM users) t ON u.id = t.id;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::Select(SelectStatement {
+            with: None,
+            distinct: false,
+            columns: vec![
+                SelectItem::Column("u.id".to_string()),
+                SelectItem::Column("t.bucket".to_string()),
+            ],
+            from: FromItem::Table {
+                name: "users".to_string(),
+                alias: Some("u".to_string()),
+            },
+            joins: vec![JoinClause {
+                kind: JoinKind::Inner,
+                source: FromItem::Subquery {
+                    query: Box::new(SelectStatement {
+                        with: None,
+                        distinct: false,
+                        columns: vec![
+                            SelectItem::Column("id".to_string()),
+                            SelectItem::Expr {
+                                expr: ScalarExpr::Binary {
+                                    left: Box::new(ScalarExpr::Column("age".to_string())),
+                                    op: ScalarBinaryOp::Add,
+                                    right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                                },
+                                alias: Some("bucket".to_string()),
+                            },
+                        ],
+                        from: FromItem::Table {
+                            name: "users".to_string(),
+                            alias: None,
+                        },
+                        joins: vec![],
+                        filter: None,
+                        group_by: vec![],
+                        having: None,
+                        compounds: vec![],
+                        order_by: vec![],
+                        limit: None,
+                    }),
+                    alias: "t".to_string(),
+                },
+                on: Expr::CompareScalar {
+                    left: ScalarExpr::Column("u.id".to_string()),
+                    op: CompareOp::Eq,
+                    right: ScalarExpr::Column("t.id".to_string()),
+                },
+            }],
+            filter: None,
+            group_by: vec![],
+            having: None,
+            compounds: vec![],
+            order_by: vec![],
+            limit: None,
+        })]
+    );
+}
+
+#[test]
+fn parses_join_with_derived_source_on_left() {
+    let statements = parse_sql(
+        "SELECT t.bucket, u.id
+         FROM (SELECT id, age + 1 AS bucket FROM users) t
+         JOIN users u ON t.id = u.id;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::Select(SelectStatement {
+            with: None,
+            distinct: false,
+            columns: vec![
+                SelectItem::Column("t.bucket".to_string()),
+                SelectItem::Column("u.id".to_string()),
+            ],
+            from: FromItem::Subquery {
+                query: Box::new(SelectStatement {
+                    with: None,
+                    distinct: false,
+                    columns: vec![
+                        SelectItem::Column("id".to_string()),
+                        SelectItem::Expr {
+                            expr: ScalarExpr::Binary {
+                                left: Box::new(ScalarExpr::Column("age".to_string())),
+                                op: ScalarBinaryOp::Add,
+                                right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                            },
+                            alias: Some("bucket".to_string()),
+                        },
+                    ],
+                    from: FromItem::Table {
+                        name: "users".to_string(),
+                        alias: None,
+                    },
+                    joins: vec![],
+                    filter: None,
+                    group_by: vec![],
+                    having: None,
+                    compounds: vec![],
+                    order_by: vec![],
+                    limit: None,
+                }),
+                alias: "t".to_string(),
+            },
+            joins: vec![JoinClause {
+                kind: JoinKind::Inner,
+                source: FromItem::Table {
+                    name: "users".to_string(),
+                    alias: Some("u".to_string()),
+                },
+                on: Expr::CompareScalar {
+                    left: ScalarExpr::Column("t.id".to_string()),
+                    op: CompareOp::Eq,
+                    right: ScalarExpr::Column("u.id".to_string()),
+                },
+            }],
+            filter: None,
+            group_by: vec![],
+            having: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
         })]
@@ -972,10 +1204,13 @@ fn parses_where_scalar_expression_in_subquery() {
                     ],
                 },
                 query: Box::new(SelectStatement {
+                    with: None,
                     distinct: false,
                     columns: vec![SelectItem::Column("user_id".to_string())],
-                    table: "orders".to_string(),
-                    table_alias: Some("o".to_string()),
+                    from: FromItem::Table {
+                        name: "orders".to_string(),
+                        alias: Some("o".to_string()),
+                    },
                     joins: vec![],
                     filter: Some(Expr::And(
                         Box::new(Expr::CompareScalar {
@@ -991,6 +1226,7 @@ fn parses_where_scalar_expression_in_subquery() {
                     )),
                     group_by: vec![],
                     having: None,
+                    compounds: vec![],
                     order_by: vec![],
                     limit: None,
                 }),
@@ -1024,10 +1260,13 @@ fn parses_where_scalar_expression_not_in_subquery() {
                     ],
                 },
                 query: Box::new(SelectStatement {
+                    with: None,
                     distinct: false,
                     columns: vec![SelectItem::Column("user_id".to_string())],
-                    table: "orders".to_string(),
-                    table_alias: Some("o".to_string()),
+                    from: FromItem::Table {
+                        name: "orders".to_string(),
+                        alias: Some("o".to_string()),
+                    },
                     joins: vec![],
                     filter: Some(Expr::And(
                         Box::new(Expr::CompareScalar {
@@ -1043,6 +1282,7 @@ fn parses_where_scalar_expression_not_in_subquery() {
                     )),
                     group_by: vec![],
                     having: None,
+                    compounds: vec![],
                     order_by: vec![],
                     limit: None,
                 }),
@@ -1077,10 +1317,13 @@ fn parses_where_scalar_expression_compare_subquery() {
                 },
                 op: CompareOp::Eq,
                 query: Box::new(SelectStatement {
+                    with: None,
                     distinct: false,
                     columns: vec![SelectItem::Column("user_id".to_string())],
-                    table: "orders".to_string(),
-                    table_alias: Some("o".to_string()),
+                    from: FromItem::Table {
+                        name: "orders".to_string(),
+                        alias: Some("o".to_string()),
+                    },
                     joins: vec![],
                     filter: Some(Expr::And(
                         Box::new(Expr::CompareScalar {
@@ -1096,6 +1339,7 @@ fn parses_where_scalar_expression_compare_subquery() {
                     )),
                     group_by: vec![],
                     having: None,
+                    compounds: vec![],
                     order_by: vec![],
                     limit: None,
                 }),
@@ -1123,10 +1367,13 @@ fn parses_where_column_compare_subquery_as_scalar_form() {
                 left: ScalarExpr::Column("u.id".to_string()),
                 op: CompareOp::Eq,
                 query: Box::new(SelectStatement {
+                    with: None,
                     distinct: false,
                     columns: vec![SelectItem::Column("user_id".to_string())],
-                    table: "orders".to_string(),
-                    table_alias: Some("o".to_string()),
+                    from: FromItem::Table {
+                        name: "orders".to_string(),
+                        alias: Some("o".to_string()),
+                    },
                     joins: vec![],
                     filter: Some(Expr::And(
                         Box::new(Expr::CompareScalar {
@@ -1142,6 +1389,7 @@ fn parses_where_column_compare_subquery_as_scalar_form() {
                     )),
                     group_by: vec![],
                     having: None,
+                    compounds: vec![],
                     order_by: vec![],
                     limit: None,
                 }),
@@ -1237,7 +1485,24 @@ fn parses_select_all_statement() {
 
 #[test]
 fn parses_transaction_statements() {
-    assert_eq!(parse_sql("BEGIN;").unwrap(), vec![Statement::Begin]);
+    assert_eq!(
+        parse_sql("BEGIN;").unwrap(),
+        vec![Statement::Begin {
+            isolation_level: None,
+        }]
+    );
+    assert_eq!(
+        parse_sql("BEGIN ISOLATION LEVEL SERIALIZABLE;").unwrap(),
+        vec![Statement::Begin {
+            isolation_level: Some(rustsql::sql::ast::IsolationLevel::Serializable),
+        }]
+    );
+    assert_eq!(
+        parse_sql("START TRANSACTION ISOLATION LEVEL READ COMMITTED;").unwrap(),
+        vec![Statement::Begin {
+            isolation_level: Some(rustsql::sql::ast::IsolationLevel::ReadCommitted),
+        }]
+    );
     assert_eq!(parse_sql("COMMIT;").unwrap(), vec![Statement::Commit]);
     assert_eq!(parse_sql("ROLLBACK;").unwrap(), vec![Statement::Rollback]);
 }
@@ -1309,7 +1574,15 @@ fn lexes_non_ascii_string_literal_without_utf8_slice_panics() {
 fn parses_multiple_statements_with_optional_trailing_semicolon() {
     let statements = parse_sql("BEGIN; COMMIT;;").unwrap();
 
-    assert_eq!(statements, vec![Statement::Begin, Statement::Commit]);
+    assert_eq!(
+        statements,
+        vec![
+            Statement::Begin {
+                isolation_level: None,
+            },
+            Statement::Commit,
+        ]
+    );
 }
 
 #[test]
@@ -1398,6 +1671,229 @@ fn parses_extended_comparison_operators_and_negative_integers() {
             vec![],
             None,
         )]
+    );
+}
+
+#[test]
+fn lexes_with_and_recursive_keywords() {
+    let tokens =
+        lex("WITH RECURSIVE recent AS (SELECT id FROM users) SELECT id FROM recent;").unwrap();
+
+    assert_eq!(
+        tokens
+            .into_iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TokenKind::With,
+            TokenKind::Recursive,
+            TokenKind::Identifier("recent".to_string()),
+            TokenKind::As,
+            TokenKind::LParen,
+            TokenKind::Select,
+            TokenKind::Identifier("id".to_string()),
+            TokenKind::From,
+            TokenKind::Identifier("users".to_string()),
+            TokenKind::RParen,
+            TokenKind::Select,
+            TokenKind::Identifier("id".to_string()),
+            TokenKind::From,
+            TokenKind::Identifier("recent".to_string()),
+            TokenKind::Semicolon,
+            TokenKind::Eof,
+        ]
+    );
+}
+
+#[test]
+fn lexes_union_and_union_all_keywords() {
+    assert_eq!(
+        token_kind_debugs("SELECT id FROM left_src UNION ALL SELECT id FROM right_src;"),
+        vec![
+            "Select".to_string(),
+            "Identifier(\"id\")".to_string(),
+            "From".to_string(),
+            "Identifier(\"left_src\")".to_string(),
+            "Union".to_string(),
+            "All".to_string(),
+            "Select".to_string(),
+            "Identifier(\"id\")".to_string(),
+            "From".to_string(),
+            "Identifier(\"right_src\")".to_string(),
+            "Semicolon".to_string(),
+            "Eof".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn parses_basic_union_statement() {
+    let debug = single_statement_debug("SELECT id FROM left_src UNION SELECT id FROM right_src;");
+
+    assert!(debug.contains("Union"), "unexpected AST: {debug}");
+    assert!(debug.contains("left_src"), "unexpected AST: {debug}");
+    assert!(debug.contains("right_src"), "unexpected AST: {debug}");
+    assert!(
+        debug.find("left_src") < debug.find("right_src"),
+        "unexpected AST order: {debug}"
+    );
+}
+
+#[test]
+fn parses_union_all_statement() {
+    let debug =
+        single_statement_debug("SELECT id FROM left_src UNION ALL SELECT id FROM right_src;");
+
+    assert!(debug.contains("Union"), "unexpected AST: {debug}");
+    assert!(
+        debug.contains("All") || debug.contains("all: true"),
+        "unexpected AST: {debug}"
+    );
+    assert!(debug.contains("left_src"), "unexpected AST: {debug}");
+    assert!(debug.contains("right_src"), "unexpected AST: {debug}");
+}
+
+#[test]
+fn parses_chained_union_and_union_all_preserving_order() {
+    let debug = single_statement_debug(
+        "SELECT id FROM first_src UNION SELECT id FROM second_src UNION ALL SELECT id FROM third_src;",
+    );
+
+    assert!(debug.contains("Union"), "unexpected AST: {debug}");
+    assert!(debug.contains("first_src"), "unexpected AST: {debug}");
+    assert!(debug.contains("second_src"), "unexpected AST: {debug}");
+    assert!(debug.contains("third_src"), "unexpected AST: {debug}");
+    assert!(
+        debug.find("first_src") < debug.find("second_src")
+            && debug.find("second_src") < debug.find("third_src"),
+        "unexpected AST order: {debug}"
+    );
+    assert!(
+        debug.contains("All") || debug.contains("all: true"),
+        "unexpected AST: {debug}"
+    );
+}
+
+#[test]
+fn parses_union_with_outer_order_by_and_limit() {
+    let debug = single_statement_debug(
+        "SELECT id FROM left_src UNION SELECT id FROM right_src ORDER BY id DESC LIMIT 7;",
+    );
+
+    assert!(debug.contains("Union"), "unexpected AST: {debug}");
+    assert!(debug.contains("left_src"), "unexpected AST: {debug}");
+    assert!(debug.contains("right_src"), "unexpected AST: {debug}");
+    assert!(debug.contains("id"), "unexpected AST: {debug}");
+    assert!(
+        debug.contains("descending: true"),
+        "unexpected AST: {debug}"
+    );
+    assert!(debug.contains("limit: Some"), "unexpected AST: {debug}");
+    assert!(debug.contains("7"), "unexpected AST: {debug}");
+}
+
+#[test]
+fn rejects_dangling_union_without_rhs() {
+    let error = parse_sql("SELECT id FROM left_src UNION;").unwrap_err();
+
+    assert!(
+        error.to_string().contains("expected"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn parses_top_level_with_multiple_ctes() {
+    let statements = parse_sql(
+        "WITH adults AS (SELECT id, name FROM users WHERE age >= 18),
+              named AS (SELECT id FROM adults WHERE name IS NOT NULL)
+         SELECT id FROM named;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::Select(SelectStatement {
+            with: Some(WithClause {
+                recursive: false,
+                ctes: vec![
+                    CommonTableExpr {
+                        name: "adults".to_string(),
+                        query: Box::new(SelectStatement {
+                            with: None,
+                            distinct: false,
+                            columns: vec![
+                                SelectItem::Column("id".to_string()),
+                                SelectItem::Column("name".to_string()),
+                            ],
+                            from: FromItem::Table {
+                                name: "users".to_string(),
+                                alias: None,
+                            },
+                            joins: vec![],
+                            filter: Some(Expr::Compare {
+                                column: "age".to_string(),
+                                op: CompareOp::Gte,
+                                value: Value::Integer(18),
+                            }),
+                            group_by: vec![],
+                            having: None,
+                            compounds: vec![],
+                            order_by: vec![],
+                            limit: None,
+                        }),
+                    },
+                    CommonTableExpr {
+                        name: "named".to_string(),
+                        query: Box::new(SelectStatement {
+                            with: None,
+                            distinct: false,
+                            columns: vec![SelectItem::Column("id".to_string())],
+                            from: FromItem::Table {
+                                name: "adults".to_string(),
+                                alias: None,
+                            },
+                            joins: vec![],
+                            filter: Some(Expr::IsNull {
+                                column: "name".to_string(),
+                                negated: true,
+                            }),
+                            group_by: vec![],
+                            having: None,
+                            compounds: vec![],
+                            order_by: vec![],
+                            limit: None,
+                        }),
+                    },
+                ],
+            }),
+            distinct: false,
+            columns: vec![SelectItem::Column("id".to_string())],
+            from: FromItem::Table {
+                name: "named".to_string(),
+                alias: None,
+            },
+            joins: vec![],
+            filter: None,
+            group_by: vec![],
+            having: None,
+            compounds: vec![],
+            order_by: vec![],
+            limit: None,
+        })]
+    );
+}
+
+#[test]
+fn rejects_with_recursive_queries() {
+    let error = parse_sql("WITH RECURSIVE nums AS (SELECT id FROM users) SELECT id FROM nums;")
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("WITH RECURSIVE is not supported"),
+        "unexpected error: {error}"
     );
 }
 
@@ -1579,6 +2075,7 @@ fn parses_group_by_join_and_subquery_forms() {
         statements,
         vec![
             Statement::Select(SelectStatement {
+                with: None,
                 distinct: false,
                 columns: vec![
                     SelectItem::Column("active".to_string()),
@@ -1588,12 +2085,15 @@ fn parses_group_by_join_and_subquery_forms() {
                         alias: Some("total".to_string()),
                     },
                 ],
-                table: "users".to_string(),
-                table_alias: None,
+                from: FromItem::Table {
+                    name: "users".to_string(),
+                    alias: None,
+                },
                 joins: vec![],
                 filter: None,
                 group_by: vec![ScalarExpr::Column("active".to_string())],
                 having: None,
+                compounds: vec![],
                 order_by: vec![OrderBy {
                     expr: OrderByExpr::Column("total".to_string()),
                     descending: true,
@@ -1602,17 +2102,22 @@ fn parses_group_by_join_and_subquery_forms() {
                 limit: None,
             }),
             Statement::Select(SelectStatement {
+                with: None,
                 distinct: false,
                 columns: vec![
                     SelectItem::Column("u.name".to_string()),
                     SelectItem::Column("o.amount".to_string()),
                 ],
-                table: "users".to_string(),
-                table_alias: Some("u".to_string()),
+                from: FromItem::Table {
+                    name: "users".to_string(),
+                    alias: Some("u".to_string()),
+                },
                 joins: vec![JoinClause {
                     kind: JoinKind::Inner,
-                    table: "orders".to_string(),
-                    table_alias: Some("o".to_string()),
+                    source: FromItem::Table {
+                        name: "orders".to_string(),
+                        alias: Some("o".to_string()),
+                    },
                     on: Expr::CompareScalar {
                         left: ScalarExpr::Column("u.id".to_string()),
                         op: CompareOp::Eq,
@@ -1626,6 +2131,7 @@ fn parses_group_by_join_and_subquery_forms() {
                 }),
                 group_by: vec![],
                 having: None,
+                compounds: vec![],
                 order_by: vec![OrderBy {
                     expr: OrderByExpr::Column("u.name".to_string()),
                     descending: false,
@@ -1634,18 +2140,24 @@ fn parses_group_by_join_and_subquery_forms() {
                 limit: None,
             }),
             Statement::Select(SelectStatement {
+                with: None,
                 distinct: false,
                 columns: vec![SelectItem::Column("name".to_string())],
-                table: "users".to_string(),
-                table_alias: None,
+                from: FromItem::Table {
+                    name: "users".to_string(),
+                    alias: None,
+                },
                 joins: vec![],
                 filter: Some(Expr::InSubquery {
                     column: "id".to_string(),
                     query: Box::new(SelectStatement {
+                        with: None,
                         distinct: false,
                         columns: vec![SelectItem::Column("user_id".to_string())],
-                        table: "orders".to_string(),
-                        table_alias: None,
+                        from: FromItem::Table {
+                            name: "orders".to_string(),
+                            alias: None,
+                        },
                         joins: vec![],
                         filter: Some(Expr::Compare {
                             column: "amount".to_string(),
@@ -1654,6 +2166,7 @@ fn parses_group_by_join_and_subquery_forms() {
                         }),
                         group_by: vec![],
                         having: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: None,
                     }),
@@ -1661,6 +2174,7 @@ fn parses_group_by_join_and_subquery_forms() {
                 }),
                 group_by: vec![],
                 having: None,
+                compounds: vec![],
                 order_by: vec![],
                 limit: None,
             }),

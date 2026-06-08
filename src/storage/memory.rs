@@ -67,6 +67,11 @@ enum UndoOp {
         row_id: RowId,
         row: Row,
     },
+    RestoreRow {
+        schema_name: String,
+        row_id: RowId,
+        row: Row,
+    },
 }
 
 impl Default for MemoryStorageInner {
@@ -339,6 +344,24 @@ impl MemoryStorageInner {
                     .entry(schema_name.clone())
                     .or_default()
                     .insert(row_id, row.clone());
+                self.next_row_ids
+                    .entry(schema_name.clone())
+                    .and_modify(|next| *next = max(*next, row_id.0 + 1))
+                    .or_insert(row_id.0 + 1);
+                self.add_row_to_indexes(&schema_name, row_id, &row)
+            }
+            UndoOp::RestoreRow {
+                schema_name,
+                row_id,
+                row,
+            } => {
+                let replaced_row = self
+                    .rows
+                    .get_mut(&schema_name)
+                    .and_then(|rows| rows.insert(row_id, row.clone()));
+                if let Some(replaced_row) = replaced_row {
+                    self.remove_row_from_indexes(&schema_name, row_id, &replaced_row)?;
+                }
                 self.next_row_ids
                     .entry(schema_name.clone())
                     .and_modify(|next| *next = max(*next, row_id.0 + 1))
@@ -723,6 +746,86 @@ impl TableStore for MemoryStorage {
             });
         }
 
+        Ok(())
+    }
+
+    fn update_row(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        row_id: RowId,
+        row: Row,
+    ) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+
+        let schema = inner.require_schema(schema_name)?.clone();
+        if row.len() != schema.columns.len() {
+            return Err(DbError::storage(format!(
+                "update {schema_name} expected {} values but got {}",
+                schema.columns.len(),
+                row.len()
+            )));
+        }
+
+        let Some(existing_row) = inner
+            .rows
+            .get(schema_name)
+            .and_then(|rows| rows.get(&row_id))
+            .cloned()
+        else {
+            return Ok(());
+        };
+
+        if existing_row == row {
+            return Ok(());
+        }
+
+        schema.validate_row_values(&row)?;
+        schema.validate_check_constraints(&row)?;
+
+        {
+            let existing_rows = inner
+                .rows
+                .get(schema_name)
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|(candidate_row_id, _)| **candidate_row_id != row_id)
+                        .map(|(_, existing_row)| existing_row)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            schema.validate_primary_key_uniqueness(&row, &existing_rows)?;
+        }
+
+        if let Some(indexes) = inner.indexes.get(schema_name) {
+            for index in indexes.values() {
+                let key = MemoryStorageInner::project_index_key(&schema, &index.meta, &row)?;
+                if index.meta.enforces_unique_key(&key)
+                    && index.entries.get(&key).is_some_and(|row_ids| {
+                        row_ids.iter().any(|candidate_row_id| *candidate_row_id != row_id)
+                    })
+                {
+                    return Err(DbError::storage(format!(
+                        "unique index {} constraint failed",
+                        index.meta.name
+                    )));
+                }
+            }
+        }
+
+        inner.remove_row_from_indexes(schema_name, row_id, &existing_row)?;
+        inner
+            .rows
+            .entry(schema_name.to_string())
+            .or_default()
+            .insert(row_id, row.clone());
+        inner.add_row_to_indexes(schema_name, row_id, &row)?;
+        inner.record_undo(UndoOp::RestoreRow {
+            schema_name: schema_name.to_string(),
+            row_id,
+            row: existing_row,
+        });
         Ok(())
     }
 }

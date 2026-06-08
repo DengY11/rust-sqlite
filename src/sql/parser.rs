@@ -3,9 +3,10 @@ use crate::common::types::{
     CheckConstraint, CheckExpr, CheckOp, ColumnDef, ColumnType, ForeignKey, Value,
 };
 use crate::sql::ast::{
-    AggregateArg, AggregateFunc, AlterTableAction, Assignment, CompareOp, Expr, JoinClause,
-    JoinKind, NullOrder, OrderBy, OrderByExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, SelectItem,
-    SelectStatement, Statement, TableConstraint,
+    AggregateArg, AggregateFunc, AlterTableAction, Assignment, CommonTableExpr, CompareOp,
+    CompoundOperator, CompoundSelect, Expr, FromItem, IsolationLevel, JoinClause, JoinKind,
+    NullOrder, OrderBy, OrderByExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, SelectItem,
+    SelectStatement, Statement, TableConstraint, WithClause,
 };
 use crate::sql::lexer::{Token, TokenKind, lex};
 
@@ -52,14 +53,12 @@ impl Parser {
             TokenKind::Alter => self.parse_alter(),
             TokenKind::Drop => self.parse_drop(),
             TokenKind::Insert => self.parse_insert(),
+            TokenKind::With => Ok(Statement::Select(self.parse_with_select_statement()?)),
             TokenKind::Select => Ok(Statement::Select(self.parse_select_statement()?)),
             TokenKind::Explain => self.parse_explain(),
             TokenKind::Delete => self.parse_delete(),
             TokenKind::Update => self.parse_update(),
-            TokenKind::Begin => {
-                self.advance();
-                Ok(Statement::Begin)
-            }
+            TokenKind::Begin | TokenKind::Start => self.parse_begin_or_start_transaction(),
             TokenKind::Commit => {
                 self.advance();
                 Ok(Statement::Commit)
@@ -259,13 +258,113 @@ impl Parser {
         })
     }
 
+    fn parse_begin_or_start_transaction(&mut self) -> Result<Statement> {
+        if self.matches(&TokenKind::Begin) {
+            return Ok(Statement::Begin {
+                isolation_level: self.parse_optional_isolation_level()?,
+            });
+        }
+
+        self.expect_keyword(TokenKind::Start)?;
+        self.expect_keyword(TokenKind::Transaction)?;
+        Ok(Statement::Begin {
+            isolation_level: self.parse_optional_isolation_level()?,
+        })
+    }
+
+    fn parse_optional_isolation_level(&mut self) -> Result<Option<IsolationLevel>> {
+        if !self.matches(&TokenKind::Isolation) {
+            return Ok(None);
+        }
+        self.expect_keyword(TokenKind::Level)?;
+
+        if self.matches(&TokenKind::Read) {
+            if self.matches(&TokenKind::Committed) {
+                return Ok(Some(IsolationLevel::ReadCommitted));
+            }
+
+            self.expect_keyword(TokenKind::Repeatable)?;
+            self.expect_keyword(TokenKind::Read)?;
+            return Ok(Some(IsolationLevel::RepeatableRead));
+        }
+
+        self.expect_keyword(TokenKind::Serializable)?;
+        Ok(Some(IsolationLevel::Serializable))
+    }
+
     fn parse_select_statement(&mut self) -> Result<SelectStatement> {
+        self.parse_compound_select_statement(None)
+    }
+
+    fn parse_with_select_statement(&mut self) -> Result<SelectStatement> {
+        self.expect_keyword(TokenKind::With)?;
+        let recursive = self.matches(&TokenKind::Recursive);
+        if recursive {
+            return Err(DbError::sql("WITH RECURSIVE is not supported yet"));
+        }
+
+        let mut ctes = Vec::new();
+        loop {
+            ctes.push(self.parse_common_table_expr()?);
+            if !self.matches(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        let with = WithClause { recursive, ctes };
+        self.parse_compound_select_statement(Some(with))
+    }
+
+    fn parse_common_table_expr(&mut self) -> Result<CommonTableExpr> {
+        let name = self.parse_simple_identifier()?;
+        self.expect_keyword(TokenKind::As)?;
+        self.expect_symbol(TokenKind::LParen)?;
+        let query = self.parse_select_statement()?;
+        self.expect_symbol(TokenKind::RParen)?;
+        Ok(CommonTableExpr {
+            name,
+            query: Box::new(query),
+        })
+    }
+
+    fn parse_compound_select_statement(
+        &mut self,
+        with: Option<WithClause>,
+    ) -> Result<SelectStatement> {
+        let mut select = self.parse_select_core(with)?;
+        while self.matches(&TokenKind::Union) {
+            let operator = if self.matches(&TokenKind::All) {
+                CompoundOperator::UnionAll
+            } else {
+                CompoundOperator::Union
+            };
+            select.compounds.push(CompoundSelect {
+                operator,
+                select: Box::new(self.parse_select_core(None)?),
+            });
+        }
+
+        select.order_by = if self.matches(&TokenKind::Order) {
+            self.expect_keyword(TokenKind::By)?;
+            self.parse_order_by_items()?
+        } else {
+            Vec::new()
+        };
+        select.limit = if self.matches(&TokenKind::Limit) {
+            Some(self.parse_limit_value()?)
+        } else {
+            None
+        };
+
+        Ok(select)
+    }
+
+    fn parse_select_core(&mut self, with: Option<WithClause>) -> Result<SelectStatement> {
         self.expect_keyword(TokenKind::Select)?;
         let distinct = self.matches(&TokenKind::Distinct);
         let columns = self.parse_select_list()?;
         self.expect_keyword(TokenKind::From)?;
-        let table = self.parse_simple_identifier()?;
-        let table_alias = self.parse_optional_table_alias()?;
+        let from = self.parse_from_item()?;
         let joins = self.parse_join_clauses()?;
         let filter = if self.matches(&TokenKind::Where) {
             Some(self.parse_where_expr()?)
@@ -283,29 +382,37 @@ impl Parser {
         } else {
             None
         };
-        let order_by = if self.matches(&TokenKind::Order) {
-            self.expect_keyword(TokenKind::By)?;
-            self.parse_order_by_items()?
-        } else {
-            Vec::new()
-        };
-        let limit = if self.matches(&TokenKind::Limit) {
-            Some(self.parse_limit_value()?)
-        } else {
-            None
-        };
-
         Ok(SelectStatement {
+            with,
             distinct,
             columns,
-            table,
-            table_alias,
+            from,
             joins,
             filter,
             group_by,
             having,
-            order_by,
-            limit,
+            compounds: vec![],
+            order_by: vec![],
+            limit: None,
+        })
+    }
+
+    fn parse_from_item(&mut self) -> Result<FromItem> {
+        if self.matches(&TokenKind::LParen) {
+            let query = self.parse_select_statement()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            let alias = self
+                .parse_optional_table_alias()?
+                .ok_or_else(|| DbError::sql("derived table must have an alias"))?;
+            return Ok(FromItem::Subquery {
+                query: Box::new(query),
+                alias,
+            });
+        }
+
+        Ok(FromItem::Table {
+            name: self.parse_simple_identifier()?,
+            alias: self.parse_optional_table_alias()?,
         })
     }
 
@@ -1043,13 +1150,11 @@ impl Parser {
                 break;
             };
 
-            let table = self.parse_simple_identifier()?;
-            let table_alias = self.parse_optional_table_alias()?;
+            let source = self.parse_from_item()?;
             self.expect_keyword(TokenKind::On)?;
             joins.push(JoinClause {
                 kind,
-                table,
-                table_alias,
+                source,
                 on: self.parse_where_expr()?,
             });
         }
@@ -1180,6 +1285,26 @@ impl Parser {
                 self.advance();
                 Ok("last".to_string())
             }
+            TokenKind::Level => {
+                self.advance();
+                Ok("level".to_string())
+            }
+            TokenKind::Read => {
+                self.advance();
+                Ok("read".to_string())
+            }
+            TokenKind::Committed => {
+                self.advance();
+                Ok("committed".to_string())
+            }
+            TokenKind::Repeatable => {
+                self.advance();
+                Ok("repeatable".to_string())
+            }
+            TokenKind::Serializable => {
+                self.advance();
+                Ok("serializable".to_string())
+            }
             token => {
                 Err(self.error_expected(&format!("identifier, found {}", display_token(token))))
             }
@@ -1256,7 +1381,15 @@ fn same_variant(left: &TokenKind, right: &TokenKind) -> bool {
 fn is_identifier_token(token: &TokenKind) -> bool {
     matches!(
         token,
-        TokenKind::Identifier(_) | TokenKind::Nulls | TokenKind::First | TokenKind::Last
+        TokenKind::Identifier(_)
+            | TokenKind::Nulls
+            | TokenKind::First
+            | TokenKind::Last
+            | TokenKind::Level
+            | TokenKind::Read
+            | TokenKind::Committed
+            | TokenKind::Repeatable
+            | TokenKind::Serializable
     )
 }
 
@@ -1318,6 +1451,10 @@ fn display_token(token: &TokenKind) -> String {
         TokenKind::Order => "ORDER".to_string(),
         TokenKind::By => "BY".to_string(),
         TokenKind::Limit => "LIMIT".to_string(),
+        TokenKind::With => "WITH".to_string(),
+        TokenKind::Recursive => "RECURSIVE".to_string(),
+        TokenKind::Union => "UNION".to_string(),
+        TokenKind::All => "ALL".to_string(),
         TokenKind::As => "AS".to_string(),
         TokenKind::Inner => "INNER".to_string(),
         TokenKind::Left => "LEFT".to_string(),
@@ -1332,6 +1469,14 @@ fn display_token(token: &TokenKind) -> String {
         TokenKind::Like => "LIKE".to_string(),
         TokenKind::Between => "BETWEEN".to_string(),
         TokenKind::Begin => "BEGIN".to_string(),
+        TokenKind::Start => "START".to_string(),
+        TokenKind::Transaction => "TRANSACTION".to_string(),
+        TokenKind::Isolation => "ISOLATION".to_string(),
+        TokenKind::Level => "LEVEL".to_string(),
+        TokenKind::Read => "READ".to_string(),
+        TokenKind::Committed => "COMMITTED".to_string(),
+        TokenKind::Repeatable => "REPEATABLE".to_string(),
+        TokenKind::Serializable => "SERIALIZABLE".to_string(),
         TokenKind::Commit => "COMMIT".to_string(),
         TokenKind::Rollback => "ROLLBACK".to_string(),
         TokenKind::Not => "NOT".to_string(),

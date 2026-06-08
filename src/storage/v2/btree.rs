@@ -90,8 +90,8 @@ impl BTree {
         self.root_page_id
     }
 
-    pub fn get(&self, pager: &Pager, key: u64) -> Result<Option<Vec<u8>>> {
-        let leaf = self.find_leaf(pager, self.root_page_id, key)?;
+    pub fn get(&self, pager: &Pager, txn_id: u64, key: u64) -> Result<Option<Vec<u8>>> {
+        let leaf = self.find_leaf(pager, txn_id, self.root_page_id, key)?;
         Ok(leaf.lookup(key).cloned())
     }
 
@@ -111,12 +111,12 @@ impl BTree {
         Ok(())
     }
 
-    pub fn scan_all(&self, pager: &Pager) -> Result<Vec<(u64, Vec<u8>)>> {
-        let mut current = Some(self.leftmost_leaf_page(pager, self.root_page_id)?);
+    pub fn scan_all(&self, pager: &Pager, txn_id: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut current = Some(self.leftmost_leaf_page(pager, txn_id, self.root_page_id)?);
         let mut rows = Vec::new();
 
         while let Some(page_id) = current {
-            let leaf = match read_node(pager, page_id)? {
+            let leaf = match read_node(pager, txn_id, page_id)? {
                 Node::Leaf(leaf) => leaf,
                 Node::Internal(_) => {
                     return Err(DbError::storage(format!(
@@ -140,20 +140,20 @@ impl BTree {
         self.delete_from_page(pager, txn_id, self.root_page_id, key)
     }
 
-    fn find_leaf(&self, pager: &Pager, page_id: PageId, key: u64) -> Result<LeafNode> {
-        match read_node(pager, page_id)? {
+    fn find_leaf(&self, pager: &Pager, txn_id: u64, page_id: PageId, key: u64) -> Result<LeafNode> {
+        match read_node(pager, txn_id, page_id)? {
             Node::Leaf(leaf) => Ok(leaf),
             Node::Internal(internal) => {
                 let child = internal.children[internal.child_index(key)];
-                self.find_leaf(pager, child, key)
+                self.find_leaf(pager, txn_id, child, key)
             }
         }
     }
 
-    fn leftmost_leaf_page(&self, pager: &Pager, page_id: PageId) -> Result<PageId> {
-        match read_node(pager, page_id)? {
+    fn leftmost_leaf_page(&self, pager: &Pager, txn_id: u64, page_id: PageId) -> Result<PageId> {
+        match read_node(pager, txn_id, page_id)? {
             Node::Leaf(_) => Ok(page_id),
-            Node::Internal(internal) => self.leftmost_leaf_page(pager, internal.children[0]),
+            Node::Internal(internal) => self.leftmost_leaf_page(pager, txn_id, internal.children[0]),
         }
     }
 
@@ -165,7 +165,8 @@ impl BTree {
         key: u64,
         value: Vec<u8>,
     ) -> Result<Option<SplitResult>> {
-        match read_node(pager, page_id)? {
+        pager.acquire_page_write_lock(txn_id, page_id)?;
+        match read_node(pager, txn_id, page_id)? {
             Node::Leaf(mut leaf) => {
                 match leaf.entries.binary_search_by_key(&key, |entry| entry.key) {
                     Ok(index) => leaf.entries[index].value = value,
@@ -253,7 +254,8 @@ impl BTree {
         page_id: PageId,
         key: u64,
     ) -> Result<()> {
-        match read_node(pager, page_id)? {
+        pager.acquire_page_write_lock(txn_id, page_id)?;
+        match read_node(pager, txn_id, page_id)? {
             Node::Leaf(mut leaf) => {
                 if let Ok(index) = leaf.entries.binary_search_by_key(&key, |entry| entry.key) {
                     leaf.entries.remove(index);
@@ -269,7 +271,7 @@ impl BTree {
     }
 }
 
-fn read_node(pager: &Pager, page_id: PageId) -> Result<Node> {
+fn read_node(pager: &Pager, _txn_id: u64, page_id: PageId) -> Result<Node> {
     let page = pager.read_page(page_id)?;
     match super::page::page_kind(&page)? {
         PageKind::Leaf => Ok(serde_json::from_slice(&decode_payload(
@@ -309,7 +311,7 @@ mod tests {
         let txn = pager.begin().unwrap();
         let mut tree = BTree::create(&mut pager, txn).unwrap();
         tree.insert(&mut pager, txn, 1, b"alice").unwrap();
-        assert_eq!(tree.get(&pager, 1).unwrap(), Some(b"alice".to_vec()));
+        assert_eq!(tree.get(&pager, txn, 1).unwrap(), Some(b"alice".to_vec()));
     }
 
     #[test]
@@ -326,7 +328,7 @@ mod tests {
         }
 
         let keys: Vec<u64> = tree
-            .scan_all(&pager)
+            .scan_all(&pager, txn)
             .unwrap()
             .into_iter()
             .map(|(key, _)| key)
@@ -343,6 +345,6 @@ mod tests {
         let mut tree = BTree::create(&mut pager, txn).unwrap();
         tree.insert(&mut pager, txn, 7, b"carol").unwrap();
         tree.delete(&mut pager, txn, 7).unwrap();
-        assert_eq!(tree.get(&pager, 7).unwrap(), None);
+        assert_eq!(tree.get(&pager, txn, 7).unwrap(), None);
     }
 }

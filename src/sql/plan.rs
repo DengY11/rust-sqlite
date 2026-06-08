@@ -1,14 +1,13 @@
 use crate::common::types::{ColumnDef, Value};
 use crate::sql::ast::{
-    AlterTableAction, Assignment, CompareOp, Expr, JoinKind, OrderBy, ScalarExpr, SelectItem,
-    TableConstraint,
+    AlterTableAction, Assignment, CompareOp, Expr, IsolationLevel, JoinKind, OrderBy,
+    ScalarExpr, SelectItem, TableConstraint,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinPlan {
     pub kind: JoinKind,
-    pub table: String,
-    pub table_alias: Option<String>,
+    pub source: Box<Plan>,
     pub on: Expr,
 }
 
@@ -109,9 +108,25 @@ pub enum Plan {
         limit: Option<usize>,
         distinct: bool,
     },
+    Union {
+        left: Box<Plan>,
+        right: Box<Plan>,
+        all: bool,
+        order_by: Vec<OrderBy>,
+        limit: Option<usize>,
+    },
+    DerivedSource {
+        source: Box<Plan>,
+        alias: String,
+        output_columns: Vec<String>,
+        columns: Vec<SelectItem>,
+        filter: Option<Expr>,
+        order_by: Vec<OrderBy>,
+        limit: Option<usize>,
+        distinct: bool,
+    },
     NestedLoopJoin {
-        table: String,
-        table_alias: Option<String>,
+        source: Box<Plan>,
         joins: Vec<JoinPlan>,
         columns: Vec<SelectItem>,
         filter: Option<Expr>,
@@ -130,7 +145,9 @@ pub enum Plan {
     ExplainQueryPlan {
         plan: Box<Plan>,
     },
-    BeginTxn,
+    BeginTxn {
+        isolation_level: IsolationLevel,
+    },
     CommitTxn,
     RollbackTxn,
 }
@@ -318,12 +335,26 @@ mod tests {
     #[test]
     fn nested_loop_join_plans_are_comparable() {
         let plan = Plan::NestedLoopJoin {
-            table: "users".to_string(),
-            table_alias: Some("u".to_string()),
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: Some("u".to_string()),
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
             joins: vec![JoinPlan {
                 kind: JoinKind::Inner,
-                table: "orders".to_string(),
-                table_alias: Some("o".to_string()),
+                source: Box::new(Plan::SeqScan {
+                    table: "orders".to_string(),
+                    table_alias: Some("o".to_string()),
+                    columns: vec![SelectItem::Wildcard],
+                    filter: None,
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
                 on: Expr::CompareColumns {
                     left: "u.id".to_string(),
                     op: CompareOp::Eq,
@@ -340,12 +371,26 @@ mod tests {
         assert_eq!(
             plan,
             Plan::NestedLoopJoin {
-                table: "users".to_string(),
-                table_alias: Some("u".to_string()),
+                source: Box::new(Plan::SeqScan {
+                    table: "users".to_string(),
+                    table_alias: Some("u".to_string()),
+                    columns: vec![SelectItem::Wildcard],
+                    filter: None,
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
                 joins: vec![JoinPlan {
                     kind: JoinKind::Inner,
-                    table: "orders".to_string(),
-                    table_alias: Some("o".to_string()),
+                    source: Box::new(Plan::SeqScan {
+                        table: "orders".to_string(),
+                        table_alias: Some("o".to_string()),
+                        columns: vec![SelectItem::Wildcard],
+                        filter: None,
+                        order_by: vec![],
+                        limit: None,
+                        distinct: false,
+                    }),
                     on: Expr::CompareColumns {
                         left: "u.id".to_string(),
                         op: CompareOp::Eq,
@@ -353,6 +398,50 @@ mod tests {
                     },
                 }],
                 columns: vec![SelectItem::Column("u.id".to_string())],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }
+        );
+    }
+
+    #[test]
+    fn derived_source_plans_are_comparable() {
+        let plan = Plan::DerivedSource {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![SelectItem::Column("age".to_string())],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            alias: "t".to_string(),
+            output_columns: vec!["bucket".to_string()],
+            columns: vec![SelectItem::Column("bucket".to_string())],
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            distinct: false,
+        };
+
+        assert_eq!(
+            plan,
+            Plan::DerivedSource {
+                source: Box::new(Plan::SeqScan {
+                    table: "users".to_string(),
+                    table_alias: None,
+                    columns: vec![SelectItem::Column("age".to_string())],
+                    filter: None,
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
+                alias: "t".to_string(),
+                output_columns: vec!["bucket".to_string()],
+                columns: vec![SelectItem::Column("bucket".to_string())],
                 filter: None,
                 order_by: vec![],
                 limit: None,

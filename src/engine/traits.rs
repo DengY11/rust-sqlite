@@ -3,6 +3,7 @@
 use crate::common::error::Result;
 use crate::common::types::{ColumnDef, IndexMeta, Row, RowId, Schema, Value};
 use crate::engine::txn::TransactionId;
+use crate::sql::ast::IsolationLevel;
 use crate::sql::ast::CompareOp;
 use crate::sql::planner::PlanningContext;
 
@@ -57,6 +58,13 @@ pub trait TableStore {
         schema_name: &str,
         row_id: RowId,
     ) -> Result<()>;
+    fn update_row(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        row_id: RowId,
+        row: Row,
+    ) -> Result<()>;
 }
 
 pub trait IndexStore {
@@ -110,6 +118,9 @@ pub trait IndexStore {
 
 pub trait TransactionManager {
     fn begin(&self) -> Result<TransactionId>;
+    fn begin_with_isolation(&self, _isolation_level: IsolationLevel) -> Result<TransactionId> {
+        self.begin()
+    }
     fn commit(&self, transaction_id: TransactionId) -> Result<()>;
     fn rollback(&self, transaction_id: TransactionId) -> Result<()>;
 }

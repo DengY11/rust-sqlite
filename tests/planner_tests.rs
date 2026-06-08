@@ -4,23 +4,28 @@ use rustsql::common::types::{
     CheckConstraint, CheckOp, ColumnDef, ColumnType, IndexMeta, Schema, Value,
 };
 use rustsql::sql::ast::{
-    AggregateArg, AggregateFunc, AlterTableAction, CompareOp, Expr, JoinClause, JoinKind, OrderBy,
-    OrderByExpr, ScalarExpr, SelectItem, SelectStatement, Statement, TableConstraint,
+    AggregateArg, AggregateFunc, AlterTableAction, CompareOp, Expr, FromItem, JoinClause, JoinKind,
+    OrderBy, OrderByExpr, ScalarExpr, SelectItem, SelectStatement, Statement, TableConstraint,
 };
 use rustsql::sql::optimizer::Optimizer;
+use rustsql::sql::parser::parse_sql;
 use rustsql::sql::plan::{IndexBound, IndexRange, IndexScanMode, IndexScanSpec, JoinPlan, Plan};
 use rustsql::sql::planner::{Planner, PlanningContext};
 
 fn select_statement(columns: Vec<SelectItem>, table: &str, filter: Option<Expr>) -> Statement {
     Statement::Select(SelectStatement {
+        with: None,
         distinct: false,
         columns,
-        table: table.to_string(),
-        table_alias: None,
+        from: FromItem::Table {
+            name: table.to_string(),
+            alias: None,
+        },
         joins: vec![],
         filter,
         group_by: vec![],
         having: None,
+        compounds: vec![],
         order_by: vec![],
         limit: None,
     })
@@ -86,6 +91,368 @@ fn plans_select_without_index_as_seq_scan() {
             limit: None,
             distinct: false,
         }
+    );
+}
+
+#[test]
+fn plans_select_from_derived_source_with_alias_exposed_columns() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "SELECT bucket FROM (SELECT age + 1 AS bucket FROM users) t ORDER BY bucket ASC;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::DerivedSource {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![SelectItem::Expr {
+                    expr: ScalarExpr::Binary {
+                        left: Box::new(ScalarExpr::Column("age".to_string())),
+                        op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                        right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                    },
+                    alias: Some("bucket".to_string()),
+                }],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            alias: "t".to_string(),
+            output_columns: vec!["bucket".to_string()],
+            columns: vec![SelectItem::Column("bucket".to_string())],
+            filter: None,
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Column("bucket".to_string()),
+                descending: false,
+                nulls: None,
+            }],
+            limit: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn plans_derived_source_with_unqualified_output_for_qualified_inner_column() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql("SELECT age FROM (SELECT u.age FROM users u) t ORDER BY age ASC;")
+        .unwrap()
+        .remove(0);
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::DerivedSource {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: Some("u".to_string()),
+                columns: vec![SelectItem::Column("age".to_string())],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            alias: "t".to_string(),
+            output_columns: vec!["age".to_string()],
+            columns: vec![SelectItem::Column("age".to_string())],
+            filter: None,
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Column("age".to_string()),
+                descending: false,
+                nulls: None,
+            }],
+            limit: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn plans_derived_source_with_wildcard_expanded_output_columns() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql("SELECT age FROM (SELECT * FROM users) t ORDER BY age ASC;")
+        .unwrap()
+        .remove(0);
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::DerivedSource {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            alias: "t".to_string(),
+            output_columns: vec!["id".to_string(), "age".to_string()],
+            columns: vec![SelectItem::Column("age".to_string())],
+            filter: None,
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Column("age".to_string()),
+                descending: false,
+                nulls: None,
+            }],
+            limit: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn planner_rejects_reference_to_inner_source_column_from_derived_source() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql("SELECT age FROM (SELECT age + 1 AS bucket FROM users) t;")
+        .unwrap()
+        .remove(0);
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert_eq!(error.to_string(), "plan error: unknown column age");
+}
+
+#[test]
+fn planner_rejects_unqualified_duplicate_output_from_joined_wildcard_derived_source() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([
+            (
+                "users".to_string(),
+                Schema::new(
+                    "users",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("age", ColumnType::Integer),
+                    ],
+                ),
+            ),
+            (
+                "orders".to_string(),
+                Schema::new(
+                    "orders",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("user_id", ColumnType::Integer),
+                    ],
+                ),
+            ),
+        ]),
+        HashMap::new(),
+    );
+    let statement =
+        parse_sql("SELECT id FROM (SELECT * FROM users u JOIN orders o ON u.id = o.user_id) t;")
+            .unwrap()
+            .remove(0);
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "plan error: ambiguous column reference: id"
+    );
+}
+
+#[test]
+fn planner_rejects_qualified_duplicate_output_from_joined_wildcard_derived_source() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([
+            (
+                "users".to_string(),
+                Schema::new(
+                    "users",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("age", ColumnType::Integer),
+                    ],
+                ),
+            ),
+            (
+                "orders".to_string(),
+                Schema::new(
+                    "orders",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("user_id", ColumnType::Integer),
+                    ],
+                ),
+            ),
+        ]),
+        HashMap::new(),
+    );
+    let statement =
+        parse_sql("SELECT t.id FROM (SELECT * FROM users u JOIN orders o ON u.id = o.user_id) t;")
+            .unwrap()
+            .remove(0);
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "plan error: ambiguous column reference: t.id"
+    );
+}
+
+#[test]
+fn plans_union_and_union_all_as_distinct_compound_plans() {
+    let planner = Planner::new();
+    let context = build_users_context();
+
+    let union = parse_sql("SELECT id FROM users UNION SELECT id FROM users;")
+        .unwrap()
+        .remove(0);
+    let union_all = parse_sql("SELECT id FROM users UNION ALL SELECT id FROM users;")
+        .unwrap()
+        .remove(0);
+
+    let union_plan = planner.plan_statement(&union, &context).unwrap();
+    let union_all_plan = planner.plan_statement(&union_all, &context).unwrap();
+
+    let union_debug = format!("{union_plan:?}");
+    let union_all_debug = format!("{union_all_plan:?}");
+
+    assert!(
+        union_debug.contains("Union"),
+        "expected UNION plan debug output, got {union_debug}"
+    );
+    assert!(
+        union_all_debug.contains("Union"),
+        "expected UNION ALL plan debug output, got {union_all_debug}"
+    );
+    assert!(
+        union_debug.contains("all: false"),
+        "expected UNION plan to record duplicate elimination, got {union_debug}"
+    );
+    assert!(
+        union_all_debug.contains("all: true"),
+        "expected UNION ALL plan to preserve duplicates, got {union_all_debug}"
+    );
+    assert_ne!(
+        union_debug, union_all_debug,
+        "UNION and UNION ALL should not lower to identical plans"
+    );
+}
+
+#[test]
+fn planner_rejects_union_with_mismatched_column_counts() {
+    let planner = Planner::new();
+    let context = build_users_context();
+    let statement = parse_sql("SELECT id FROM users UNION SELECT id, name FROM users;")
+        .unwrap()
+        .remove(0);
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "plan error: UNION branches must return the same number of columns"
+    );
+}
+
+#[test]
+fn plans_derived_source_wrapping_union_with_left_branch_output_name() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "SELECT id FROM (SELECT id FROM users UNION SELECT age FROM users) t ORDER BY id ASC;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+    let debug = format!("{plan:?}");
+
+    assert!(
+        debug.contains("DerivedSource"),
+        "expected derived source wrapper, got {debug}"
+    );
+    assert!(
+        debug.contains("Union"),
+        "expected compound child plan inside derived source, got {debug}"
+    );
+    assert!(
+        debug.contains("output_columns: [\"id\"]"),
+        "expected derived source to expose left branch column name, got {debug}"
+    );
+    assert!(
+        debug.contains("columns: [Column(\"id\")]") || debug.contains("columns: [Column(\"id\")],"),
+        "expected outer query to consume exposed compound column name, got {debug}"
     );
 }
 
@@ -736,7 +1103,14 @@ fn plans_create_insert_and_txn_statements() {
             &context,
         )
         .unwrap();
-    let begin = planner.plan_statement(&Statement::Begin, &context).unwrap();
+    let begin = planner
+        .plan_statement(
+            &Statement::Begin {
+                isolation_level: None,
+            },
+            &context,
+        )
+        .unwrap();
     let commit = planner
         .plan_statement(&Statement::Commit, &context)
         .unwrap();
@@ -771,7 +1145,12 @@ fn plans_create_insert_and_txn_statements() {
             values: vec![Value::Integer(1), Value::Text("alice".to_string())],
         }
     );
-    assert_eq!(begin, Plan::BeginTxn);
+    assert_eq!(
+        begin,
+        Plan::BeginTxn {
+            isolation_level: rustsql::sql::ast::IsolationLevel::ReadCommitted,
+        }
+    );
     assert_eq!(commit, Plan::CommitTxn);
     assert_eq!(rollback, Plan::RollbackTxn);
 }
@@ -1041,6 +1420,7 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
         HashMap::new(),
     );
     let statement = Statement::Select(SelectStatement {
+        with: None,
         columns: vec![
             SelectItem::Column("active".to_string()),
             SelectItem::Aggregate {
@@ -1049,11 +1429,14 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
                 alias: Some("total".to_string()),
             },
         ],
-        table: "users".to_string(),
-        table_alias: None,
+        from: FromItem::Table {
+            name: "users".to_string(),
+            alias: None,
+        },
         joins: vec![],
         filter: None,
         group_by: vec![ScalarExpr::Column("active".to_string())],
+        compounds: vec![],
         order_by: vec![OrderBy {
             expr: OrderByExpr::Column("total".to_string()),
             descending: true,
@@ -1115,6 +1498,7 @@ fn plans_aggregate_scalar_expression_arguments() {
         HashMap::new(),
     );
     let statement = Statement::Select(SelectStatement {
+        with: None,
         columns: vec![SelectItem::Aggregate {
             func: AggregateFunc::Sum,
             arg: AggregateArg::Expr {
@@ -1127,11 +1511,14 @@ fn plans_aggregate_scalar_expression_arguments() {
             },
             alias: Some("total".to_string()),
         }],
-        table: "users".to_string(),
-        table_alias: None,
+        from: FromItem::Table {
+            name: "users".to_string(),
+            alias: None,
+        },
         joins: vec![],
         filter: None,
         group_by: vec![],
+        compounds: vec![],
         order_by: vec![],
         limit: None,
         distinct: false,
@@ -1190,16 +1577,20 @@ fn planner_rejects_having_reference_to_ungrouped_source_column() {
         HashMap::new(),
     );
     let statement = Statement::Select(SelectStatement {
+        with: None,
         columns: vec![SelectItem::Aggregate {
             func: AggregateFunc::Count,
             arg: AggregateArg::Wildcard,
             alias: Some("total".to_string()),
         }],
-        table: "users".to_string(),
-        table_alias: None,
+        from: FromItem::Table {
+            name: "users".to_string(),
+            alias: None,
+        },
         joins: vec![],
         filter: None,
         group_by: vec![],
+        compounds: vec![],
         order_by: vec![],
         limit: None,
         distinct: false,
@@ -1235,12 +1626,16 @@ fn planner_rejects_order_by_ungrouped_source_column_in_grouped_projection() {
         HashMap::new(),
     );
     let statement = Statement::Select(SelectStatement {
+        with: None,
         columns: vec![SelectItem::Column("age".to_string())],
-        table: "users".to_string(),
-        table_alias: None,
+        from: FromItem::Table {
+            name: "users".to_string(),
+            alias: None,
+        },
         joins: vec![],
         filter: None,
         group_by: vec![ScalarExpr::Column("age".to_string())],
+        compounds: vec![],
         order_by: vec![OrderBy {
             expr: OrderByExpr::Column("id".to_string()),
             descending: true,
@@ -1276,6 +1671,7 @@ fn planner_rejects_sum_non_integer_scalar_expression_argument() {
         HashMap::new(),
     );
     let statement = Statement::Select(SelectStatement {
+        with: None,
         columns: vec![SelectItem::Aggregate {
             func: AggregateFunc::Sum,
             arg: AggregateArg::Expr {
@@ -1288,11 +1684,14 @@ fn planner_rejects_sum_non_integer_scalar_expression_argument() {
             },
             alias: Some("total".to_string()),
         }],
-        table: "users".to_string(),
-        table_alias: None,
+        from: FromItem::Table {
+            name: "users".to_string(),
+            alias: None,
+        },
         joins: vec![],
         filter: None,
         group_by: vec![],
+        compounds: vec![],
         order_by: vec![],
         limit: None,
         distinct: false,
@@ -1328,15 +1727,20 @@ fn plans_join_query_as_nested_loop_join() {
         HashMap::new(),
     );
     let statement = Statement::Select(SelectStatement {
+        with: None,
         columns: vec![
             SelectItem::Column("u.name".to_string()),
             SelectItem::Column("o.amount".to_string()),
         ],
-        table: "users".to_string(),
-        table_alias: Some("u".to_string()),
+        from: FromItem::Table {
+            name: "users".to_string(),
+            alias: Some("u".to_string()),
+        },
         joins: vec![JoinClause {
-            table: "orders".to_string(),
-            table_alias: Some("o".to_string()),
+            source: FromItem::Table {
+                name: "orders".to_string(),
+                alias: Some("o".to_string()),
+            },
             on: Expr::CompareColumns {
                 left: "u.id".to_string(),
                 op: CompareOp::Eq,
@@ -1350,6 +1754,7 @@ fn plans_join_query_as_nested_loop_join() {
             value: Value::Integer(10),
         }),
         group_by: vec![],
+        compounds: vec![],
         order_by: vec![OrderBy {
             expr: OrderByExpr::Column("u.name".to_string()),
             descending: false,
@@ -1365,11 +1770,25 @@ fn plans_join_query_as_nested_loop_join() {
     assert_eq!(
         plan,
         Plan::NestedLoopJoin {
-            table: "users".to_string(),
-            table_alias: Some("u".to_string()),
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: Some("u".to_string()),
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
             joins: vec![JoinPlan {
-                table: "orders".to_string(),
-                table_alias: Some("o".to_string()),
+                source: Box::new(Plan::SeqScan {
+                    table: "orders".to_string(),
+                    table_alias: Some("o".to_string()),
+                    columns: vec![SelectItem::Wildcard],
+                    filter: None,
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
                 on: Expr::CompareColumns {
                     left: "u.id".to_string(),
                     op: CompareOp::Eq,
@@ -1398,6 +1817,556 @@ fn plans_join_query_as_nested_loop_join() {
 }
 
 #[test]
+fn plans_join_with_derived_source_on_right_as_nested_loop_join() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([
+            (
+                "users".to_string(),
+                Schema::new(
+                    "users",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("name", ColumnType::Text),
+                        ColumnDef::new("age", ColumnType::Integer),
+                    ],
+                ),
+            ),
+            (
+                "orders".to_string(),
+                Schema::new(
+                    "orders",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("user_id", ColumnType::Integer),
+                        ColumnDef::new("amount", ColumnType::Integer),
+                    ],
+                ),
+            ),
+        ]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "SELECT u.name, t.bucket
+         FROM users u
+         JOIN (SELECT id, age + 1 AS bucket FROM users) t ON u.id = t.id
+         ORDER BY u.name ASC;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::NestedLoopJoin {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: Some("u".to_string()),
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            joins: vec![JoinPlan {
+                source: Box::new(Plan::DerivedSource {
+                    source: Box::new(Plan::SeqScan {
+                        table: "users".to_string(),
+                        table_alias: None,
+                        columns: vec![
+                            SelectItem::Column("id".to_string()),
+                            SelectItem::Expr {
+                                expr: ScalarExpr::Binary {
+                                    left: Box::new(ScalarExpr::Column("age".to_string())),
+                                    op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                                    right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                                },
+                                alias: Some("bucket".to_string()),
+                            },
+                        ],
+                        filter: None,
+                        order_by: vec![],
+                        limit: None,
+                        distinct: false,
+                    }),
+                    alias: "t".to_string(),
+                    output_columns: vec!["id".to_string(), "bucket".to_string()],
+                    columns: vec![SelectItem::Wildcard],
+                    filter: None,
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
+                on: Expr::CompareScalar {
+                    left: rustsql::sql::ast::ScalarExpr::Column("u.id".to_string()),
+                    op: CompareOp::Eq,
+                    right: rustsql::sql::ast::ScalarExpr::Column("t.id".to_string()),
+                },
+                kind: JoinKind::Inner,
+            }],
+            columns: vec![
+                SelectItem::Column("u.name".to_string()),
+                SelectItem::Column("t.bucket".to_string()),
+            ],
+            filter: None,
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Column("u.name".to_string()),
+                descending: false,
+                nulls: None,
+            }],
+            limit: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn planner_rejects_reference_to_unexposed_inner_column_from_joined_derived_source() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("name", ColumnType::Text),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "SELECT u.name
+         FROM users u
+         JOIN (SELECT id, age + 1 AS bucket FROM users) t ON u.id = t.id
+         WHERE t.age > 20;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+    assert_eq!(error.to_string(), "plan error: unknown column t.age");
+}
+
+#[test]
+fn plans_aggregate_query_over_derived_source() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "SELECT bucket, COUNT(*) AS total
+         FROM (SELECT age + 1 AS bucket FROM users) t
+         GROUP BY bucket
+         HAVING bucket > 20
+         ORDER BY total DESC;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::Aggregate {
+            source: Box::new(Plan::DerivedSource {
+                source: Box::new(Plan::SeqScan {
+                    table: "users".to_string(),
+                    table_alias: None,
+                    columns: vec![SelectItem::Expr {
+                        expr: ScalarExpr::Binary {
+                            left: Box::new(ScalarExpr::Column("age".to_string())),
+                            op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                            right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                        },
+                        alias: Some("bucket".to_string()),
+                    }],
+                    filter: None,
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
+                alias: "t".to_string(),
+                output_columns: vec!["bucket".to_string()],
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            columns: vec![
+                SelectItem::Column("bucket".to_string()),
+                SelectItem::Aggregate {
+                    func: AggregateFunc::Count,
+                    arg: AggregateArg::Wildcard,
+                    alias: Some("total".to_string()),
+                },
+            ],
+            group_by: vec![ScalarExpr::Column("bucket".to_string())],
+            having: Some(Expr::Compare {
+                column: "bucket".to_string(),
+                op: CompareOp::Gt,
+                value: Value::Integer(20),
+            }),
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Column("total".to_string()),
+                descending: true,
+                nulls: None,
+            }],
+            limit: None,
+        }
+    );
+}
+
+#[test]
+fn planner_lowers_single_cte_source_to_aggregate_over_derived_source() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "WITH buckets AS (SELECT age + 1 AS bucket FROM users)
+         SELECT bucket, COUNT(*) AS total
+         FROM buckets
+         GROUP BY bucket
+         HAVING bucket > 20
+         ORDER BY total DESC;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::Aggregate {
+            source: Box::new(Plan::DerivedSource {
+                source: Box::new(Plan::SeqScan {
+                    table: "users".to_string(),
+                    table_alias: None,
+                    columns: vec![SelectItem::Expr {
+                        expr: ScalarExpr::Binary {
+                            left: Box::new(ScalarExpr::Column("age".to_string())),
+                            op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                            right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                        },
+                        alias: Some("bucket".to_string()),
+                    }],
+                    filter: None,
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
+                alias: "buckets".to_string(),
+                output_columns: vec!["bucket".to_string()],
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            columns: vec![
+                SelectItem::Column("bucket".to_string()),
+                SelectItem::Aggregate {
+                    func: AggregateFunc::Count,
+                    arg: AggregateArg::Wildcard,
+                    alias: Some("total".to_string()),
+                },
+            ],
+            group_by: vec![ScalarExpr::Column("bucket".to_string())],
+            having: Some(Expr::Compare {
+                column: "bucket".to_string(),
+                op: CompareOp::Gt,
+                value: Value::Integer(20),
+            }),
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Column("total".to_string()),
+                descending: true,
+                nulls: None,
+            }],
+            limit: None,
+        }
+    );
+}
+
+#[test]
+fn planner_lowers_chained_cte_references_to_nested_derived_sources() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("name", ColumnType::Text),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "WITH adults AS (SELECT id, name FROM users WHERE age >= 18),
+              named AS (SELECT id FROM adults WHERE name IS NOT NULL)
+         SELECT id FROM named ORDER BY id ASC;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::DerivedSource {
+            source: Box::new(Plan::DerivedSource {
+                source: Box::new(Plan::SeqScan {
+                    table: "users".to_string(),
+                    table_alias: None,
+                    columns: vec![
+                        SelectItem::Column("id".to_string()),
+                        SelectItem::Column("name".to_string()),
+                    ],
+                    filter: Some(Expr::Compare {
+                        column: "age".to_string(),
+                        op: CompareOp::Gte,
+                        value: Value::Integer(18),
+                    }),
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
+                alias: "adults".to_string(),
+                output_columns: vec!["id".to_string(), "name".to_string()],
+                columns: vec![SelectItem::Column("id".to_string())],
+                filter: Some(Expr::IsNull {
+                    column: "name".to_string(),
+                    negated: true,
+                }),
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            alias: "named".to_string(),
+            output_columns: vec!["id".to_string()],
+            columns: vec![SelectItem::Column("id".to_string())],
+            filter: None,
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Column("id".to_string()),
+                descending: false,
+                nulls: None,
+            }],
+            limit: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn planner_rejects_duplicate_cte_names() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "WITH dup AS (SELECT id FROM users),
+              dup AS (SELECT age FROM users)
+         SELECT id FROM dup;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert_eq!(error.to_string(), "plan error: duplicate CTE name: dup");
+}
+
+#[test]
+fn plans_aggregate_query_over_joined_derived_source() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("age", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "SELECT t.bucket, COUNT(*) AS total
+         FROM users u
+         JOIN (SELECT id, age + 1 AS bucket FROM users) t ON u.id = t.id
+         GROUP BY t.bucket
+         HAVING t.bucket > 20
+         ORDER BY t.bucket ASC;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let plan = planner.plan_statement(&statement, &context).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::Aggregate {
+            source: Box::new(Plan::NestedLoopJoin {
+                source: Box::new(Plan::SeqScan {
+                    table: "users".to_string(),
+                    table_alias: Some("u".to_string()),
+                    columns: vec![SelectItem::Wildcard],
+                    filter: None,
+                    order_by: vec![],
+                    limit: None,
+                    distinct: false,
+                }),
+                joins: vec![JoinPlan {
+                    source: Box::new(Plan::DerivedSource {
+                        source: Box::new(Plan::SeqScan {
+                            table: "users".to_string(),
+                            table_alias: None,
+                            columns: vec![
+                                SelectItem::Column("id".to_string()),
+                                SelectItem::Expr {
+                                    expr: ScalarExpr::Binary {
+                                        left: Box::new(ScalarExpr::Column("age".to_string())),
+                                        op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                                        right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                                    },
+                                    alias: Some("bucket".to_string()),
+                                },
+                            ],
+                            filter: None,
+                            order_by: vec![],
+                            limit: None,
+                            distinct: false,
+                        }),
+                        alias: "t".to_string(),
+                        output_columns: vec!["id".to_string(), "bucket".to_string()],
+                        columns: vec![SelectItem::Wildcard],
+                        filter: None,
+                        order_by: vec![],
+                        limit: None,
+                        distinct: false,
+                    }),
+                    on: Expr::CompareScalar {
+                        left: ScalarExpr::Column("u.id".to_string()),
+                        op: CompareOp::Eq,
+                        right: ScalarExpr::Column("t.id".to_string()),
+                    },
+                    kind: JoinKind::Inner,
+                }],
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                distinct: false,
+            }),
+            columns: vec![
+                SelectItem::Column("t.bucket".to_string()),
+                SelectItem::Aggregate {
+                    func: AggregateFunc::Count,
+                    arg: AggregateArg::Wildcard,
+                    alias: Some("total".to_string()),
+                },
+            ],
+            group_by: vec![ScalarExpr::Column("t.bucket".to_string())],
+            having: Some(Expr::Compare {
+                column: "t.bucket".to_string(),
+                op: CompareOp::Gt,
+                value: Value::Integer(20),
+            }),
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Column("t.bucket".to_string()),
+                descending: false,
+                nulls: None,
+            }],
+            limit: None,
+        }
+    );
+}
+
+#[test]
+fn planner_rejects_aggregate_reference_to_ambiguous_joined_derived_output() {
+    let planner = Planner::new();
+    let context = PlanningContext::new(
+        HashMap::from([
+            (
+                "users".to_string(),
+                Schema::new(
+                    "users",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("age", ColumnType::Integer),
+                    ],
+                ),
+            ),
+            (
+                "orders".to_string(),
+                Schema::new(
+                    "orders",
+                    vec![
+                        ColumnDef::primary_key("id", ColumnType::Integer),
+                        ColumnDef::new("user_id", ColumnType::Integer),
+                    ],
+                ),
+            ),
+        ]),
+        HashMap::new(),
+    );
+    let statement = parse_sql(
+        "SELECT id, COUNT(*) AS total
+         FROM (SELECT * FROM users u JOIN orders o ON u.id = o.user_id) t
+         GROUP BY id;",
+    )
+    .unwrap()
+    .remove(0);
+
+    let error = planner.plan_statement(&statement, &context).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "plan error: ambiguous column reference: id"
+    );
+}
+
+#[test]
 fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
     let planner = Planner::new();
     let context = PlanningContext::new(
@@ -1414,6 +2383,7 @@ fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
         HashMap::new(),
     );
     let statement = Statement::Select(SelectStatement {
+        with: None,
         columns: vec![
             SelectItem::Expr {
                 expr: ScalarExpr::Binary {
@@ -1429,8 +2399,10 @@ fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
                 alias: Some("total".to_string()),
             },
         ],
-        table: "users".to_string(),
-        table_alias: None,
+        from: FromItem::Table {
+            name: "users".to_string(),
+            alias: None,
+        },
         joins: vec![],
         filter: None,
         group_by: vec![ScalarExpr::Binary {
@@ -1438,6 +2410,7 @@ fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
             op: rustsql::sql::ast::ScalarBinaryOp::Add,
             right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
         }],
+        compounds: vec![],
         order_by: vec![OrderBy {
             expr: OrderByExpr::Expr(ScalarExpr::Binary {
                 left: Box::new(ScalarExpr::Column("total".to_string())),
@@ -1529,15 +2502,21 @@ fn planner_rejects_unknown_qualified_column_in_correlated_subquery() {
         HashMap::new(),
     );
     let statement = Statement::Select(SelectStatement {
+        with: None,
         columns: vec![SelectItem::Column("u.name".to_string())],
-        table: "users".to_string(),
-        table_alias: Some("u".to_string()),
+        from: FromItem::Table {
+            name: "users".to_string(),
+            alias: Some("u".to_string()),
+        },
         joins: vec![],
         filter: Some(Expr::ExistsSubquery {
             query: Box::new(SelectStatement {
+                with: None,
                 columns: vec![SelectItem::Column("id".to_string())],
-                table: "orders".to_string(),
-                table_alias: Some("o".to_string()),
+                from: FromItem::Table {
+                    name: "orders".to_string(),
+                    alias: Some("o".to_string()),
+                },
                 joins: vec![],
                 filter: Some(Expr::CompareColumns {
                     left: "o.user_id".to_string(),
@@ -1545,6 +2524,7 @@ fn planner_rejects_unknown_qualified_column_in_correlated_subquery() {
                     right: "x.id".to_string(),
                 }),
                 group_by: vec![],
+                compounds: vec![],
                 order_by: vec![],
                 limit: None,
                 distinct: false,
@@ -1553,6 +2533,7 @@ fn planner_rejects_unknown_qualified_column_in_correlated_subquery() {
             negated: false,
         }),
         group_by: vec![],
+        compounds: vec![],
         order_by: vec![],
         limit: None,
         distinct: false,
@@ -1594,13 +2575,18 @@ fn planner_rejects_join_condition_reference_to_future_join_alias() {
         HashMap::new(),
     );
     let statement = Statement::Select(SelectStatement {
+        with: None,
         columns: vec![SelectItem::Column("u.name".to_string())],
-        table: "users".to_string(),
-        table_alias: Some("u".to_string()),
+        from: FromItem::Table {
+            name: "users".to_string(),
+            alias: Some("u".to_string()),
+        },
         joins: vec![
             JoinClause {
-                table: "orders".to_string(),
-                table_alias: Some("o".to_string()),
+                source: FromItem::Table {
+                    name: "orders".to_string(),
+                    alias: Some("o".to_string()),
+                },
                 on: Expr::CompareScalar {
                     left: rustsql::sql::ast::ScalarExpr::Column("u.id".to_string()),
                     op: CompareOp::Eq,
@@ -1609,8 +2595,10 @@ fn planner_rejects_join_condition_reference_to_future_join_alias() {
                 kind: JoinKind::Inner,
             },
             JoinClause {
-                table: "payments".to_string(),
-                table_alias: Some("p".to_string()),
+                source: FromItem::Table {
+                    name: "payments".to_string(),
+                    alias: Some("p".to_string()),
+                },
                 on: Expr::CompareScalar {
                     left: rustsql::sql::ast::ScalarExpr::Column("o.id".to_string()),
                     op: CompareOp::Eq,
@@ -1621,6 +2609,7 @@ fn planner_rejects_join_condition_reference_to_future_join_alias() {
         ],
         filter: None,
         group_by: vec![],
+        compounds: vec![],
         order_by: vec![],
         limit: None,
         distinct: false,

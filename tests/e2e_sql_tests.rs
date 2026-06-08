@@ -1,8 +1,12 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use rustsql::common::types::{ForeignKey, Value};
 use rustsql::db::Database;
+use rustsql::storage::v2::FileStorage as V2FileStorage;
 use tempfile::tempdir;
 
 #[test]
@@ -259,6 +263,72 @@ fn database_explicit_transactions_rollback_and_commit() {
         db.query("SELECT * FROM users WHERE id = 2;").unwrap(),
         vec![vec![Value::Integer(2), Value::from("bob")]]
     );
+
+    db.execute("BEGIN ISOLATION LEVEL SERIALIZABLE; INSERT INTO users VALUES (3, 'carol'); COMMIT;")
+        .unwrap();
+    assert_eq!(
+        db.query("SELECT * FROM users WHERE id = 3;").unwrap(),
+        vec![vec![Value::Integer(3), Value::from("carol")]]
+    );
+
+    db.execute(
+        "START TRANSACTION ISOLATION LEVEL READ COMMITTED; INSERT INTO users VALUES (4, 'dave'); ROLLBACK;",
+    )
+    .unwrap();
+    assert_eq!(
+        db.query("SELECT * FROM users WHERE id = 4;").unwrap(),
+        Vec::<Vec<Value>>::new()
+    );
+}
+
+#[test]
+fn database_with_storage_v2_serializable_select_blocks_conflicting_insert() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db");
+    let setup_db = Database::with_storage(V2FileStorage::open(&path).unwrap());
+
+    setup_db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN);
+         CREATE INDEX idx_users_active_name ON users (active, name);",
+    )
+    .unwrap();
+
+    let (reader_locked_tx, reader_locked_rx) = mpsc::channel();
+    let (release_reader_tx, release_reader_rx) = mpsc::channel();
+    let (writer_done_tx, writer_done_rx) = mpsc::channel();
+
+    let reader_path = path.clone();
+    let reader = thread::spawn(move || {
+        let db = Database::with_storage(V2FileStorage::open(&reader_path).unwrap());
+        db.execute("BEGIN ISOLATION LEVEL SERIALIZABLE;").unwrap();
+        assert_eq!(
+            db.query(
+                "SELECT id FROM users WHERE active = true AND name >= 'alice' AND name <= 'carol';",
+            )
+            .unwrap(),
+            Vec::<Vec<Value>>::new()
+        );
+        reader_locked_tx.send(()).unwrap();
+        release_reader_rx.recv().unwrap();
+        db.execute("ROLLBACK;").unwrap();
+    });
+
+    reader_locked_rx.recv().unwrap();
+
+    let writer_path = path.clone();
+    let writer = thread::spawn(move || {
+        let db = Database::with_storage(V2FileStorage::open(&writer_path).unwrap());
+        db.execute("INSERT INTO users VALUES (1, 'bob', true);")
+            .unwrap();
+        writer_done_tx.send(()).unwrap();
+    });
+
+    assert!(writer_done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    release_reader_tx.send(()).unwrap();
+    writer_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    reader.join().unwrap();
+    writer.join().unwrap();
 }
 
 #[test]
@@ -1056,6 +1126,187 @@ fn database_supports_having_left_join_and_distinct() {
 }
 
 #[test]
+fn database_union_deduplicates_rows() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE left_values (id INTEGER PRIMARY KEY, value INTEGER);
+         CREATE TABLE right_values (id INTEGER PRIMARY KEY, value INTEGER);
+         INSERT INTO left_values VALUES (1, 1);
+         INSERT INTO left_values VALUES (2, 2);
+         INSERT INTO right_values VALUES (10, 2);
+         INSERT INTO right_values VALUES (11, 2);
+         INSERT INTO right_values VALUES (12, 3);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT value FROM left_values
+             UNION
+             SELECT value FROM right_values
+             ORDER BY value ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ]
+    );
+}
+
+#[test]
+fn database_union_all_preserves_duplicate_rows() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE left_values (id INTEGER PRIMARY KEY, value INTEGER);
+         CREATE TABLE right_values (id INTEGER PRIMARY KEY, value INTEGER);
+         INSERT INTO left_values VALUES (1, 1);
+         INSERT INTO left_values VALUES (2, 2);
+         INSERT INTO right_values VALUES (10, 2);
+         INSERT INTO right_values VALUES (11, 2);
+         INSERT INTO right_values VALUES (12, 3);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT value FROM left_values
+             UNION ALL
+             SELECT value FROM right_values
+             ORDER BY value ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ]
+    );
+}
+
+#[test]
+fn database_applies_order_by_and_limit_to_entire_union_all_result() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE left_values (id INTEGER PRIMARY KEY, value INTEGER);
+         CREATE TABLE right_values (id INTEGER PRIMARY KEY, value INTEGER);
+         INSERT INTO left_values VALUES (1, 1);
+         INSERT INTO left_values VALUES (2, 4);
+         INSERT INTO right_values VALUES (10, 2);
+         INSERT INTO right_values VALUES (11, 3);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT value FROM left_values
+             UNION ALL
+             SELECT value FROM right_values
+             ORDER BY value DESC
+             LIMIT 2;",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::Integer(4)], vec![Value::Integer(3)]]);
+}
+
+#[test]
+fn database_joins_with_derived_source_on_right() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);
+         INSERT INTO users VALUES (1, 'alice', 20);
+         INSERT INTO users VALUES (2, 'bob', 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT u.name, t.bucket
+             FROM users u
+             JOIN (SELECT id, age + 1 AS bucket FROM users) t ON u.id = t.id
+             ORDER BY u.id ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from("alice"), Value::Integer(21)],
+            vec![Value::from("bob"), Value::Integer(31)],
+        ]
+    );
+}
+
+#[test]
+fn database_left_joins_aggregate_derived_source() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL);
+         INSERT INTO users VALUES (1, 'alice');
+         INSERT INTO users VALUES (2, 'bob');
+         INSERT INTO users VALUES (3, 'carol');
+         INSERT INTO orders VALUES (1, 1, 40);
+         INSERT INTO orders VALUES (2, 1, 120);
+         INSERT INTO orders VALUES (3, 3, 200);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT u.id, t.total
+             FROM users u
+             LEFT JOIN (
+                 SELECT user_id, COUNT(*) AS total
+                 FROM orders
+                 GROUP BY user_id
+             ) t ON u.id = t.user_id
+             ORDER BY u.id ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Null],
+            vec![Value::Integer(3), Value::Integer(1)],
+        ]
+    );
+}
+
+#[test]
+fn database_rejects_reference_to_unexposed_inner_column_from_joined_derived_source() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);
+         INSERT INTO users VALUES (1, 'alice', 20);",
+    )
+    .unwrap();
+
+    let error = db
+        .query(
+            "SELECT u.name
+             FROM users u
+             JOIN (SELECT id, age + 1 AS bucket FROM users) t ON u.id = t.id
+             WHERE t.age > 20;",
+        )
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "plan error: unknown column t.age");
+}
+
+#[test]
 fn database_supports_common_sql_predicates_order_positions_and_distinct_aggregates() {
     let db = Database::memory();
 
@@ -1447,6 +1698,206 @@ fn database_groups_with_scalar_projection_and_scalar_aggregate_argument() {
 }
 
 #[test]
+fn database_selects_from_subquery_and_filters_on_derived_alias() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO users VALUES (2, 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT bucket
+             FROM (SELECT age + 1 AS bucket FROM users) t
+             WHERE bucket > 21
+             ORDER BY bucket ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::Integer(31)]]);
+}
+
+#[test]
+fn database_consumes_aggregate_subquery_outputs_as_regular_columns() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO users VALUES (2, 20);
+         INSERT INTO users VALUES (3, 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT bucket, total
+             FROM (
+                 SELECT age + 1 AS bucket, COUNT(*) AS total
+                 FROM users
+                 GROUP BY age + 1
+             ) t
+             WHERE total > 1
+             ORDER BY bucket ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(rows, vec![vec![Value::Integer(21), Value::Integer(2)]]);
+}
+
+#[test]
+fn database_aggregates_over_derived_source() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO users VALUES (2, 20);
+         INSERT INTO users VALUES (3, 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT bucket, COUNT(*) AS total
+             FROM (SELECT age + 1 AS bucket FROM users) t
+             GROUP BY bucket
+             HAVING bucket > 20
+             ORDER BY bucket ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(21), Value::Integer(2)],
+            vec![Value::Integer(31), Value::Integer(1)],
+        ]
+    );
+}
+
+#[test]
+fn database_aggregates_over_joined_derived_source() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO users VALUES (2, 20);
+         INSERT INTO users VALUES (3, 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT t.bucket, COUNT(*) AS total
+             FROM users u
+             JOIN (SELECT id, age + 1 AS bucket FROM users) t ON u.id = t.id
+             GROUP BY t.bucket
+             HAVING t.bucket > 20
+             ORDER BY t.bucket ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(21), Value::Integer(2)],
+            vec![Value::Integer(31), Value::Integer(1)],
+        ]
+    );
+}
+
+#[test]
+fn database_selects_from_wildcard_subquery_columns() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO users VALUES (2, 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT age
+             FROM (SELECT * FROM users) t
+             ORDER BY age ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(20)], vec![Value::Integer(30)]]
+    );
+}
+
+#[test]
+fn database_selects_from_qualified_column_subquery_using_unqualified_output_name() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO users VALUES (2, 30);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "SELECT age
+             FROM (SELECT u.age FROM users u) t
+             ORDER BY age ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(20)], vec![Value::Integer(30)]]
+    );
+}
+
+#[test]
+fn database_rejects_unqualified_duplicate_output_from_joined_wildcard_derived_source() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO orders VALUES (10, 1);",
+    )
+    .unwrap();
+
+    let error = db
+        .query("SELECT id FROM (SELECT * FROM users u JOIN orders o ON u.id = o.user_id) t;")
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "plan error: ambiguous column reference: id"
+    );
+}
+
+#[test]
+fn database_rejects_qualified_duplicate_output_from_joined_wildcard_derived_source() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER);
+         INSERT INTO users VALUES (1, 20);
+         INSERT INTO orders VALUES (10, 1);",
+    )
+    .unwrap();
+
+    let error = db
+        .query("SELECT t.id FROM (SELECT * FROM users u JOIN orders o ON u.id = o.user_id) t;")
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "plan error: ambiguous column reference: t.id"
+    );
+}
+
+#[test]
 fn database_having_and_order_by_can_reference_group_expression_without_alias() {
     let db = Database::memory();
     db.execute(
@@ -1708,6 +2159,75 @@ fn database_filters_with_scalar_expression_in_subquery() {
         .unwrap();
 
     assert_eq!(not_in_rows, vec![vec![Value::from("bob")]]);
+}
+
+#[test]
+fn database_supports_cte_in_in_subquery() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL);
+         INSERT INTO users VALUES (1, 'alice');
+         INSERT INTO users VALUES (2, 'bob');
+         INSERT INTO users VALUES (3, 'carol');
+         INSERT INTO orders VALUES (1, 1, 120);
+         INSERT INTO orders VALUES (2, 2, 5);
+         INSERT INTO orders VALUES (3, 3, 200);",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "WITH high_spenders AS (
+                 SELECT user_id
+                 FROM orders
+                 WHERE amount >= 100
+             )
+             SELECT name
+             FROM users
+             WHERE id IN (SELECT user_id FROM high_spenders)
+             ORDER BY name ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![vec![Value::from("alice")], vec![Value::from("carol")]]
+    );
+}
+
+#[test]
+fn database_cte_shadows_base_table_name_in_outer_query() {
+    let db = Database::memory();
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TABLE archived_users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+         INSERT INTO users VALUES (1, 'active_alice');
+         INSERT INTO users VALUES (2, 'active_bob');
+         INSERT INTO archived_users VALUES (10, 'archived_zoe');
+         INSERT INTO archived_users VALUES (11, 'archived_yuki');",
+    )
+    .unwrap();
+
+    let rows = db
+        .query(
+            "WITH users AS (
+                 SELECT id, name
+                 FROM archived_users
+             )
+             SELECT name
+             FROM users
+             ORDER BY id ASC;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from("archived_zoe")],
+            vec![Value::from("archived_yuki")],
+        ]
+    );
 }
 
 #[test]
