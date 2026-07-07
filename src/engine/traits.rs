@@ -1,10 +1,12 @@
 //! Storage engine traits shared by future backends.
 
+use std::path::PathBuf;
+
 use crate::common::error::Result;
 use crate::common::types::{ColumnDef, IndexMeta, Row, RowId, Schema, Value};
 use crate::engine::txn::TransactionId;
-use crate::sql::ast::IsolationLevel;
 use crate::sql::ast::CompareOp;
+use crate::sql::ast::IsolationLevel;
 use crate::sql::planner::PlanningContext;
 
 pub trait CatalogStore {
@@ -29,6 +31,12 @@ pub trait CatalogStore {
         schema_name: &str,
         old_name: &str,
         new_name: &str,
+    ) -> Result<()>;
+    fn drop_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        old_name: &str,
     ) -> Result<()>;
     fn get_schema(&self, transaction_id: TransactionId, name: &str) -> Result<Option<Schema>>;
     fn list_schemas(&self, transaction_id: TransactionId) -> Result<Vec<Schema>>;
@@ -91,6 +99,13 @@ pub trait IndexStore {
         transaction_id: TransactionId,
         schema_name: &str,
     ) -> Result<Vec<IndexMeta>>;
+    fn list_all_indexes(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+    ) -> Result<Vec<IndexMeta>> {
+        self.list_indexes(transaction_id, schema_name)
+    }
     fn lookup_index(
         &self,
         transaction_id: TransactionId,
@@ -134,4 +149,69 @@ pub trait PlanningStorageEngine: StorageEngine {
         &self,
         transaction_id: Option<TransactionId>,
     ) -> Result<PlanningContext>;
+
+    fn database_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    fn journal_mode(&self) -> &'static str {
+        "memory"
+    }
+
+    fn ignore_check_constraints(&self) -> bool {
+        false
+    }
+
+    fn set_ignore_check_constraints(&self, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+
+    fn case_sensitive_like(&self) -> bool {
+        false
+    }
+
+    fn set_case_sensitive_like(&self, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+
+    fn database_page_size(&self) -> u32 {
+        4096
+    }
+
+    fn database_page_count(&self) -> Result<u32> {
+        Ok(0)
+    }
+
+    fn database_freelist_count(&self) -> Result<u32> {
+        Ok(0)
+    }
+
+    fn user_version(&self) -> Result<u32> {
+        Ok(0)
+    }
+
+    fn set_user_version(&self, _version: u32) -> Result<()> {
+        Ok(())
+    }
+
+    fn application_id(&self) -> Result<u32> {
+        Ok(0)
+    }
+
+    fn set_application_id(&self, _application_id: u32) -> Result<()> {
+        Ok(())
+    }
+
+    fn schema_version(&self) -> Result<u32> {
+        Ok(0)
+    }
+
+    fn set_schema_version(&self, _schema_version: u32) -> Result<()> {
+        Ok(())
+    }
+
+    fn increment_schema_version(&self) -> Result<()> {
+        let next = self.schema_version()?.wrapping_add(1);
+        self.set_schema_version(next)
+    }
 }

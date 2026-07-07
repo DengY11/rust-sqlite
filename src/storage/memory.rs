@@ -24,6 +24,11 @@ struct MemoryStorageInner {
     next_row_ids: HashMap<String, u64>,
     next_txn_id: u64,
     active_txn: Option<ActiveTransaction>,
+    user_version: u32,
+    application_id: u32,
+    schema_version: u32,
+    ignore_check_constraints: bool,
+    case_sensitive_like: bool,
 }
 
 #[derive(Debug)]
@@ -83,6 +88,11 @@ impl Default for MemoryStorageInner {
             next_row_ids: HashMap::new(),
             next_txn_id: 1,
             active_txn: None,
+            user_version: 0,
+            application_id: 0,
+            schema_version: 0,
+            ignore_check_constraints: false,
+            case_sensitive_like: false,
         }
     }
 }
@@ -125,9 +135,89 @@ impl PlanningStorageEngine for MemoryStorage {
     ) -> Result<PlanningContext> {
         self.planning_context(transaction_id)
     }
+
+    fn user_version(&self) -> Result<u32> {
+        Ok(self.inner.borrow().user_version)
+    }
+
+    fn set_user_version(&self, version: u32) -> Result<()> {
+        self.inner.borrow_mut().user_version = version;
+        Ok(())
+    }
+
+    fn application_id(&self) -> Result<u32> {
+        Ok(self.inner.borrow().application_id)
+    }
+
+    fn set_application_id(&self, application_id: u32) -> Result<()> {
+        self.inner.borrow_mut().application_id = application_id;
+        Ok(())
+    }
+
+    fn schema_version(&self) -> Result<u32> {
+        Ok(self.inner.borrow().schema_version)
+    }
+
+    fn set_schema_version(&self, schema_version: u32) -> Result<()> {
+        self.inner.borrow_mut().schema_version = schema_version;
+        Ok(())
+    }
+
+    fn ignore_check_constraints(&self) -> bool {
+        self.inner.borrow().ignore_check_constraints
+    }
+
+    fn set_ignore_check_constraints(&self, enabled: bool) -> Result<()> {
+        self.inner.borrow_mut().ignore_check_constraints = enabled;
+        Ok(())
+    }
+
+    fn case_sensitive_like(&self) -> bool {
+        self.inner.borrow().case_sensitive_like
+    }
+
+    fn set_case_sensitive_like(&self, enabled: bool) -> Result<()> {
+        self.inner.borrow_mut().case_sensitive_like = enabled;
+        Ok(())
+    }
 }
 
 impl MemoryStorageInner {
+    fn is_primary_key_backing_index(schema: &Schema, index: &IndexMeta, schema_name: &str) -> bool {
+        schema
+            .primary_key_constraint
+            .as_ref()
+            .is_some_and(|primary_key| {
+                index
+                    .name
+                    .starts_with(&format!("sqlite_autoindex_{schema_name}_"))
+                    && primary_key.columns == index.columns
+            })
+    }
+
+    fn integer_primary_key_column_index(schema: &Schema) -> Option<usize> {
+        if schema.without_rowid {
+            return None;
+        }
+        let primary_key_columns = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .collect::<Vec<_>>();
+        let [(index, column)] = primary_key_columns.as_slice() else {
+            return None;
+        };
+        (matches!(
+            column.column_type,
+            crate::common::types::ColumnType::Integer
+        ) && !matches!(
+            column.primary_key_sort_order,
+            Some(crate::common::types::SortOrder::Desc)
+        ))
+        .then_some(*index)
+    }
+
     fn project_index_key(schema: &Schema, index: &IndexMeta, row: &Row) -> Result<Vec<Value>> {
         index
             .columns
@@ -233,7 +323,10 @@ impl MemoryStorageInner {
             return Ok(());
         };
 
-        for index in indexes.values() {
+        for index in indexes
+            .values()
+            .filter(|index| !Self::is_primary_key_backing_index(&schema, &index.meta, schema_name))
+        {
             let key = Self::project_index_key(&schema, &index.meta, row)?;
             if index.meta.enforces_unique_key(&key)
                 && index
@@ -270,6 +363,27 @@ impl MemoryStorageInner {
                 if row_ids.is_empty() {
                     index.entries.remove(&key);
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn rebuild_indexes_for_schema(
+        &mut self,
+        schema_name: &str,
+        schema: &Schema,
+        rows: &BTreeMap<RowId, Row>,
+    ) -> Result<()> {
+        let Some(indexes) = self.indexes.get_mut(schema_name) else {
+            return Ok(());
+        };
+
+        for index in indexes.values_mut() {
+            index.entries.clear();
+            for (row_id, row) in rows {
+                let key = Self::project_index_key(schema, &index.meta, row)?;
+                index.entries.entry(key).or_default().insert(*row_id);
             }
         }
 
@@ -528,7 +642,10 @@ impl CatalogStore for MemoryStorage {
         let indexes = inner.indexes.get(schema_name).cloned().unwrap_or_default();
         let next_row_id = inner.next_row_ids.get(schema_name).copied();
 
-        let default_value = column.default_value.clone().unwrap_or(Value::Null);
+        let default_value = column
+            .default_value
+            .as_ref()
+            .map_or(Ok(Value::Null), |default| default.evaluate())?;
         let old_schema = schema.clone();
         let mut updated_schema = schema;
         updated_schema.columns.push(column);
@@ -537,7 +654,8 @@ impl CatalogStore for MemoryStorage {
             let mut candidate = row.clone();
             candidate.push(default_value.clone());
             updated_schema.validate_row_values(&candidate)?;
-            updated_schema.validate_check_constraints(&candidate)?;
+            updated_schema
+                .validate_check_constraints_with_like_mode(&candidate, inner.case_sensitive_like)?;
         }
 
         inner.record_undo(UndoOp::RestoreTable {
@@ -610,7 +728,8 @@ impl CatalogStore for MemoryStorage {
             .filter(|(name, _)| name.as_str() != schema_name)
             .filter(|(_, schema)| {
                 schema.all_foreign_keys().iter().any(|foreign_key| {
-                    foreign_key.ref_table == schema_name && foreign_key.ref_column == old_name
+                    foreign_key.ref_table == schema_name
+                        && foreign_key.has_referenced_column(old_name)
                 })
             })
             .map(|(name, schema)| (name.clone(), schema.clone()))
@@ -629,6 +748,44 @@ impl CatalogStore for MemoryStorage {
                 schema.rename_foreign_key_ref_column(schema_name, old_name, new_name);
             }
         }
+        Ok(())
+    }
+
+    fn drop_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        old_name: &str,
+    ) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let schema = inner.require_schema(schema_name)?.clone();
+        let (updated_schema, removed_index) = schema.drop_column(old_name)?;
+        let rows = inner.rows.get(schema_name).cloned().unwrap_or_default();
+        let indexes = inner.indexes.get(schema_name).cloned().unwrap_or_default();
+        let next_row_id = inner.next_row_ids.get(schema_name).copied();
+        inner.record_undo(UndoOp::RestoreTable {
+            schema,
+            rows: rows.clone(),
+            indexes,
+            next_row_id,
+        });
+
+        let updated_rows = rows
+            .into_iter()
+            .map(|(row_id, mut row)| {
+                row.remove(removed_index);
+                (row_id, row)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        inner
+            .schemas
+            .insert(schema_name.to_string(), updated_schema.clone());
+        inner
+            .rows
+            .insert(schema_name.to_string(), updated_rows.clone());
+        inner.rebuild_indexes_for_schema(schema_name, &updated_schema, &updated_rows)?;
         Ok(())
     }
 
@@ -664,6 +821,33 @@ impl TableStore for MemoryStorage {
             )));
         }
 
+        let mut row = row;
+        let row_id =
+            if let Some(index) = MemoryStorageInner::integer_primary_key_column_index(&schema) {
+                match row.get(index) {
+                    Some(Value::Integer(value)) => RowId(u64::try_from(*value).map_err(|_| {
+                        DbError::storage("sqlite rowid must be a non-negative INTEGER")
+                    })?),
+                    Some(Value::Null) => {
+                        let row_id = inner.next_row_id(schema_name);
+                        row[index] =
+                            Value::Integer(i64::try_from(row_id.0).map_err(|_| {
+                                DbError::storage("sqlite rowid does not fit in i64")
+                            })?);
+                        row_id
+                    }
+                    Some(value) => {
+                        return Err(DbError::storage(format!(
+                            "sqlite rowid column must be INTEGER, got {}",
+                            value.type_name()
+                        )));
+                    }
+                    None => return Err(DbError::storage("sqlite row is missing rowid column")),
+                }
+            } else {
+                inner.next_row_id(schema_name)
+            };
+
         {
             let existing_rows = inner
                 .rows
@@ -671,12 +855,14 @@ impl TableStore for MemoryStorage {
                 .map(|rows| rows.values().collect::<Vec<_>>())
                 .unwrap_or_default();
             schema.validate_row_values(&row)?;
-            schema.validate_check_constraints(&row)?;
+            if !inner.ignore_check_constraints {
+                schema
+                    .validate_check_constraints_with_like_mode(&row, inner.case_sensitive_like)?;
+            }
             schema.validate_primary_key_uniqueness(&row, &existing_rows)?;
         }
         inner.validate_unique_index_constraints(schema_name, &row)?;
 
-        let row_id = inner.next_row_id(schema_name);
         inner
             .rows
             .entry(schema_name.to_string())
@@ -767,6 +953,7 @@ impl TableStore for MemoryStorage {
                 row.len()
             )));
         }
+        let mut row = row;
 
         let Some(existing_row) = inner
             .rows
@@ -777,12 +964,39 @@ impl TableStore for MemoryStorage {
             return Ok(());
         };
 
-        if existing_row == row {
+        let target_row_id =
+            if let Some(index) = MemoryStorageInner::integer_primary_key_column_index(&schema) {
+                match row.get(index) {
+                    Some(Value::Integer(value)) => RowId(u64::try_from(*value).map_err(|_| {
+                        DbError::storage("sqlite rowid must be a non-negative INTEGER")
+                    })?),
+                    Some(Value::Null) => {
+                        row[index] =
+                            Value::Integer(i64::try_from(row_id.0).map_err(|_| {
+                                DbError::storage("sqlite rowid does not fit in i64")
+                            })?);
+                        row_id
+                    }
+                    Some(value) => {
+                        return Err(DbError::storage(format!(
+                            "sqlite rowid column must be INTEGER, got {}",
+                            value.type_name()
+                        )));
+                    }
+                    None => return Err(DbError::storage("sqlite row is missing rowid column")),
+                }
+            } else {
+                row_id
+            };
+
+        if existing_row == row && target_row_id == row_id {
             return Ok(());
         }
 
         schema.validate_row_values(&row)?;
-        schema.validate_check_constraints(&row)?;
+        if !inner.ignore_check_constraints {
+            schema.validate_check_constraints_with_like_mode(&row, inner.case_sensitive_like)?;
+        }
 
         {
             let existing_rows = inner
@@ -803,7 +1017,9 @@ impl TableStore for MemoryStorage {
                 let key = MemoryStorageInner::project_index_key(&schema, &index.meta, &row)?;
                 if index.meta.enforces_unique_key(&key)
                     && index.entries.get(&key).is_some_and(|row_ids| {
-                        row_ids.iter().any(|candidate_row_id| *candidate_row_id != row_id)
+                        row_ids
+                            .iter()
+                            .any(|candidate_row_id| *candidate_row_id != row_id)
                     })
                 {
                     return Err(DbError::storage(format!(
@@ -815,12 +1031,31 @@ impl TableStore for MemoryStorage {
         }
 
         inner.remove_row_from_indexes(schema_name, row_id, &existing_row)?;
+        if target_row_id != row_id
+            && inner
+                .rows
+                .get(schema_name)
+                .is_some_and(|rows| rows.contains_key(&target_row_id))
+        {
+            return Err(DbError::storage(format!(
+                "duplicate rowid {} on table {}",
+                target_row_id.0, schema_name
+            )));
+        }
+        if let Some(rows) = inner.rows.get_mut(schema_name) {
+            rows.remove(&row_id);
+        }
         inner
             .rows
             .entry(schema_name.to_string())
             .or_default()
-            .insert(row_id, row.clone());
-        inner.add_row_to_indexes(schema_name, row_id, &row)?;
+            .insert(target_row_id, row.clone());
+        inner
+            .next_row_ids
+            .entry(schema_name.to_string())
+            .and_modify(|next| *next = max(*next, target_row_id.0 + 1))
+            .or_insert(target_row_id.0 + 1);
+        inner.add_row_to_indexes(schema_name, target_row_id, &row)?;
         inner.record_undo(UndoOp::RestoreRow {
             schema_name: schema_name.to_string(),
             row_id,

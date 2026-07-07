@@ -1,17 +1,18 @@
 use crate::common::error::{DbError, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
     pub position: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Create,
     Alter,
     Add,
     Rename,
+    Replace,
     Drop,
     Table,
     Column,
@@ -19,6 +20,10 @@ pub enum TokenKind {
     Unique,
     Index,
     On,
+    Off,
+    Conflict,
+    Do,
+    Nothing,
     Insert,
     Into,
     Values,
@@ -33,20 +38,30 @@ pub enum TokenKind {
     Order,
     By,
     Limit,
+    Offset,
     With,
     Recursive,
     Union,
+    Intersect,
+    Except,
     All,
     As,
     Inner,
+    Cross,
     Left,
+    Right,
+    Full,
     Outer,
+    Natural,
     Join,
+    Using,
     Asc,
     Desc,
     And,
     Or,
     Like,
+    Glob,
+    Escape,
     Between,
     Begin,
     Start,
@@ -59,6 +74,12 @@ pub enum TokenKind {
     Serializable,
     Commit,
     Rollback,
+    Case,
+    When,
+    Then,
+    Else,
+    End,
+    If,
     Not,
     In,
     Is,
@@ -66,26 +87,43 @@ pub enum TokenKind {
     Explain,
     Query,
     Plan,
+    Pragma,
+    Analyze,
+    Reindex,
+    Vacuum,
     Distinct,
     Default,
+    Returning,
     Check,
+    Collate,
     Constraint,
     Foreign,
     References,
+    Generated,
+    Always,
+    Stored,
+    Virtual,
+    IsNull,
+    NotNull,
     Nulls,
     First,
     Last,
     Primary,
     Key,
+    Strict,
+    Autoincrement,
     IntegerType,
     TextType,
+    BlobType,
     BooleanType,
     True,
     False,
     Null,
     Identifier(String),
     Integer(i64),
+    Real(f64),
     String(String),
+    BlobLiteral(Vec<u8>),
     Star,
     Comma,
     Semicolon,
@@ -100,7 +138,15 @@ pub enum TokenKind {
     Plus,
     Minus,
     Slash,
+    Percent,
+    Ampersand,
+    Pipe,
+    ShiftLeft,
+    ShiftRight,
+    Tilde,
     PipePipe,
+    Arrow,
+    ArrowText,
     Dot,
     Eof,
 }
@@ -128,6 +174,14 @@ impl<'a> Lexer<'a> {
                 self.advance_char();
                 continue;
             }
+            if ch == '-' && self.peek_next() == Some('-') {
+                self.skip_line_comment();
+                continue;
+            }
+            if ch == '/' && self.peek_next() == Some('*') {
+                self.skip_block_comment()?;
+                continue;
+            }
 
             let position = self.offset;
             let kind = match ch {
@@ -143,6 +197,7 @@ impl<'a> Lexer<'a> {
                     self.advance_char();
                     TokenKind::Comma
                 }
+                '.' if matches!(self.peek_next(), Some('0'..='9')) => self.lex_number()?,
                 '.' => {
                     self.advance_char();
                     TokenKind::Dot
@@ -155,12 +210,27 @@ impl<'a> Lexer<'a> {
                     self.advance_char();
                     TokenKind::Plus
                 }
+                '%' => {
+                    self.advance_char();
+                    TokenKind::Percent
+                }
+                '&' => {
+                    self.advance_char();
+                    TokenKind::Ampersand
+                }
+                '~' => {
+                    self.advance_char();
+                    TokenKind::Tilde
+                }
                 ';' => {
                     self.advance_char();
                     TokenKind::Semicolon
                 }
                 '=' => {
                     self.advance_char();
+                    if self.peek() == Some('=') {
+                        self.advance_char();
+                    }
                     TokenKind::Eq
                 }
                 '!' if self.peek_next() == Some('=') => {
@@ -179,6 +249,9 @@ impl<'a> Lexer<'a> {
                     if self.peek() == Some('=') {
                         self.advance_char();
                         TokenKind::Gte
+                    } else if self.peek() == Some('>') {
+                        self.advance_char();
+                        TokenKind::ShiftRight
                     } else {
                         TokenKind::Gt
                     }
@@ -191,13 +264,26 @@ impl<'a> Lexer<'a> {
                     } else if self.peek() == Some('>') {
                         self.advance_char();
                         TokenKind::Ne
+                    } else if self.peek() == Some('<') {
+                        self.advance_char();
+                        TokenKind::ShiftLeft
                     } else {
                         TokenKind::Lt
                     }
                 }
                 '-' => {
                     self.advance_char();
-                    TokenKind::Minus
+                    if self.peek() == Some('>') {
+                        self.advance_char();
+                        if self.peek() == Some('>') {
+                            self.advance_char();
+                            TokenKind::ArrowText
+                        } else {
+                            TokenKind::Arrow
+                        }
+                    } else {
+                        TokenKind::Minus
+                    }
                 }
                 '/' => {
                     self.advance_char();
@@ -209,13 +295,15 @@ impl<'a> Lexer<'a> {
                     TokenKind::PipePipe
                 }
                 '|' => {
-                    return Err(DbError::sql(format!(
-                        "unexpected character '{}' at position {}",
-                        ch, position
-                    )));
+                    self.advance_char();
+                    TokenKind::Pipe
                 }
                 '\'' => self.lex_string()?,
-                '0'..='9' => self.lex_integer()?,
+                '"' => self.lex_quoted_identifier('"', '"')?,
+                '`' => self.lex_quoted_identifier('`', '`')?,
+                '[' => self.lex_quoted_identifier('[', ']')?,
+                '0'..='9' => self.lex_number()?,
+                'x' | 'X' if self.peek_next() == Some('\'') => self.lex_blob_literal()?,
                 _ if is_identifier_start(ch) => self.lex_word(),
                 _ => {
                     return Err(DbError::sql(format!(
@@ -270,16 +358,138 @@ impl<'a> Lexer<'a> {
         Err(DbError::sql("unterminated string literal"))
     }
 
-    fn lex_integer(&mut self) -> Result<TokenKind> {
+    fn lex_quoted_identifier(&mut self, opener: char, closer: char) -> Result<TokenKind> {
+        self.advance_char();
+        let mut value = String::new();
+
+        while let Some(ch) = self.advance_char() {
+            if ch == closer {
+                if opener == '"' && self.peek() == Some('"') {
+                    value.push('"');
+                    self.advance_char();
+                    continue;
+                }
+                return Ok(TokenKind::Identifier(value));
+            }
+            value.push(ch);
+        }
+
+        Err(DbError::sql("unterminated quoted identifier"))
+    }
+
+    fn skip_line_comment(&mut self) {
+        self.advance_char();
+        self.advance_char();
+        while let Some(ch) = self.peek() {
+            self.advance_char();
+            if ch == '\n' {
+                break;
+            }
+        }
+    }
+
+    fn skip_block_comment(&mut self) -> Result<()> {
+        self.advance_char();
+        self.advance_char();
+        while let Some(ch) = self.advance_char() {
+            if ch == '*' && self.peek() == Some('/') {
+                self.advance_char();
+                return Ok(());
+            }
+        }
+        Err(DbError::sql("unterminated block comment"))
+    }
+
+    fn lex_number(&mut self) -> Result<TokenKind> {
         let start = self.offset;
-        while matches!(self.peek(), Some('0'..='9')) {
+        if self.peek() == Some('0') && matches!(self.peek_next(), Some('x' | 'X')) {
+            self.advance_char();
+            self.advance_char();
+            let hex_start = self.offset;
+            while matches!(self.peek(), Some('0'..='9' | 'a'..='f' | 'A'..='F' | '_')) {
+                self.advance_char();
+            }
+            if self.offset == hex_start {
+                return Err(DbError::sql("invalid hexadecimal integer literal '0x'"));
+            }
+            let text = &self.input[hex_start..self.offset];
+            let normalized = text.replace('_', "");
+            let value = i64::from_str_radix(&normalized, 16).map_err(|error| {
+                DbError::sql(format!(
+                    "invalid hexadecimal integer literal '0x{text}': {error}"
+                ))
+            })?;
+            return Ok(TokenKind::Integer(value));
+        }
+        while matches!(self.peek(), Some('0'..='9' | '_')) {
             self.advance_char();
         }
+        let mut is_real = false;
+        if self.peek() == Some('.') {
+            let saw_integer_digits = self.offset > start;
+            let next_is_digit = matches!(self.peek_next(), Some('0'..='9'));
+            if saw_integer_digits || next_is_digit {
+                self.advance_char();
+                while matches!(self.peek(), Some('0'..='9' | '_')) {
+                    self.advance_char();
+                }
+                is_real = true;
+            }
+        }
+        if matches!(self.peek(), Some('e' | 'E')) {
+            let exponent_start = self.offset;
+            self.advance_char();
+            if matches!(self.peek(), Some('+' | '-')) {
+                self.advance_char();
+            }
+            if matches!(self.peek(), Some('0'..='9')) {
+                while matches!(self.peek(), Some('0'..='9' | '_')) {
+                    self.advance_char();
+                }
+                is_real = true;
+            } else {
+                self.offset = exponent_start;
+            }
+        }
         let text = &self.input[start..self.offset];
-        let value = text
-            .parse::<i64>()
-            .map_err(|error| DbError::sql(format!("invalid integer literal '{text}': {error}")))?;
-        Ok(TokenKind::Integer(value))
+        if is_real {
+            let value = text
+                .replace('_', "")
+                .parse::<f64>()
+                .map_err(|error| DbError::sql(format!("invalid real literal '{text}': {error}")))?;
+            Ok(TokenKind::Real(value))
+        } else {
+            let value = text.replace('_', "").parse::<i64>().map_err(|error| {
+                DbError::sql(format!("invalid integer literal '{text}': {error}"))
+            })?;
+            Ok(TokenKind::Integer(value))
+        }
+    }
+
+    fn lex_blob_literal(&mut self) -> Result<TokenKind> {
+        self.advance_char();
+        let TokenKind::String(hex) = self.lex_string()? else {
+            unreachable!("blob literal parser must reuse string literal parsing");
+        };
+
+        if hex.len() % 2 != 0 {
+            return Err(DbError::sql(
+                "blob literal must contain an even number of hex digits",
+            ));
+        }
+
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        let mut index = 0;
+        while index < hex.len() {
+            let end = index + 2;
+            let pair = &hex[index..end];
+            let byte = u8::from_str_radix(pair, 16)
+                .map_err(|_| DbError::sql(format!("invalid blob literal hex byte '{pair}'")))?;
+            bytes.push(byte);
+            index = end;
+        }
+
+        Ok(TokenKind::BlobLiteral(bytes))
     }
 
     fn lex_word(&mut self) -> TokenKind {
@@ -294,6 +504,7 @@ impl<'a> Lexer<'a> {
             "ALTER" => TokenKind::Alter,
             "ADD" => TokenKind::Add,
             "RENAME" => TokenKind::Rename,
+            "REPLACE" => TokenKind::Replace,
             "DROP" => TokenKind::Drop,
             "TABLE" => TokenKind::Table,
             "COLUMN" => TokenKind::Column,
@@ -301,6 +512,10 @@ impl<'a> Lexer<'a> {
             "UNIQUE" => TokenKind::Unique,
             "INDEX" => TokenKind::Index,
             "ON" => TokenKind::On,
+            "OFF" => TokenKind::Off,
+            "CONFLICT" => TokenKind::Conflict,
+            "DO" => TokenKind::Do,
+            "NOTHING" => TokenKind::Nothing,
             "INSERT" => TokenKind::Insert,
             "INTO" => TokenKind::Into,
             "VALUES" => TokenKind::Values,
@@ -315,20 +530,30 @@ impl<'a> Lexer<'a> {
             "ORDER" => TokenKind::Order,
             "BY" => TokenKind::By,
             "LIMIT" => TokenKind::Limit,
+            "OFFSET" => TokenKind::Offset,
             "WITH" => TokenKind::With,
             "RECURSIVE" => TokenKind::Recursive,
             "UNION" => TokenKind::Union,
+            "INTERSECT" => TokenKind::Intersect,
+            "EXCEPT" => TokenKind::Except,
             "ALL" => TokenKind::All,
             "AS" => TokenKind::As,
             "INNER" => TokenKind::Inner,
+            "CROSS" => TokenKind::Cross,
             "LEFT" => TokenKind::Left,
+            "RIGHT" => TokenKind::Right,
+            "FULL" => TokenKind::Full,
             "OUTER" => TokenKind::Outer,
+            "NATURAL" => TokenKind::Natural,
             "JOIN" => TokenKind::Join,
+            "USING" => TokenKind::Using,
             "ASC" => TokenKind::Asc,
             "DESC" => TokenKind::Desc,
             "AND" => TokenKind::And,
             "OR" => TokenKind::Or,
             "LIKE" => TokenKind::Like,
+            "GLOB" => TokenKind::Glob,
+            "ESCAPE" => TokenKind::Escape,
             "BETWEEN" => TokenKind::Between,
             "BEGIN" => TokenKind::Begin,
             "START" => TokenKind::Start,
@@ -341,6 +566,12 @@ impl<'a> Lexer<'a> {
             "SERIALIZABLE" => TokenKind::Serializable,
             "COMMIT" => TokenKind::Commit,
             "ROLLBACK" => TokenKind::Rollback,
+            "CASE" => TokenKind::Case,
+            "WHEN" => TokenKind::When,
+            "THEN" => TokenKind::Then,
+            "ELSE" => TokenKind::Else,
+            "END" => TokenKind::End,
+            "IF" => TokenKind::If,
             "NOT" => TokenKind::Not,
             "IN" => TokenKind::In,
             "IS" => TokenKind::Is,
@@ -348,19 +579,34 @@ impl<'a> Lexer<'a> {
             "EXPLAIN" => TokenKind::Explain,
             "QUERY" => TokenKind::Query,
             "PLAN" => TokenKind::Plan,
+            "PRAGMA" => TokenKind::Pragma,
+            "ANALYZE" => TokenKind::Analyze,
+            "REINDEX" => TokenKind::Reindex,
+            "VACUUM" => TokenKind::Vacuum,
             "DISTINCT" => TokenKind::Distinct,
             "DEFAULT" => TokenKind::Default,
+            "RETURNING" => TokenKind::Returning,
             "CHECK" => TokenKind::Check,
+            "COLLATE" => TokenKind::Collate,
             "CONSTRAINT" => TokenKind::Constraint,
             "FOREIGN" => TokenKind::Foreign,
             "REFERENCES" => TokenKind::References,
+            "GENERATED" => TokenKind::Generated,
+            "ALWAYS" => TokenKind::Always,
+            "STORED" => TokenKind::Stored,
+            "VIRTUAL" => TokenKind::Virtual,
+            "ISNULL" => TokenKind::IsNull,
+            "NOTNULL" => TokenKind::NotNull,
             "NULLS" => TokenKind::Nulls,
             "FIRST" => TokenKind::First,
             "LAST" => TokenKind::Last,
             "PRIMARY" => TokenKind::Primary,
             "KEY" => TokenKind::Key,
+            "STRICT" => TokenKind::Strict,
+            "AUTOINCREMENT" => TokenKind::Autoincrement,
             "INTEGER" => TokenKind::IntegerType,
             "TEXT" => TokenKind::TextType,
+            "BLOB" => TokenKind::BlobType,
             "BOOLEAN" => TokenKind::BooleanType,
             "TRUE" => TokenKind::True,
             "FALSE" => TokenKind::False,

@@ -40,7 +40,9 @@ fn unique_email_index(name: &str) -> IndexMeta {
     IndexMeta {
         name: name.to_string(),
         columns: vec!["email".to_string()],
+        decorated_columns: None,
         unique: true,
+        predicate: None,
     }
 }
 
@@ -91,7 +93,9 @@ fn storage_v2_renames_table_and_column_and_rewrites_added_column() {
             IndexMeta {
                 name: "idx_users_name".to_string(),
                 columns: vec!["name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             },
         )
         .unwrap();
@@ -103,7 +107,9 @@ fn storage_v2_renames_table_and_column_and_rewrites_added_column() {
         .add_column(
             txn,
             "users",
-            ColumnDef::new("age", ColumnType::Integer).default_value(Value::Integer(0)),
+            ColumnDef::new("age", ColumnType::Integer).default_value(
+                rustsql::common::types::ColumnDefault::Literal(Value::Integer(0)),
+            ),
         )
         .unwrap();
     storage
@@ -247,7 +253,9 @@ fn storage_v2_planning_context_exposes_persisted_indexes() {
                 IndexMeta {
                     name: "idx_users_name".to_string(),
                     columns: vec!["name".to_string()],
+                    decorated_columns: None,
                     unique: false,
+                    predicate: None,
                 },
             );
         catalog
@@ -349,21 +357,27 @@ fn storage_v2_read_committed_refreshes_catalog_snapshot_between_statements() {
     let reader = reader_storage
         .begin_with_isolation(IsolationLevel::ReadCommitted)
         .unwrap();
-    assert!(reader_storage
-        .planning_context_snapshot(Some(reader))
-        .unwrap()
-        .schema("users")
-        .is_none());
+    assert!(
+        reader_storage
+            .planning_context_snapshot(Some(reader))
+            .unwrap()
+            .schema("users")
+            .is_none()
+    );
 
     let writer = writer_storage.begin().unwrap();
-    writer_storage.create_schema(writer, users_schema()).unwrap();
+    writer_storage
+        .create_schema(writer, users_schema())
+        .unwrap();
     writer_storage.commit(writer).unwrap();
 
-    assert!(reader_storage
-        .planning_context_snapshot(Some(reader))
-        .unwrap()
-        .schema("users")
-        .is_some());
+    assert!(
+        reader_storage
+            .planning_context_snapshot(Some(reader))
+            .unwrap()
+            .schema("users")
+            .is_some()
+    );
 
     reader_storage.rollback(reader).unwrap();
 }
@@ -375,7 +389,9 @@ fn storage_v2_deadlock_selected_victim_wakes_and_cleanup_leaves_no_rows() {
     let setup_storage = FileStorage::open(&path).unwrap();
 
     let setup_txn = setup_storage.begin().unwrap();
-    setup_storage.create_schema(setup_txn, users_schema()).unwrap();
+    setup_storage
+        .create_schema(setup_txn, users_schema())
+        .unwrap();
     setup_storage.commit(setup_txn).unwrap();
 
     let (writer_inserted_tx, writer_inserted_rx) = mpsc::channel();
@@ -388,7 +404,9 @@ fn storage_v2_deadlock_selected_victim_wakes_and_cleanup_leaves_no_rows() {
     let writer_path = path.clone();
     let writer = thread::spawn(move || {
         let storage = FileStorage::open(&writer_path).unwrap();
-        let txn = storage.begin_with_isolation(IsolationLevel::ReadCommitted).unwrap();
+        let txn = storage
+            .begin_with_isolation(IsolationLevel::ReadCommitted)
+            .unwrap();
         storage
             .insert_row(txn, "users", user_row(1, "alice", "a@example.com", true))
             .unwrap();
@@ -426,14 +444,21 @@ fn storage_v2_deadlock_selected_victim_wakes_and_cleanup_leaves_no_rows() {
     start_writer_deadlock_tx.send(()).unwrap();
 
     writer_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    reader_deadlock_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    reader_deadlock_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
 
     writer.join().unwrap();
     reader.join().unwrap();
 
     let verify_storage = FileStorage::open(&path).unwrap();
     let verify_txn = verify_storage.begin().unwrap();
-    assert!(verify_storage.scan_rows(verify_txn, "users").unwrap().is_empty());
+    assert!(
+        verify_storage
+            .scan_rows(verify_txn, "users")
+            .unwrap()
+            .is_empty()
+    );
     verify_storage.rollback(verify_txn).unwrap();
 }
 
@@ -444,7 +469,9 @@ fn storage_v2_page_write_waits_until_holder_commits_then_wakes_up() {
 
     let setup_storage = FileStorage::open(&path).unwrap();
     let setup_txn = setup_storage.begin().unwrap();
-    setup_storage.create_schema(setup_txn, users_schema()).unwrap();
+    setup_storage
+        .create_schema(setup_txn, users_schema())
+        .unwrap();
     setup_storage.commit(setup_txn).unwrap();
 
     let (writer1_locked_tx, writer1_locked_rx) = mpsc::channel();
@@ -476,16 +503,25 @@ fn storage_v2_page_write_waits_until_holder_commits_then_wakes_up() {
         writer2_done_tx.send(()).unwrap();
     });
 
-    assert!(writer2_done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    assert!(
+        writer2_done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err()
+    );
     release_writer1_tx.send(()).unwrap();
-    writer2_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    writer2_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
 
     writer1.join().unwrap();
     writer2.join().unwrap();
 
     let verify_storage = FileStorage::open(&path).unwrap();
     let verify_txn = verify_storage.begin().unwrap();
-    assert_eq!(verify_storage.scan_rows(verify_txn, "users").unwrap().len(), 2);
+    assert_eq!(
+        verify_storage.scan_rows(verify_txn, "users").unwrap().len(),
+        2
+    );
     verify_storage.rollback(verify_txn).unwrap();
 }
 
@@ -496,7 +532,9 @@ fn storage_v2_predicate_write_waits_until_reader_rolls_back_then_wakes_up() {
 
     let setup_storage = FileStorage::open(&path).unwrap();
     let setup_txn = setup_storage.begin().unwrap();
-    setup_storage.create_schema(setup_txn, users_schema()).unwrap();
+    setup_storage
+        .create_schema(setup_txn, users_schema())
+        .unwrap();
     setup_storage.commit(setup_txn).unwrap();
 
     let (reader_locked_tx, reader_locked_rx) = mpsc::channel();
@@ -528,7 +566,11 @@ fn storage_v2_predicate_write_waits_until_reader_rolls_back_then_wakes_up() {
         writer_done_tx.send(()).unwrap();
     });
 
-    assert!(writer_done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    assert!(
+        writer_done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err()
+    );
     release_reader_tx.send(()).unwrap();
     writer_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
@@ -537,7 +579,10 @@ fn storage_v2_predicate_write_waits_until_reader_rolls_back_then_wakes_up() {
 
     let verify_storage = FileStorage::open(&path).unwrap();
     let verify_txn = verify_storage.begin().unwrap();
-    assert_eq!(verify_storage.scan_rows(verify_txn, "users").unwrap().len(), 1);
+    assert_eq!(
+        verify_storage.scan_rows(verify_txn, "users").unwrap().len(),
+        1
+    );
     verify_storage.rollback(verify_txn).unwrap();
 }
 
@@ -550,7 +595,11 @@ fn storage_v2_purge_physically_removes_deleted_rows_after_old_reader_finishes() 
     let setup_txn = storage.begin().unwrap();
     storage.create_schema(setup_txn, users_schema()).unwrap();
     let row_id = storage
-        .insert_row(setup_txn, "users", user_row(1, "alice", "a@example.com", true))
+        .insert_row(
+            setup_txn,
+            "users",
+            user_row(1, "alice", "a@example.com", true),
+        )
         .unwrap();
     storage.commit(setup_txn).unwrap();
 
@@ -589,14 +638,23 @@ fn storage_v2_purge_advances_even_while_newer_reader_remains_active() {
     let setup_txn = storage.begin().unwrap();
     storage.create_schema(setup_txn, users_schema()).unwrap();
     let row_id = storage
-        .insert_row(setup_txn, "users", user_row(1, "alice", "a@example.com", true))
+        .insert_row(
+            setup_txn,
+            "users",
+            user_row(1, "alice", "a@example.com", true),
+        )
         .unwrap();
     storage.commit(setup_txn).unwrap();
 
     let old_reader = storage
         .begin_with_isolation(IsolationLevel::RepeatableRead)
         .unwrap();
-    assert!(storage.get_row(old_reader, "users", row_id).unwrap().is_some());
+    assert!(
+        storage
+            .get_row(old_reader, "users", row_id)
+            .unwrap()
+            .is_some()
+    );
 
     let deleter = storage.begin().unwrap();
     storage.delete_row(deleter, "users", row_id).unwrap();
@@ -605,7 +663,12 @@ fn storage_v2_purge_advances_even_while_newer_reader_remains_active() {
     let newer_reader = storage
         .begin_with_isolation(IsolationLevel::RepeatableRead)
         .unwrap();
-    assert!(storage.get_row(newer_reader, "users", row_id).unwrap().is_none());
+    assert!(
+        storage
+            .get_row(newer_reader, "users", row_id)
+            .unwrap()
+            .is_none()
+    );
 
     storage.rollback(old_reader).unwrap();
 
@@ -719,7 +782,9 @@ fn storage_v2_repeatable_read_keeps_index_entry_visible_after_concurrent_delete(
         vec![row_id]
     );
 
-    let writer = storage.begin_with_isolation(IsolationLevel::ReadCommitted).unwrap();
+    let writer = storage
+        .begin_with_isolation(IsolationLevel::ReadCommitted)
+        .unwrap();
     storage.delete_row(writer, "users", row_id).unwrap();
     storage.commit(writer).unwrap();
 
@@ -736,16 +801,20 @@ fn storage_v2_repeatable_read_keeps_index_entry_visible_after_concurrent_delete(
     );
     assert!(storage.get_row(reader, "users", row_id).unwrap().is_some());
 
-    let fresh_reader = storage.begin_with_isolation(IsolationLevel::ReadCommitted).unwrap();
-    assert!(storage
-        .lookup_index(
-            fresh_reader,
-            "users",
-            "idx_users_email",
-            &[Value::from("alice@example.com")],
-        )
-        .unwrap()
-        .is_empty());
+    let fresh_reader = storage
+        .begin_with_isolation(IsolationLevel::ReadCommitted)
+        .unwrap();
+    assert!(
+        storage
+            .lookup_index(
+                fresh_reader,
+                "users",
+                "idx_users_email",
+                &[Value::from("alice@example.com")],
+            )
+            .unwrap()
+            .is_empty()
+    );
 
     storage.rollback(reader).unwrap();
     storage.rollback(fresh_reader).unwrap();
@@ -758,7 +827,9 @@ fn storage_v2_serializable_range_scan_blocks_conflicting_insert() {
     let setup_storage = FileStorage::open(&path).unwrap();
 
     let setup_txn = setup_storage.begin().unwrap();
-    setup_storage.create_schema(setup_txn, users_schema()).unwrap();
+    setup_storage
+        .create_schema(setup_txn, users_schema())
+        .unwrap();
     setup_storage
         .create_index(
             setup_txn,
@@ -766,7 +837,9 @@ fn storage_v2_serializable_range_scan_blocks_conflicting_insert() {
             IndexMeta {
                 name: "idx_users_active_name".to_string(),
                 columns: vec!["active".to_string(), "name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             },
         )
         .unwrap();
@@ -782,17 +855,19 @@ fn storage_v2_serializable_range_scan_blocks_conflicting_insert() {
         let txn = storage
             .begin_with_isolation(IsolationLevel::Serializable)
             .unwrap();
-        assert!(storage
-            .scan_index_range(
-                txn,
-                "users",
-                "idx_users_active_name",
-                &[Value::Boolean(true)],
-                Some((CompareOp::Gte, &Value::from("alice"))),
-                Some((CompareOp::Lte, &Value::from("carol"))),
-            )
-            .unwrap()
-            .is_empty());
+        assert!(
+            storage
+                .scan_index_range(
+                    txn,
+                    "users",
+                    "idx_users_active_name",
+                    &[Value::Boolean(true)],
+                    Some((CompareOp::Gte, &Value::from("alice"))),
+                    Some((CompareOp::Lte, &Value::from("carol"))),
+                )
+                .unwrap()
+                .is_empty()
+        );
         reader_locked_tx.send(()).unwrap();
         release_reader_rx.recv().unwrap();
         storage.rollback(txn).unwrap();
@@ -803,7 +878,9 @@ fn storage_v2_serializable_range_scan_blocks_conflicting_insert() {
     let writer_path = path.clone();
     let writer = thread::spawn(move || {
         let storage = FileStorage::open(&writer_path).unwrap();
-        let txn = storage.begin_with_isolation(IsolationLevel::ReadCommitted).unwrap();
+        let txn = storage
+            .begin_with_isolation(IsolationLevel::ReadCommitted)
+            .unwrap();
         storage
             .insert_row(txn, "users", user_row(1, "bob", "b@example.com", true))
             .unwrap();
@@ -811,7 +888,11 @@ fn storage_v2_serializable_range_scan_blocks_conflicting_insert() {
         writer_done_tx.send(()).unwrap();
     });
 
-    assert!(writer_done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    assert!(
+        writer_done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err()
+    );
     release_reader_tx.send(()).unwrap();
     writer_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
@@ -826,7 +907,9 @@ fn storage_v2_page_write_conflict_blocks_concurrent_writers_on_same_table() {
     let setup_storage = FileStorage::open(&path).unwrap();
 
     let setup_txn = setup_storage.begin().unwrap();
-    setup_storage.create_schema(setup_txn, users_schema()).unwrap();
+    setup_storage
+        .create_schema(setup_txn, users_schema())
+        .unwrap();
     setup_storage.commit(setup_txn).unwrap();
 
     let (writer1_locked_tx, writer1_locked_rx) = mpsc::channel();
@@ -836,7 +919,9 @@ fn storage_v2_page_write_conflict_blocks_concurrent_writers_on_same_table() {
     let writer1_path = path.clone();
     let writer1 = thread::spawn(move || {
         let storage = FileStorage::open(&writer1_path).unwrap();
-        let txn = storage.begin_with_isolation(IsolationLevel::ReadCommitted).unwrap();
+        let txn = storage
+            .begin_with_isolation(IsolationLevel::ReadCommitted)
+            .unwrap();
         storage
             .insert_row(txn, "users", user_row(1, "alice", "a@example.com", true))
             .unwrap();
@@ -850,7 +935,9 @@ fn storage_v2_page_write_conflict_blocks_concurrent_writers_on_same_table() {
     let writer2_path = path.clone();
     let writer2 = thread::spawn(move || {
         let storage = FileStorage::open(&writer2_path).unwrap();
-        let txn = storage.begin_with_isolation(IsolationLevel::ReadCommitted).unwrap();
+        let txn = storage
+            .begin_with_isolation(IsolationLevel::ReadCommitted)
+            .unwrap();
         storage
             .insert_row(txn, "users", user_row(2, "bob", "b@example.com", false))
             .unwrap();
@@ -858,12 +945,90 @@ fn storage_v2_page_write_conflict_blocks_concurrent_writers_on_same_table() {
         writer2_done_tx.send(()).unwrap();
     });
 
-    assert!(writer2_done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    assert!(
+        writer2_done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err()
+    );
     release_writer1_tx.send(()).unwrap();
-    writer2_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    writer2_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
 
     writer1.join().unwrap();
     writer2.join().unwrap();
+}
+
+#[test]
+fn storage_v2_table_exclusive_ddl_waits_for_writer_then_wakes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("db");
+    let setup_storage = FileStorage::open(&path).unwrap();
+
+    let setup_txn = setup_storage.begin().unwrap();
+    setup_storage
+        .create_schema(setup_txn, users_schema())
+        .unwrap();
+    setup_storage.commit(setup_txn).unwrap();
+
+    let (writer_locked_tx, writer_locked_rx) = mpsc::channel();
+    let (release_writer_tx, release_writer_rx) = mpsc::channel();
+    let (ddl_done_tx, ddl_done_rx) = mpsc::channel();
+
+    let writer_path = path.clone();
+    let writer = thread::spawn(move || {
+        let storage = FileStorage::open(&writer_path).unwrap();
+        let txn = storage
+            .begin_with_isolation(IsolationLevel::ReadCommitted)
+            .unwrap();
+        storage
+            .insert_row(txn, "users", user_row(1, "alice", "a@example.com", true))
+            .unwrap();
+        writer_locked_tx.send(()).unwrap();
+        release_writer_rx.recv().unwrap();
+        storage.rollback(txn).unwrap();
+    });
+
+    writer_locked_rx.recv().unwrap();
+
+    let ddl_path = path.clone();
+    let ddl = thread::spawn(move || {
+        let storage = FileStorage::open(&ddl_path).unwrap();
+        let txn = storage
+            .begin_with_isolation(IsolationLevel::ReadCommitted)
+            .unwrap();
+        storage
+            .add_column(
+                txn,
+                "users",
+                ColumnDef::new("age", ColumnType::Integer).default_value(
+                    rustsql::common::types::ColumnDefault::Literal(Value::Integer(0)),
+                ),
+            )
+            .unwrap();
+        storage.commit(txn).unwrap();
+        ddl_done_tx.send(()).unwrap();
+    });
+
+    assert!(
+        ddl_done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err()
+    );
+    release_writer_tx.send(()).unwrap();
+    ddl_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    writer.join().unwrap();
+    ddl.join().unwrap();
+
+    let verify_storage = FileStorage::open(&path).unwrap();
+    let verify_txn = verify_storage.begin().unwrap();
+    let schema = verify_storage
+        .get_schema(verify_txn, "users")
+        .unwrap()
+        .unwrap();
+    assert!(schema.columns.iter().any(|column| column.name == "age"));
+    verify_storage.rollback(verify_txn).unwrap();
 }
 
 #[test]
@@ -978,7 +1143,9 @@ fn storage_v2_backfills_multi_column_index_for_existing_rows() {
             IndexMeta {
                 name: "idx_users_name_email".to_string(),
                 columns: vec!["name".to_string(), "email".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             },
         )
         .unwrap();
@@ -1003,7 +1170,9 @@ fn storage_v2_rejects_duplicate_index_names_on_same_table() {
     let index = IndexMeta {
         name: "idx_users_name".to_string(),
         columns: vec!["name".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     };
     storage.create_index(txn, "users", index.clone()).unwrap();
     let error = storage.create_index(txn, "users", index).unwrap_err();
@@ -1028,7 +1197,9 @@ fn storage_v2_updates_multi_column_indexes_on_insert_and_delete() {
             IndexMeta {
                 name: "idx_users_name_email".to_string(),
                 columns: vec!["name".to_string(), "email".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             },
         )
         .unwrap();
@@ -1115,15 +1286,17 @@ fn storage_v2_sql_update_keeps_single_row_id_with_version_chain_and_same_index_e
             .unwrap(),
         vec![row_id]
     );
-    assert!(storage
-        .lookup_index(
-            fresh_reader,
-            "users",
-            "idx_users_email",
-            &[Value::from("a@example.com")],
-        )
-        .unwrap()
-        .is_empty());
+    assert!(
+        storage
+            .lookup_index(
+                fresh_reader,
+                "users",
+                "idx_users_email",
+                &[Value::from("a@example.com")],
+            )
+            .unwrap()
+            .is_empty()
+    );
 
     {
         let pager = Pager::open(&path).unwrap();
@@ -1133,8 +1306,14 @@ fn storage_v2_sql_update_keeps_single_row_id_with_version_chain_and_same_index_e
         let versioned = rustsql::storage::v2::codec::decode_versioned_row(&stored).unwrap();
         assert_eq!(tree.scan_all(&pager, 0).unwrap().len(), 1);
         assert_eq!(versioned.versions.len(), 2);
-        assert_eq!(versioned.versions[0].row, user_row(1, "ally", "ally@example.com", true));
-        assert_eq!(versioned.versions[1].row, user_row(1, "alice", "a@example.com", true));
+        assert_eq!(
+            versioned.versions[0].row,
+            user_row(1, "ally", "ally@example.com", true)
+        );
+        assert_eq!(
+            versioned.versions[1].row,
+            user_row(1, "alice", "a@example.com", true)
+        );
     }
 
     storage.rollback(old_reader).unwrap();
@@ -1164,7 +1343,12 @@ fn storage_v2_sql_update_purge_compacts_old_version_in_place_after_reader_finish
     let old_reader = storage
         .begin_with_isolation(IsolationLevel::RepeatableRead)
         .unwrap();
-    assert!(storage.get_row(old_reader, "users", row_id).unwrap().is_some());
+    assert!(
+        storage
+            .get_row(old_reader, "users", row_id)
+            .unwrap()
+            .is_some()
+    );
 
     db.execute("UPDATE users SET name = 'ally' WHERE id = 1;")
         .unwrap();
@@ -1188,7 +1372,10 @@ fn storage_v2_sql_update_purge_compacts_old_version_in_place_after_reader_finish
         let versioned = rustsql::storage::v2::codec::decode_versioned_row(&stored).unwrap();
         assert_eq!(tree.scan_all(&pager, 0).unwrap().len(), 1);
         assert_eq!(versioned.versions.len(), 1);
-        assert_eq!(versioned.versions[0].row, user_row(1, "ally", "a@example.com", true));
+        assert_eq!(
+            versioned.versions[0].row,
+            user_row(1, "ally", "a@example.com", true)
+        );
     }
 }
 
@@ -1206,7 +1393,9 @@ fn storage_v2_lookup_index_rejects_wrong_key_arity() {
             IndexMeta {
                 name: "idx_users_name_email".to_string(),
                 columns: vec!["name".to_string(), "email".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             },
         )
         .unwrap();
@@ -1239,7 +1428,9 @@ fn storage_v2_scans_index_by_composite_prefix() {
             IndexMeta {
                 name: "idx_users_active_name".to_string(),
                 columns: vec!["active".to_string(), "name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             },
         )
         .unwrap();
@@ -1279,7 +1470,9 @@ fn storage_v2_scans_index_by_prefix_with_range_bound() {
             IndexMeta {
                 name: "idx_users_active_name".to_string(),
                 columns: vec!["active".to_string(), "name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             },
         )
         .unwrap();
@@ -1321,7 +1514,9 @@ fn storage_v2_scans_index_by_prefix_with_two_sided_range() {
             IndexMeta {
                 name: "idx_users_active_name".to_string(),
                 columns: vec!["active".to_string(), "name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             },
         )
         .unwrap();

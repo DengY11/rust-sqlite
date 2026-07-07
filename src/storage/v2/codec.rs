@@ -102,7 +102,11 @@ pub fn visible_row(bytes: &[u8], txn_id: u64, snapshot: &TxnSnapshot) -> Result<
     Ok(None)
 }
 
-pub fn mark_row_deleted(bytes: &[u8], txn_id: u64, snapshot: &TxnSnapshot) -> Result<Option<Vec<u8>>> {
+pub fn mark_row_deleted(
+    bytes: &[u8],
+    txn_id: u64,
+    snapshot: &TxnSnapshot,
+) -> Result<Option<Vec<u8>>> {
     let mut versioned = decode_versioned_row(bytes)?;
     for version in &mut versioned.versions {
         let creator_visible = version_visible_to_snapshot(
@@ -167,7 +171,9 @@ pub fn append_row_version(
     };
 
     if versioned.versions[visible_index].created_by_txn == txn_id
-        && versioned.versions[visible_index].created_commit_ts.is_none()
+        && versioned.versions[visible_index]
+            .created_commit_ts
+            .is_none()
     {
         versioned.versions[visible_index].row = row.clone();
         return Ok(Some(serde_json::to_vec(&StoredRow::Versioned(versioned))?));
@@ -268,14 +274,14 @@ pub fn project_index_key(schema: &Schema, index: &IndexMeta, row: &Row) -> Resul
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::engine::txn::TransactionId;
     use crate::common::types::{ColumnDef, ColumnType, IndexMeta, RowId, Schema, Value};
+    use crate::engine::txn::TransactionId;
     use crate::storage::v2::tx_types::TxnSnapshot;
 
     use super::{
-        decode_index_key, decode_row, decode_row_ids, decode_schema, encode_index_key, encode_row,
-        encode_row_ids, encode_schema, project_index_key, visible_row, mark_row_deleted,
-        RowVersion, StoredRow, VersionedRow,
+        RowVersion, StoredRow, VersionedRow, decode_index_key, decode_row, decode_row_ids,
+        decode_schema, encode_index_key, encode_row, encode_row_ids, encode_schema,
+        mark_row_deleted, project_index_key, visible_row,
     };
 
     #[test]
@@ -344,7 +350,9 @@ mod tests {
         let index = IndexMeta {
             name: "idx_users_name_email".to_string(),
             columns: vec!["name".to_string(), "email".to_string()],
+            decorated_columns: None,
             unique: false,
+            predicate: None,
         };
 
         assert_eq!(

@@ -1,7 +1,7 @@
 use crate::common::types::{ColumnDef, Value};
 use crate::sql::ast::{
-    AlterTableAction, Assignment, CompareOp, Expr, IsolationLevel, JoinKind, OrderBy,
-    ScalarExpr, SelectItem, TableConstraint,
+    AlterTableAction, Assignment, CompareOp, CompoundOperator, Expr, IsolationLevel, JoinKind,
+    OrderBy, ScalarExpr, SelectItem, TableConstraint, UpsertClause,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,6 +9,7 @@ pub struct JoinPlan {
     pub kind: JoinKind,
     pub source: Box<Plan>,
     pub on: Expr,
+    pub using_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,36 +46,260 @@ pub enum Plan {
         name: String,
         columns: Vec<ColumnDef>,
         constraints: Vec<TableConstraint>,
+        strict: bool,
+        without_rowid: bool,
+        if_not_exists: bool,
+    },
+    CreateTableAs {
+        name: String,
+        if_not_exists: bool,
+        source: Box<Plan>,
     },
     CreateIndex {
         name: String,
         table: String,
         columns: Vec<String>,
+        decorated_columns: Option<Vec<String>>,
         unique: bool,
+        predicate: Option<String>,
+        if_not_exists: bool,
     },
     DropTable {
         name: String,
+        if_exists: bool,
     },
     DropIndex {
         table: String,
         name: String,
+        if_exists: bool,
     },
+    NoOp,
     AlterTable {
         table: String,
         action: AlterTableAction,
     },
     Insert {
         table: String,
+        or_conflict: Option<String>,
         values: Vec<Value>,
+    },
+    InsertReturning {
+        table: String,
+        or_conflict: Option<String>,
+        values: Vec<Value>,
+        returning: Vec<SelectItem>,
+    },
+    InsertUpsert {
+        table: String,
+        values: Vec<Value>,
+        upsert: UpsertClause,
+    },
+    InsertUpsertReturning {
+        table: String,
+        values: Vec<Value>,
+        upsert: UpsertClause,
+        returning: Vec<SelectItem>,
+    },
+    InsertMany {
+        table: String,
+        or_conflict: Option<String>,
+        rows: Vec<Vec<Value>>,
+    },
+    InsertManyReturning {
+        table: String,
+        or_conflict: Option<String>,
+        rows: Vec<Vec<Value>>,
+        returning: Vec<SelectItem>,
+    },
+    InsertManyUpsert {
+        table: String,
+        rows: Vec<Vec<Value>>,
+        upsert: UpsertClause,
+    },
+    InsertManyUpsertReturning {
+        table: String,
+        rows: Vec<Vec<Value>>,
+        upsert: UpsertClause,
+        returning: Vec<SelectItem>,
+    },
+    InsertDoNothing {
+        table: String,
+        target: Option<Vec<String>>,
+        values: Vec<Value>,
+    },
+    InsertDoNothingReturning {
+        table: String,
+        target: Option<Vec<String>>,
+        values: Vec<Value>,
+        returning: Vec<SelectItem>,
+    },
+    InsertManyDoNothing {
+        table: String,
+        target: Option<Vec<String>>,
+        rows: Vec<Vec<Value>>,
+    },
+    InsertManyDoNothingReturning {
+        table: String,
+        target: Option<Vec<String>>,
+        rows: Vec<Vec<Value>>,
+        returning: Vec<SelectItem>,
+    },
+    InsertExpr {
+        table: String,
+        or_conflict: Option<String>,
+        values: Vec<ScalarExpr>,
+    },
+    InsertExprReturning {
+        table: String,
+        or_conflict: Option<String>,
+        values: Vec<ScalarExpr>,
+        returning: Vec<SelectItem>,
+    },
+    InsertExprUpsert {
+        table: String,
+        values: Vec<ScalarExpr>,
+        upsert: UpsertClause,
+    },
+    InsertExprUpsertReturning {
+        table: String,
+        values: Vec<ScalarExpr>,
+        upsert: UpsertClause,
+        returning: Vec<SelectItem>,
+    },
+    InsertManyExpr {
+        table: String,
+        or_conflict: Option<String>,
+        rows: Vec<Vec<ScalarExpr>>,
+    },
+    InsertManyExprReturning {
+        table: String,
+        or_conflict: Option<String>,
+        rows: Vec<Vec<ScalarExpr>>,
+        returning: Vec<SelectItem>,
+    },
+    InsertManyExprUpsert {
+        table: String,
+        rows: Vec<Vec<ScalarExpr>>,
+        upsert: UpsertClause,
+    },
+    InsertManyExprUpsertReturning {
+        table: String,
+        rows: Vec<Vec<ScalarExpr>>,
+        upsert: UpsertClause,
+        returning: Vec<SelectItem>,
+    },
+    InsertExprDoNothing {
+        table: String,
+        target: Option<Vec<String>>,
+        values: Vec<ScalarExpr>,
+    },
+    InsertExprDoNothingReturning {
+        table: String,
+        target: Option<Vec<String>>,
+        values: Vec<ScalarExpr>,
+        returning: Vec<SelectItem>,
+    },
+    InsertManyExprDoNothing {
+        table: String,
+        target: Option<Vec<String>>,
+        rows: Vec<Vec<ScalarExpr>>,
+    },
+    InsertManyExprDoNothingReturning {
+        table: String,
+        target: Option<Vec<String>>,
+        rows: Vec<Vec<ScalarExpr>>,
+        returning: Vec<SelectItem>,
+    },
+    InsertSelect {
+        table: String,
+        columns: Option<Vec<String>>,
+        or_conflict: Option<String>,
+        source: Box<Plan>,
+    },
+    InsertSelectReturning {
+        table: String,
+        columns: Option<Vec<String>>,
+        or_conflict: Option<String>,
+        source: Box<Plan>,
+        returning: Vec<SelectItem>,
+    },
+    InsertSelectUpsert {
+        table: String,
+        columns: Option<Vec<String>>,
+        source: Box<Plan>,
+        upsert: UpsertClause,
+    },
+    InsertSelectUpsertReturning {
+        table: String,
+        columns: Option<Vec<String>>,
+        source: Box<Plan>,
+        upsert: UpsertClause,
+        returning: Vec<SelectItem>,
+    },
+    InsertSelectDoNothing {
+        table: String,
+        columns: Option<Vec<String>>,
+        target: Option<Vec<String>>,
+        source: Box<Plan>,
+    },
+    InsertSelectDoNothingReturning {
+        table: String,
+        columns: Option<Vec<String>>,
+        target: Option<Vec<String>>,
+        source: Box<Plan>,
+        returning: Vec<SelectItem>,
     },
     Delete {
         table: String,
         filter: Option<Expr>,
     },
+    DeleteLimited {
+        table: String,
+        filter: Option<Expr>,
+        order_by: Vec<OrderBy>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
+    DeleteReturning {
+        table: String,
+        filter: Option<Expr>,
+        returning: Vec<SelectItem>,
+    },
+    DeleteReturningLimited {
+        table: String,
+        filter: Option<Expr>,
+        returning: Vec<SelectItem>,
+        order_by: Vec<OrderBy>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
     Update {
         table: String,
         assignments: Vec<Assignment>,
         filter: Option<Expr>,
+    },
+    UpdateLimited {
+        table: String,
+        assignments: Vec<Assignment>,
+        filter: Option<Expr>,
+        order_by: Vec<OrderBy>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
+    UpdateReturning {
+        table: String,
+        assignments: Vec<Assignment>,
+        filter: Option<Expr>,
+        returning: Vec<SelectItem>,
+    },
+    UpdateReturningLimited {
+        table: String,
+        assignments: Vec<Assignment>,
+        filter: Option<Expr>,
+        returning: Vec<SelectItem>,
+        order_by: Vec<OrderBy>,
+        limit: Option<usize>,
+        offset: Option<usize>,
     },
     SeqScan {
         table: String,
@@ -83,6 +308,17 @@ pub enum Plan {
         filter: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
+        distinct: bool,
+    },
+    ForcedSeqScan {
+        table: String,
+        table_alias: Option<String>,
+        columns: Vec<SelectItem>,
+        filter: Option<Expr>,
+        order_by: Vec<OrderBy>,
+        limit: Option<usize>,
+        offset: Option<usize>,
         distinct: bool,
     },
     IndexScan {
@@ -96,6 +332,7 @@ pub enum Plan {
         filter: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
         distinct: bool,
     },
     IndexUnion {
@@ -106,14 +343,17 @@ pub enum Plan {
         filter: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
         distinct: bool,
     },
     Union {
         left: Box<Plan>,
         right: Box<Plan>,
+        operator: CompoundOperator,
         all: bool,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
     },
     DerivedSource {
         source: Box<Plan>,
@@ -123,6 +363,7 @@ pub enum Plan {
         filter: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
         distinct: bool,
     },
     NestedLoopJoin {
@@ -132,6 +373,7 @@ pub enum Plan {
         filter: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
         distinct: bool,
     },
     Aggregate {
@@ -141,9 +383,109 @@ pub enum Plan {
         having: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
+    },
+    Values {
+        rows: Vec<Vec<ScalarExpr>>,
     },
     ExplainQueryPlan {
         plan: Box<Plan>,
+    },
+    PragmaTableInfo {
+        table: String,
+    },
+    PragmaTableXInfo {
+        table: String,
+    },
+    PragmaTableList {
+        table: Option<String>,
+        schema: Option<String>,
+    },
+    PragmaIndexList {
+        table: String,
+    },
+    PragmaIndexInfo {
+        index: String,
+    },
+    PragmaIndexXInfo {
+        index: String,
+    },
+    PragmaForeignKeyList {
+        table: String,
+    },
+    PragmaForeignKeyCheck {
+        table: Option<String>,
+    },
+    PragmaForeignKeys,
+    SetPragmaForeignKeys {
+        enabled: bool,
+    },
+    PragmaReadUncommitted,
+    SetPragmaReadUncommitted {
+        enabled: bool,
+    },
+    PragmaQueryOnly,
+    SetPragmaQueryOnly {
+        enabled: bool,
+    },
+    PragmaRecursiveTriggers,
+    SetPragmaRecursiveTriggers {
+        enabled: bool,
+    },
+    PragmaTrustedSchema,
+    SetPragmaTrustedSchema {
+        enabled: bool,
+    },
+    PragmaIgnoreCheckConstraints,
+    SetPragmaIgnoreCheckConstraints {
+        enabled: bool,
+    },
+    PragmaEncoding,
+    PragmaCollationList,
+    PragmaDataVersion,
+    PragmaQuickCheck,
+    PragmaIntegrityCheck,
+    PragmaFunctionList,
+    PragmaCompileOptions,
+    PragmaJournalMode,
+    PragmaSynchronous,
+    PragmaCacheSize,
+    SetPragmaCacheSize {
+        value: i64,
+    },
+    PragmaTempStore,
+    PragmaLockingMode,
+    PragmaBusyTimeout,
+    SetPragmaBusyTimeout {
+        value: i64,
+    },
+    PragmaThreads,
+    SetPragmaThreads {
+        value: u32,
+    },
+    PragmaCaseSensitiveLike,
+    SetPragmaCaseSensitiveLike {
+        enabled: bool,
+    },
+    PragmaReverseUnorderedSelects,
+    SetPragmaReverseUnorderedSelects {
+        enabled: bool,
+    },
+    PragmaDatabaseList,
+    PragmaPageSize,
+    PragmaPageCount,
+    PragmaFreelistCount,
+    PragmaUserVersion,
+    SetPragmaUserVersion {
+        value: u32,
+    },
+    PragmaApplicationId,
+    SetPragmaApplicationId {
+        value: u32,
+    },
+    PragmaSchemaVersion,
+    SetPragmaSchemaVersion {
+        value: u32,
     },
     BeginTxn {
         isolation_level: IsolationLevel,
@@ -165,6 +507,9 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef::primary_key("id", ColumnType::Integer)],
             constraints: vec![],
+            strict: false,
+            without_rowid: false,
+            if_not_exists: false,
         };
         assert_eq!(
             plan,
@@ -172,6 +517,9 @@ mod tests {
                 name: "users".to_string(),
                 columns: vec![ColumnDef::primary_key("id", ColumnType::Integer)],
                 constraints: vec![],
+                strict: false,
+                without_rowid: false,
+                if_not_exists: false,
             }
         );
     }
@@ -189,6 +537,7 @@ mod tests {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         };
         assert_eq!(
@@ -204,6 +553,7 @@ mod tests {
                 }),
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }
         );
@@ -229,6 +579,7 @@ mod tests {
             filter: None,
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         };
         assert_eq!(
@@ -251,6 +602,7 @@ mod tests {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }
         );
@@ -290,6 +642,7 @@ mod tests {
             )),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         };
 
@@ -327,6 +680,7 @@ mod tests {
                 )),
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }
         );
@@ -342,6 +696,7 @@ mod tests {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             joins: vec![JoinPlan {
@@ -353,6 +708,7 @@ mod tests {
                     filter: None,
                     order_by: vec![],
                     limit: None,
+                    offset: None,
                     distinct: false,
                 }),
                 on: Expr::CompareColumns {
@@ -360,11 +716,13 @@ mod tests {
                     op: CompareOp::Eq,
                     right: "o.user_id".to_string(),
                 },
+                using_columns: Vec::new(),
             }],
             columns: vec![SelectItem::Column("u.id".to_string())],
             filter: None,
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         };
 
@@ -378,6 +736,7 @@ mod tests {
                     filter: None,
                     order_by: vec![],
                     limit: None,
+                    offset: None,
                     distinct: false,
                 }),
                 joins: vec![JoinPlan {
@@ -389,6 +748,7 @@ mod tests {
                         filter: None,
                         order_by: vec![],
                         limit: None,
+                        offset: None,
                         distinct: false,
                     }),
                     on: Expr::CompareColumns {
@@ -396,11 +756,13 @@ mod tests {
                         op: CompareOp::Eq,
                         right: "o.user_id".to_string(),
                     },
+                    using_columns: Vec::new(),
                 }],
                 columns: vec![SelectItem::Column("u.id".to_string())],
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }
         );
@@ -416,6 +778,7 @@ mod tests {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             alias: "t".to_string(),
@@ -424,6 +787,7 @@ mod tests {
             filter: None,
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         };
 
@@ -437,6 +801,7 @@ mod tests {
                     filter: None,
                     order_by: vec![],
                     limit: None,
+                    offset: None,
                     distinct: false,
                 }),
                 alias: "t".to_string(),
@@ -445,6 +810,7 @@ mod tests {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }
         );

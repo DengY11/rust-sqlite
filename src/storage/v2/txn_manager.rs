@@ -8,7 +8,9 @@ use crate::engine::txn::TransactionId;
 use crate::sql::ast::{CompareOp, IsolationLevel};
 use crate::storage::v2::page::PageId;
 
-use super::tx_types::{PageWriteSetEntry, TxnSnapshot, TxnState, TxnStatus, TxnWriteSet, UndoRecord};
+use super::tx_types::{
+    PageWriteSetEntry, TxnSnapshot, TxnState, TxnStatus, TxnWriteSet, UndoRecord,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PredicateLockKind {
@@ -34,6 +36,20 @@ struct PredicateLock {
     kind: PredicateLockKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TableLockMode {
+    IntentionRead,
+    IntentionWrite,
+    Exclusive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableLock {
+    txn_id: TransactionId,
+    table: String,
+    mode: TableLockMode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PredicateWriteKey {
     table: String,
@@ -46,9 +62,12 @@ pub struct TxnManager {
     next_commit_ts: u64,
     next_row_ids: HashMap<String, u64>,
     txns: HashMap<TransactionId, TxnState>,
+    table_locks: Vec<TableLock>,
     predicate_locks: Vec<PredicateLock>,
+    table_wait_queues: HashMap<String, VecDeque<TransactionId>>,
     page_write_owners: HashMap<PageId, TransactionId>,
     page_write_wait_queues: HashMap<PageId, VecDeque<TransactionId>>,
+    table_wait_blockers: HashMap<TransactionId, BTreeSet<TransactionId>>,
     predicate_write_wait_queues: HashMap<PredicateWriteKey, VecDeque<TransactionId>>,
     page_wait_blockers: HashMap<TransactionId, BTreeSet<TransactionId>>,
     predicate_wait_blockers: HashMap<TransactionId, BTreeSet<TransactionId>>,
@@ -69,9 +88,12 @@ impl TxnManager {
             next_commit_ts: next_txn_id.saturating_sub(1),
             next_row_ids: HashMap::new(),
             txns: HashMap::new(),
+            table_locks: Vec::new(),
             predicate_locks: Vec::new(),
+            table_wait_queues: HashMap::new(),
             page_write_owners: HashMap::new(),
             page_write_wait_queues: HashMap::new(),
+            table_wait_blockers: HashMap::new(),
             predicate_write_wait_queues: HashMap::new(),
             page_wait_blockers: HashMap::new(),
             predicate_wait_blockers: HashMap::new(),
@@ -218,7 +240,8 @@ impl TxnManager {
         self.txns.retain(|_, txn| match txn.status {
             TxnStatus::Active => true,
             TxnStatus::Committed => {
-                txn.commit_ts.is_none_or(|commit_ts| commit_ts > purge_horizon)
+                txn.commit_ts
+                    .is_none_or(|commit_ts| commit_ts > purge_horizon)
                     || !txn.purge_records.is_empty()
             }
             TxnStatus::Aborted => !txn.undo_records.is_empty() || txn.terminal_error.is_some(),
@@ -269,12 +292,36 @@ impl TxnManager {
     }
 
     pub fn acquire_table_read_lock(&mut self, txn_id: TransactionId, table: &str) -> Result<()> {
-        self.acquire_predicate_lock(txn_id, PredicateLock {
+        self.acquire_table_intention_read(txn_id, table)?;
+        self.acquire_predicate_lock(
             txn_id,
-            table: table.to_string(),
-            index: None,
-            kind: PredicateLockKind::Table,
-        })
+            PredicateLock {
+                txn_id,
+                table: table.to_string(),
+                index: None,
+                kind: PredicateLockKind::Table,
+            },
+        )
+    }
+
+    pub fn acquire_table_intention_read(
+        &mut self,
+        txn_id: TransactionId,
+        table: &str,
+    ) -> Result<()> {
+        self.acquire_table_lock(txn_id, table, TableLockMode::IntentionRead)
+    }
+
+    pub fn acquire_table_intention_write(
+        &mut self,
+        txn_id: TransactionId,
+        table: &str,
+    ) -> Result<()> {
+        self.acquire_table_lock(txn_id, table, TableLockMode::IntentionWrite)
+    }
+
+    pub fn acquire_table_exclusive(&mut self, txn_id: TransactionId, table: &str) -> Result<()> {
+        self.acquire_table_lock(txn_id, table, TableLockMode::Exclusive)
     }
 
     pub fn acquire_exact_key_lock(
@@ -294,12 +341,15 @@ impl TxnManager {
         index: &str,
         key: &[Value],
     ) -> Result<()> {
-        self.acquire_predicate_lock(txn_id, PredicateLock {
+        self.acquire_predicate_lock(
             txn_id,
-            table: table.to_string(),
-            index: Some(index.to_string()),
-            kind: PredicateLockKind::Record(key.to_vec()),
-        })
+            PredicateLock {
+                txn_id,
+                table: table.to_string(),
+                index: Some(index.to_string()),
+                kind: PredicateLockKind::Record(key.to_vec()),
+            },
+        )
     }
 
     pub fn acquire_prefix_lock(
@@ -321,16 +371,19 @@ impl TxnManager {
         lower: Option<(CompareOp, &Value)>,
         upper: Option<(CompareOp, &Value)>,
     ) -> Result<()> {
-        self.acquire_predicate_lock(txn_id, PredicateLock {
+        self.acquire_predicate_lock(
             txn_id,
-            table: table.to_string(),
-            index: Some(index.to_string()),
-            kind: PredicateLockKind::Gap {
-                prefix: key_prefix.to_vec(),
-                lower: lower.map(|(op, value)| (op, value.clone())),
-                upper: upper.map(|(op, value)| (op, value.clone())),
+            PredicateLock {
+                txn_id,
+                table: table.to_string(),
+                index: Some(index.to_string()),
+                kind: PredicateLockKind::Gap {
+                    prefix: key_prefix.to_vec(),
+                    lower: lower.map(|(op, value)| (op, value.clone())),
+                    upper: upper.map(|(op, value)| (op, value.clone())),
+                },
             },
-        })
+        )
     }
 
     pub fn acquire_range_lock(
@@ -354,16 +407,19 @@ impl TxnManager {
         lower: Option<(CompareOp, &Value)>,
         upper: Option<(CompareOp, &Value)>,
     ) -> Result<()> {
-        self.acquire_predicate_lock(txn_id, PredicateLock {
+        self.acquire_predicate_lock(
             txn_id,
-            table: table.to_string(),
-            index: Some(index.to_string()),
-            kind: PredicateLockKind::NextKey {
-                prefix: key_prefix.to_vec(),
-                lower: lower.map(|(op, value)| (op, value.clone())),
-                upper: upper.map(|(op, value)| (op, value.clone())),
+            PredicateLock {
+                txn_id,
+                table: table.to_string(),
+                index: Some(index.to_string()),
+                kind: PredicateLockKind::NextKey {
+                    prefix: key_prefix.to_vec(),
+                    lower: lower.map(|(op, value)| (op, value.clone())),
+                    upper: upper.map(|(op, value)| (op, value.clone())),
+                },
             },
-        })
+        )
     }
 
     pub fn check_write_conflicts(
@@ -509,10 +565,13 @@ impl TxnManager {
 
     pub fn release_transaction_resources(&mut self, txn_id: TransactionId) -> Result<()> {
         self.get(txn_id)?;
+        self.table_locks.retain(|lock| lock.txn_id != txn_id);
         self.page_write_owners.retain(|_, owner| *owner != txn_id);
+        self.remove_txn_from_table_wait_queues(txn_id);
         self.remove_txn_from_wait_queues(txn_id);
         self.remove_txn_from_predicate_wait_queues(txn_id);
         self.predicate_locks.retain(|lock| lock.txn_id != txn_id);
+        self.table_wait_blockers.remove(&txn_id);
         self.page_wait_blockers.remove(&txn_id);
         self.predicate_wait_blockers.remove(&txn_id);
         self.waits_for.remove(&txn_id);
@@ -560,7 +619,9 @@ impl TxnManager {
             .values()
             .filter(|txn| {
                 txn.status == TxnStatus::Committed
-                    && txn.commit_ts.is_some_and(|commit_ts| commit_ts <= purge_horizon)
+                    && txn
+                        .commit_ts
+                        .is_some_and(|commit_ts| commit_ts <= purge_horizon)
                     && !txn.purge_records.is_empty()
             })
             .collect::<Vec<_>>();
@@ -578,7 +639,10 @@ impl TxnManager {
         planned
     }
 
-    pub fn complete_purge_batch(&mut self, purged_records: &[(TransactionId, UndoRecord)]) -> Result<()> {
+    pub fn complete_purge_batch(
+        &mut self,
+        purged_records: &[(TransactionId, UndoRecord)],
+    ) -> Result<()> {
         for (txn_id, record) in purged_records {
             let txn = self.get_mut(*txn_id)?;
             let Some(front) = txn.purge_records.pop_front() else {
@@ -622,6 +686,7 @@ impl TxnManager {
                 purge_records: VecDeque::new(),
             },
         );
+        self.table_wait_blockers.entry(txn_id).or_default();
         self.page_wait_blockers.entry(txn_id).or_default();
         self.predicate_wait_blockers.entry(txn_id).or_default();
         self.waits_for.entry(txn_id).or_default();
@@ -632,11 +697,9 @@ impl TxnManager {
         if txn.status == TxnStatus::Active {
             Ok(())
         } else {
-            Err(DbError::txn(
-                txn.terminal_error
-                    .clone()
-                    .unwrap_or_else(|| format!("transaction {} is not active", txn_id.0)),
-            ))
+            Err(DbError::txn(txn.terminal_error.clone().unwrap_or_else(
+                || format!("transaction {} is not active", txn_id.0),
+            )))
         }
     }
 
@@ -664,9 +727,15 @@ impl TxnManager {
                 .iter()
                 .filter(|lock| lock.txn_id == *txn_id)
                 .count();
+            let table_lock_count = self
+                .table_locks
+                .iter()
+                .filter(|lock| lock.txn_id == *txn_id)
+                .count();
             let rollback_cost = txn.undo_records.len()
                 + txn.write_set.page_writes.len()
                 + page_lock_count
+                + table_lock_count
                 + predicate_lock_count;
             (
                 rollback_cost,
@@ -676,7 +745,11 @@ impl TxnManager {
         }))
     }
 
-    fn wait_path(&self, current: TransactionId, target: TransactionId) -> Option<Vec<TransactionId>> {
+    fn wait_path(
+        &self,
+        current: TransactionId,
+        target: TransactionId,
+    ) -> Option<Vec<TransactionId>> {
         self.wait_path_with_visited(current, target, &mut BTreeSet::new())
     }
 
@@ -723,7 +796,11 @@ impl TxnManager {
         if self.isolation_level(txn_id)? != IsolationLevel::Serializable {
             return Ok(());
         }
-        if !self.predicate_locks.iter().any(|existing| *existing == lock) {
+        if !self
+            .predicate_locks
+            .iter()
+            .any(|existing| *existing == lock)
+        {
             self.predicate_locks.push(lock);
         }
         Ok(())
@@ -750,6 +827,162 @@ impl TxnManager {
         Ok(blockers)
     }
 
+    fn acquire_table_lock(
+        &mut self,
+        txn_id: TransactionId,
+        table: &str,
+        mode: TableLockMode,
+    ) -> Result<()> {
+        self.ensure_active(txn_id)?;
+
+        let blockers = self.conflicting_table_lock_txns(txn_id, table, mode)?;
+        let table_key = table.to_string();
+        if blockers.is_empty() {
+            let front_waiter = self
+                .table_wait_queues
+                .get(&table_key)
+                .and_then(|queue| queue.front().copied());
+            if let Some(front_waiter) = front_waiter {
+                if front_waiter != txn_id {
+                    self.enqueue_table_waiter(table, txn_id);
+                    self.set_table_wait_edges(txn_id, BTreeSet::from([front_waiter]));
+                    if self.has_wait_path(front_waiter, txn_id, &mut BTreeSet::new()) {
+                        if self.resolve_deadlock(txn_id, front_waiter, |victim| {
+                            format!(
+                                "deadlock detected while waiting for table lock on {table}; victim transaction {} aborted",
+                                victim.0
+                            )
+                        })? {
+                            return self.acquire_table_lock(txn_id, table, mode);
+                        }
+                    }
+                    return Err(DbError::txn(format!(
+                        "table lock wait on {table}; transaction {} is ahead in queue",
+                        front_waiter.0
+                    )));
+                }
+            }
+
+            self.dequeue_table_waiter(table, txn_id);
+            self.clear_table_wait_edges(txn_id);
+            self.upsert_table_lock(txn_id, table, mode);
+            return Ok(());
+        }
+
+        self.enqueue_table_waiter(table, txn_id);
+        self.set_table_wait_edges(txn_id, blockers.clone());
+        for blocker in &blockers {
+            if self.has_wait_path(*blocker, txn_id, &mut BTreeSet::new()) {
+                if self.resolve_deadlock(txn_id, *blocker, |victim| {
+                    format!(
+                        "deadlock detected while acquiring table lock on {table}; victim transaction {} aborted",
+                        victim.0
+                    )
+                })? {
+                    return self.acquire_table_lock(txn_id, table, mode);
+                }
+            }
+        }
+
+        Err(DbError::txn(format!(
+            "table lock wait on {table}; waiting on transactions {}",
+            blockers
+                .iter()
+                .map(|txn| txn.0.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )))
+    }
+
+    fn conflicting_table_lock_txns(
+        &self,
+        txn_id: TransactionId,
+        table: &str,
+        requested_mode: TableLockMode,
+    ) -> Result<BTreeSet<TransactionId>> {
+        let mut blockers = BTreeSet::new();
+        for lock in &self.table_locks {
+            if lock.txn_id == txn_id || lock.table != table {
+                continue;
+            }
+            if self.get(lock.txn_id)?.status != TxnStatus::Active {
+                continue;
+            }
+            if table_lock_modes_conflict(lock.mode, requested_mode) {
+                blockers.insert(lock.txn_id);
+            }
+        }
+        Ok(blockers)
+    }
+
+    fn upsert_table_lock(&mut self, txn_id: TransactionId, table: &str, mode: TableLockMode) {
+        if let Some(existing) = self
+            .table_locks
+            .iter_mut()
+            .find(|lock| lock.txn_id == txn_id && lock.table == table)
+        {
+            if mode > existing.mode {
+                existing.mode = mode;
+            }
+        } else {
+            self.table_locks.push(TableLock {
+                txn_id,
+                table: table.to_string(),
+                mode,
+            });
+        }
+    }
+
+    fn enqueue_table_waiter(&mut self, table: &str, txn_id: TransactionId) {
+        let queue = self.table_wait_queues.entry(table.to_string()).or_default();
+        if !queue.contains(&txn_id) {
+            queue.push_back(txn_id);
+        }
+    }
+
+    fn dequeue_table_waiter(&mut self, table: &str, txn_id: TransactionId) {
+        let should_remove = if let Some(queue) = self.table_wait_queues.get_mut(table) {
+            if queue.front().copied() == Some(txn_id) {
+                queue.pop_front();
+            }
+            queue.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            self.table_wait_queues.remove(table);
+        }
+    }
+
+    fn remove_txn_from_table_wait_queues(&mut self, txn_id: TransactionId) {
+        let tables = self
+            .table_wait_queues
+            .iter()
+            .filter_map(|(table, queue)| queue.contains(&txn_id).then_some(table.clone()))
+            .collect::<Vec<_>>();
+        for table in tables {
+            let should_remove = if let Some(queue) = self.table_wait_queues.get_mut(&table) {
+                queue.retain(|queued_txn_id| *queued_txn_id != txn_id);
+                queue.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                self.table_wait_queues.remove(&table);
+            }
+        }
+    }
+
+    fn set_table_wait_edges(&mut self, txn_id: TransactionId, blockers: BTreeSet<TransactionId>) {
+        self.table_wait_blockers.insert(txn_id, blockers);
+        self.refresh_waits_for(txn_id);
+    }
+
+    fn clear_table_wait_edges(&mut self, txn_id: TransactionId) {
+        self.table_wait_blockers.insert(txn_id, BTreeSet::new());
+        self.refresh_waits_for(txn_id);
+    }
+
     fn enqueue_page_waiter(&mut self, page_id: PageId, txn_id: TransactionId) {
         let queue = self.page_write_wait_queues.entry(page_id).or_default();
         if !queue.contains(&txn_id) {
@@ -772,14 +1005,18 @@ impl TxnManager {
     }
 
     fn enqueue_predicate_waiter(&mut self, wait_key: PredicateWriteKey, txn_id: TransactionId) {
-        let queue = self.predicate_write_wait_queues.entry(wait_key).or_default();
+        let queue = self
+            .predicate_write_wait_queues
+            .entry(wait_key)
+            .or_default();
         if !queue.contains(&txn_id) {
             queue.push_back(txn_id);
         }
     }
 
     fn dequeue_predicate_waiter(&mut self, wait_key: &PredicateWriteKey, txn_id: TransactionId) {
-        let should_remove = if let Some(queue) = self.predicate_write_wait_queues.get_mut(wait_key) {
+        let should_remove = if let Some(queue) = self.predicate_write_wait_queues.get_mut(wait_key)
+        {
             if queue.front().copied() == Some(txn_id) {
                 queue.pop_front();
             }
@@ -818,12 +1055,13 @@ impl TxnManager {
             .filter_map(|(wait_key, queue)| queue.contains(&txn_id).then_some(wait_key.clone()))
             .collect::<Vec<_>>();
         for wait_key in wait_keys {
-            let should_remove = if let Some(queue) = self.predicate_write_wait_queues.get_mut(&wait_key) {
-                queue.retain(|queued_txn_id| *queued_txn_id != txn_id);
-                queue.is_empty()
-            } else {
-                false
-            };
+            let should_remove =
+                if let Some(queue) = self.predicate_write_wait_queues.get_mut(&wait_key) {
+                    queue.retain(|queued_txn_id| *queued_txn_id != txn_id);
+                    queue.is_empty()
+                } else {
+                    false
+                };
             if should_remove {
                 self.predicate_write_wait_queues.remove(&wait_key);
             }
@@ -840,7 +1078,11 @@ impl TxnManager {
         self.refresh_waits_for(txn_id);
     }
 
-    fn set_predicate_wait_edges(&mut self, txn_id: TransactionId, blockers: BTreeSet<TransactionId>) {
+    fn set_predicate_wait_edges(
+        &mut self,
+        txn_id: TransactionId,
+        blockers: BTreeSet<TransactionId>,
+    ) {
         self.predicate_wait_blockers.insert(txn_id, blockers);
         self.refresh_waits_for(txn_id);
     }
@@ -852,6 +1094,13 @@ impl TxnManager {
 
     fn refresh_waits_for(&mut self, txn_id: TransactionId) {
         let mut blockers = BTreeSet::new();
+        blockers.extend(
+            self.table_wait_blockers
+                .get(&txn_id)
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
         blockers.extend(
             self.page_wait_blockers
                 .get(&txn_id)
@@ -877,6 +1126,9 @@ impl TxnManager {
             .filter(|txn_id| *txn_id != blocker)
             .collect::<Vec<_>>();
         for txn_id in txns {
+            if let Some(table_blockers) = self.table_wait_blockers.get_mut(&txn_id) {
+                table_blockers.remove(&blocker);
+            }
             if let Some(page_blockers) = self.page_wait_blockers.get_mut(&txn_id) {
                 page_blockers.remove(&blocker);
             }
@@ -934,9 +1186,9 @@ impl Default for TxnManager {
 fn predicate_lock_conflicts(lock: &PredicateLock, index_keys: &[(String, Vec<Value>)]) -> bool {
     match &lock.kind {
         PredicateLockKind::Table => true,
-        PredicateLockKind::Record(locked_key) => index_keys.iter().any(|(index, key)| {
-            lock.index.as_deref() == Some(index.as_str()) && key == locked_key
-        }),
+        PredicateLockKind::Record(locked_key) => index_keys
+            .iter()
+            .any(|(index, key)| lock.index.as_deref() == Some(index.as_str()) && key == locked_key),
         PredicateLockKind::Gap {
             prefix,
             lower,
@@ -961,6 +1213,16 @@ fn predicate_lock_conflicts(lock: &PredicateLock, index_keys: &[(String, Vec<Val
                     .is_none_or(|(op, value)| matches_compare(candidate, *op, value))
         }),
     }
+}
+
+fn table_lock_modes_conflict(existing: TableLockMode, requested: TableLockMode) -> bool {
+    !matches!(
+        (existing, requested),
+        (TableLockMode::IntentionRead, TableLockMode::IntentionRead)
+            | (TableLockMode::IntentionRead, TableLockMode::IntentionWrite)
+            | (TableLockMode::IntentionWrite, TableLockMode::IntentionRead)
+            | (TableLockMode::IntentionWrite, TableLockMode::IntentionWrite)
+    )
 }
 
 fn predicate_write_key(table: &str, index_keys: &[(String, Vec<Value>)]) -> PredicateWriteKey {
@@ -1061,9 +1323,11 @@ mod tests {
             .unwrap();
 
         let write_set = manager.page_write_set(txn).unwrap();
-        assert!(write_set
-            .touched_pages
-            .contains(&crate::storage::v2::page::PageId(3)));
+        assert!(
+            write_set
+                .touched_pages
+                .contains(&crate::storage::v2::page::PageId(3))
+        );
         assert_eq!(write_set.page_writes.len(), 1);
         assert_eq!(write_set.page_writes[0].after_image, vec![4, 5, 6]);
     }
@@ -1174,7 +1438,11 @@ mod tests {
         manager.release_transaction_resources(writer1).unwrap();
 
         let writer3_still_waiting = manager.acquire_page_write(writer3, page_id).unwrap_err();
-        assert!(writer3_still_waiting.to_string().contains("page write wait"));
+        assert!(
+            writer3_still_waiting
+                .to_string()
+                .contains("page write wait")
+        );
 
         manager.acquire_page_write(writer2, page_id).unwrap();
     }
@@ -1288,7 +1556,11 @@ mod tests {
                 )],
             )
             .unwrap_err();
-        assert!(writer2_still_waiting.to_string().contains("predicate write wait"));
+        assert!(
+            writer2_still_waiting
+                .to_string()
+                .contains("predicate write wait")
+        );
 
         manager
             .check_write_conflicts(
@@ -1507,7 +1779,10 @@ mod tests {
         manager.purge_finished_transactions_up_to(committed_old_ts);
 
         assert!(manager.get(committed_old).is_err());
-        assert_eq!(manager.get(committed_new).unwrap().commit_ts, Some(committed_new_ts));
+        assert_eq!(
+            manager.get(committed_new).unwrap().commit_ts,
+            Some(committed_new_ts)
+        );
     }
 
     #[test]
@@ -1543,5 +1818,45 @@ mod tests {
         manager.complete_purge_batch(&planned_batch).unwrap();
         manager.purge_finished_transactions_up_to(commit_ts);
         assert_eq!(manager.history_list_length(), 0);
+    }
+
+    #[test]
+    fn table_intention_locks_allow_is_and_ix_but_block_exclusive() {
+        let mut manager = TxnManager::new();
+        let reader = manager.begin(IsolationLevel::ReadCommitted);
+        let writer = manager.begin(IsolationLevel::ReadCommitted);
+        let ddl = manager.begin(IsolationLevel::ReadCommitted);
+
+        manager
+            .acquire_table_intention_read(reader, "users")
+            .unwrap();
+        manager
+            .acquire_table_intention_write(writer, "users")
+            .unwrap();
+
+        let wait = manager.acquire_table_exclusive(ddl, "users").unwrap_err();
+        assert!(wait.to_string().contains("table lock wait"));
+
+        manager.release_transaction_resources(reader).unwrap();
+        manager.release_transaction_resources(writer).unwrap();
+
+        manager.acquire_table_exclusive(ddl, "users").unwrap();
+    }
+
+    #[test]
+    fn table_lock_wait_cycle_reports_deadlock() {
+        let mut manager = TxnManager::new();
+        let txn1 = manager.begin(IsolationLevel::ReadCommitted);
+        let txn2 = manager.begin(IsolationLevel::ReadCommitted);
+
+        manager.acquire_table_exclusive(txn1, "users").unwrap();
+        manager.acquire_table_exclusive(txn2, "orders").unwrap();
+
+        let wait = manager.acquire_table_exclusive(txn1, "orders").unwrap_err();
+        assert!(wait.to_string().contains("table lock"));
+
+        let deadlock = manager.acquire_table_exclusive(txn2, "users").unwrap_err();
+        assert!(deadlock.to_string().contains("deadlock"));
+        assert_eq!(manager.status(txn2).unwrap(), TxnStatus::Aborted);
     }
 }

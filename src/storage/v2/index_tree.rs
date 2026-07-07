@@ -150,7 +150,13 @@ impl IndexTree {
         self.delete_from_page(pager, txn_id, self.root_page_id, key)
     }
 
-    fn find_leaf(&self, pager: &Pager, txn_id: u64, page_id: PageId, key: &[u8]) -> Result<LeafNode> {
+    fn find_leaf(
+        &self,
+        pager: &Pager,
+        txn_id: u64,
+        page_id: PageId,
+        key: &[u8],
+    ) -> Result<LeafNode> {
         match read_node(pager, txn_id, page_id)? {
             Node::Leaf(leaf) => Ok(leaf),
             Node::Internal(internal) => {
@@ -163,7 +169,9 @@ impl IndexTree {
     fn leftmost_leaf_page(&self, pager: &Pager, txn_id: u64, page_id: PageId) -> Result<PageId> {
         match read_node(pager, txn_id, page_id)? {
             Node::Leaf(_) => Ok(page_id),
-            Node::Internal(internal) => self.leftmost_leaf_page(pager, txn_id, internal.children[0]),
+            Node::Internal(internal) => {
+                self.leftmost_leaf_page(pager, txn_id, internal.children[0])
+            }
         }
     }
 

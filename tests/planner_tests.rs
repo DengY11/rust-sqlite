@@ -5,7 +5,8 @@ use rustsql::common::types::{
 };
 use rustsql::sql::ast::{
     AggregateArg, AggregateFunc, AlterTableAction, CompareOp, Expr, FromItem, JoinClause, JoinKind,
-    OrderBy, OrderByExpr, ScalarExpr, SelectItem, SelectStatement, Statement, TableConstraint,
+    OrderBy, OrderByExpr, ScalarExpr, ScalarFunc, SelectItem, SelectStatement, Statement,
+    TableConstraint,
 };
 use rustsql::sql::optimizer::Optimizer;
 use rustsql::sql::parser::parse_sql;
@@ -28,6 +29,7 @@ fn select_statement(columns: Vec<SelectItem>, table: &str, filter: Option<Expr>)
         compounds: vec![],
         order_by: vec![],
         limit: None,
+        offset: None,
     })
 }
 
@@ -89,6 +91,7 @@ fn plans_select_without_index_as_seq_scan() {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -135,6 +138,7 @@ fn plans_select_from_derived_source_with_alias_exposed_columns() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             alias: "t".to_string(),
@@ -143,10 +147,12 @@ fn plans_select_from_derived_source_with_alias_exposed_columns() {
             filter: None,
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("bucket".to_string()),
+                collation: None,
                 descending: false,
                 nulls: None,
             }],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -184,6 +190,7 @@ fn plans_derived_source_with_unqualified_output_for_qualified_inner_column() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             alias: "t".to_string(),
@@ -192,10 +199,12 @@ fn plans_derived_source_with_unqualified_output_for_qualified_inner_column() {
             filter: None,
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("age".to_string()),
+                collation: None,
                 descending: false,
                 nulls: None,
             }],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -233,6 +242,7 @@ fn plans_derived_source_with_wildcard_expanded_output_columns() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             alias: "t".to_string(),
@@ -241,10 +251,12 @@ fn plans_derived_source_with_wildcard_expanded_output_columns() {
             filter: None,
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("age".to_string()),
+                collation: None,
                 descending: false,
                 nulls: None,
             }],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -470,7 +482,9 @@ fn plans_select_with_matching_eq_index_as_index_scan() {
     let indexes = vec![IndexMeta {
         name: "idx_users_id".to_string(),
         columns: vec!["id".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }];
 
     let plan = optimized_plan(&statement, &context_with_indexes(indexes));
@@ -492,6 +506,7 @@ fn plans_select_with_matching_eq_index_as_index_scan() {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -518,7 +533,9 @@ fn plans_and_equality_prefix_with_composite_index_as_index_scan() {
     let indexes = vec![IndexMeta {
         name: "idx_users_id_name".to_string(),
         columns: vec!["id".to_string(), "name".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }];
 
     let plan = optimized_plan(&statement, &context_with_indexes(indexes));
@@ -547,6 +564,7 @@ fn plans_and_equality_prefix_with_composite_index_as_index_scan() {
             )),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -557,7 +575,9 @@ fn plans_eq_prefix_plus_range_predicate_as_index_scan_with_full_filter() {
     let indexes = vec![IndexMeta {
         name: "idx_users_id_name".to_string(),
         columns: vec!["id".to_string(), "name".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }];
     let statement = select_statement(
         vec![SelectItem::Wildcard],
@@ -609,6 +629,7 @@ fn plans_eq_prefix_plus_range_predicate_as_index_scan_with_full_filter() {
             )),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -619,7 +640,9 @@ fn plans_eq_prefix_plus_two_sided_range_as_index_scan() {
     let indexes = vec![IndexMeta {
         name: "idx_users_id_name".to_string(),
         columns: vec!["id".to_string(), "name".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }];
     let statement = select_statement(
         vec![SelectItem::Wildcard],
@@ -688,6 +711,7 @@ fn plans_eq_prefix_plus_two_sided_range_as_index_scan() {
             )),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -698,7 +722,9 @@ fn plans_tightens_redundant_range_bounds_on_same_column() {
     let indexes = vec![IndexMeta {
         name: "idx_users_id_name".to_string(),
         columns: vec!["id".to_string(), "name".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }];
     let statement = select_statement(
         vec![SelectItem::Wildcard],
@@ -781,6 +807,7 @@ fn plans_tightens_redundant_range_bounds_on_same_column() {
             )),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -792,12 +819,16 @@ fn plans_indexable_or_predicates_as_index_union() {
         IndexMeta {
             name: "idx_users_id".to_string(),
             columns: vec!["id".to_string()],
+            decorated_columns: None,
             unique: false,
+            predicate: None,
         },
         IndexMeta {
             name: "idx_users_name".to_string(),
             columns: vec!["name".to_string()],
+            decorated_columns: None,
             unique: false,
+            predicate: None,
         },
     ];
     let statement = select_statement(
@@ -853,6 +884,7 @@ fn plans_indexable_or_predicates_as_index_union() {
             )),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -864,7 +896,9 @@ fn plans_or_predicates_as_seq_scan_when_any_branch_is_not_indexable() {
     let indexes = vec![IndexMeta {
         name: "idx_users_id".to_string(),
         columns: vec!["id".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }];
     let statement = select_statement(
         vec![SelectItem::Wildcard],
@@ -907,6 +941,7 @@ fn plans_or_predicates_as_seq_scan_when_any_branch_is_not_indexable() {
             )),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -917,7 +952,9 @@ fn plans_range_predicates_as_index_scan_when_leading_index_column_matches() {
     let indexes = vec![IndexMeta {
         name: "idx_users_id".to_string(),
         columns: vec!["id".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }];
     let context = context_with_indexes(indexes);
 
@@ -970,6 +1007,7 @@ fn plans_range_predicates_as_index_scan_when_leading_index_column_matches() {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -997,6 +1035,7 @@ fn plans_range_predicates_as_index_scan_when_leading_index_column_matches() {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -1007,7 +1046,9 @@ fn plans_inclusive_range_predicates_as_index_scan() {
     let indexes = vec![IndexMeta {
         name: "idx_users_id".to_string(),
         columns: vec!["id".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }];
     let statement = select_statement(
         vec![SelectItem::Wildcard],
@@ -1062,6 +1103,7 @@ fn plans_inclusive_range_predicates_as_index_scan() {
             )),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -1078,6 +1120,9 @@ fn plans_create_insert_and_txn_statements() {
                 name: "users".to_string(),
                 columns: user_schema().columns,
                 constraints: vec![],
+                strict: false,
+                without_rowid: false,
+                if_not_exists: false,
             },
             &context,
         )
@@ -1088,7 +1133,10 @@ fn plans_create_insert_and_txn_statements() {
                 name: "idx_users_id".to_string(),
                 table: "users".to_string(),
                 columns: vec!["id".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
+                if_not_exists: false,
             },
             &context,
         )
@@ -1098,6 +1146,7 @@ fn plans_create_insert_and_txn_statements() {
             &Statement::Insert {
                 table: "users".to_string(),
                 columns: None,
+                or_conflict: None,
                 values: vec![Value::Integer(1), Value::Text("alice".to_string())],
             },
             &context,
@@ -1127,6 +1176,9 @@ fn plans_create_insert_and_txn_statements() {
                 ColumnDef::new("name", ColumnType::Text),
             ],
             constraints: vec![],
+            strict: false,
+            without_rowid: false,
+            if_not_exists: false,
         }
     );
     assert_eq!(
@@ -1135,13 +1187,17 @@ fn plans_create_insert_and_txn_statements() {
             name: "idx_users_id".to_string(),
             table: "users".to_string(),
             columns: vec!["id".to_string()],
+            decorated_columns: None,
             unique: false,
+            predicate: None,
+            if_not_exists: false,
         }
     );
     assert_eq!(
         insert,
         Plan::Insert {
             table: "users".to_string(),
+            or_conflict: None,
             values: vec![Value::Integer(1), Value::Text("alice".to_string())],
         }
     );
@@ -1153,6 +1209,859 @@ fn plans_create_insert_and_txn_statements() {
     );
     assert_eq!(commit, Plan::CommitTxn);
     assert_eq!(rollback, Plan::RollbackTxn);
+}
+
+#[test]
+fn planner_expands_insert_default_values_into_schema_defaults() {
+    let planner = Planner::new();
+    let users = Schema::new(
+        "users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("name", ColumnType::Text)
+                .default_value(rustsql::common::types::ColumnDefault::Literal(Value::from(
+                    "anonymous",
+                )))
+                .nullable(false),
+            ColumnDef::new("active", ColumnType::Boolean)
+                .default_value(rustsql::common::types::ColumnDefault::Literal(
+                    Value::Boolean(true),
+                ))
+                .nullable(false),
+        ],
+    );
+    let context = PlanningContext::new(
+        HashMap::from([(String::from("users"), users)]),
+        HashMap::new(),
+    );
+
+    let plan = planner
+        .plan_statement(
+            &Statement::Insert {
+                table: "users".to_string(),
+                columns: None,
+                or_conflict: None,
+                values: vec![],
+            },
+            &context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::Insert {
+            table: "users".to_string(),
+            or_conflict: None,
+            values: vec![Value::Null, Value::from("anonymous"), Value::Boolean(true),],
+        }
+    );
+}
+
+#[test]
+fn planner_plans_insert_select_statement() {
+    let planner = Planner::new();
+    let users = Schema::new(
+        "users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("name", ColumnType::Text),
+        ],
+    );
+    let archive_users = Schema::new(
+        "archive_users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("name", ColumnType::Text),
+        ],
+    );
+    let context = PlanningContext::new(
+        HashMap::from([
+            (String::from("users"), users),
+            (String::from("archive_users"), archive_users),
+        ]),
+        HashMap::new(),
+    );
+
+    let plan = planner
+        .plan_statement(
+            &Statement::InsertSelect {
+                table: "archive_users".to_string(),
+                columns: None,
+                or_conflict: None,
+                select: Box::new(SelectStatement {
+                    with: None,
+                    distinct: false,
+                    columns: vec![
+                        SelectItem::Column("id".to_string()),
+                        SelectItem::Column("name".to_string()),
+                    ],
+                    from: FromItem::Table {
+                        name: "users".to_string(),
+                        alias: None,
+                    },
+                    joins: vec![],
+                    filter: Some(Expr::Compare {
+                        column: "id".to_string(),
+                        op: CompareOp::Gte,
+                        value: Value::Integer(2),
+                    }),
+                    group_by: vec![],
+                    having: None,
+                    compounds: vec![],
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                }),
+            },
+            &context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::InsertSelect {
+            table: "archive_users".to_string(),
+            columns: None,
+            or_conflict: None,
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![
+                    SelectItem::Column("id".to_string()),
+                    SelectItem::Column("name".to_string()),
+                ],
+                filter: Some(Expr::Compare {
+                    column: "id".to_string(),
+                    op: CompareOp::Gte,
+                    value: Value::Integer(2),
+                }),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                distinct: false,
+            }),
+        }
+    );
+}
+
+#[test]
+fn planner_plans_insert_select_statement_with_explicit_column_list() {
+    let planner = Planner::new();
+    let users = Schema::new(
+        "users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("name", ColumnType::Text),
+        ],
+    );
+    let archive_users = Schema::new(
+        "archive_users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("name", ColumnType::Text),
+            ColumnDef::new("active", ColumnType::Boolean).default_value(
+                rustsql::common::types::ColumnDefault::Literal(Value::Boolean(true)),
+            ),
+        ],
+    );
+    let context = PlanningContext::new(
+        HashMap::from([
+            (String::from("users"), users),
+            (String::from("archive_users"), archive_users),
+        ]),
+        HashMap::new(),
+    );
+
+    let plan = planner
+        .plan_statement(
+            &Statement::InsertSelect {
+                table: "archive_users".to_string(),
+                columns: Some(vec!["id".to_string(), "name".to_string()]),
+                or_conflict: None,
+                select: Box::new(SelectStatement {
+                    with: None,
+                    distinct: false,
+                    columns: vec![
+                        SelectItem::Column("id".to_string()),
+                        SelectItem::Column("name".to_string()),
+                    ],
+                    from: FromItem::Table {
+                        name: "users".to_string(),
+                        alias: None,
+                    },
+                    joins: vec![],
+                    filter: Some(Expr::Compare {
+                        column: "id".to_string(),
+                        op: CompareOp::Gte,
+                        value: Value::Integer(2),
+                    }),
+                    group_by: vec![],
+                    having: None,
+                    compounds: vec![],
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                }),
+            },
+            &context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::InsertSelect {
+            table: "archive_users".to_string(),
+            columns: Some(vec!["id".to_string(), "name".to_string()]),
+            or_conflict: None,
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![
+                    SelectItem::Column("id".to_string()),
+                    SelectItem::Column("name".to_string()),
+                ],
+                filter: Some(Expr::Compare {
+                    column: "id".to_string(),
+                    op: CompareOp::Gte,
+                    value: Value::Integer(2),
+                }),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                distinct: false,
+            }),
+        }
+    );
+}
+
+#[test]
+fn planner_plans_multi_row_insert_statement() {
+    let planner = Planner::new();
+    let users = Schema::new(
+        "users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("name", ColumnType::Text),
+        ],
+    );
+    let context = PlanningContext::new(
+        HashMap::from([(String::from("users"), users)]),
+        HashMap::new(),
+    );
+
+    let plan = planner
+        .plan_statement(
+            &Statement::InsertMany {
+                table: "users".to_string(),
+                columns: None,
+                or_conflict: None,
+                rows: vec![
+                    vec![Value::Integer(1), Value::from("alice")],
+                    vec![Value::Integer(2), Value::from("bob")],
+                ],
+            },
+            &context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::InsertMany {
+            table: "users".to_string(),
+            or_conflict: None,
+            rows: vec![
+                vec![Value::Integer(1), Value::from("alice")],
+                vec![Value::Integer(2), Value::from("bob")],
+            ],
+        }
+    );
+}
+
+#[test]
+fn planner_plans_insert_on_conflict_target_do_nothing_statement() {
+    let planner = Planner::new();
+    let users = Schema::new(
+        "users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("email", ColumnType::Text).unique(true),
+            ColumnDef::new("name", ColumnType::Text),
+        ],
+    );
+    let context = PlanningContext::new(
+        HashMap::from([(String::from("users"), users)]),
+        HashMap::new(),
+    );
+
+    let plan = planner
+        .plan_statement(
+            &Statement::InsertDoNothing {
+                table: "users".to_string(),
+                columns: None,
+                target: Some(vec!["id".to_string()]),
+                values: vec![
+                    Value::Integer(1),
+                    Value::from("a@example.com"),
+                    Value::from("alice"),
+                ],
+            },
+            &context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::InsertDoNothing {
+            table: "users".to_string(),
+            target: Some(vec!["id".to_string()]),
+            values: vec![
+                Value::Integer(1),
+                Value::from("a@example.com"),
+                Value::from("alice"),
+            ],
+        }
+    );
+}
+
+#[test]
+fn planner_plans_insert_select_on_conflict_target_do_nothing_statement() {
+    let planner = Planner::new();
+    let users = Schema::new(
+        "users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("email", ColumnType::Text).unique(true),
+            ColumnDef::new("name", ColumnType::Text),
+        ],
+    );
+    let archive_users = Schema::new(
+        "archive_users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("email", ColumnType::Text).unique(true),
+            ColumnDef::new("name", ColumnType::Text),
+        ],
+    );
+    let context = PlanningContext::new(
+        HashMap::from([
+            (String::from("users"), users),
+            (String::from("archive_users"), archive_users),
+        ]),
+        HashMap::new(),
+    );
+
+    let plan = planner
+        .plan_statement(
+            &Statement::InsertSelectDoNothing {
+                table: "archive_users".to_string(),
+                columns: None,
+                target: Some(vec!["id".to_string()]),
+                select: Box::new(SelectStatement {
+                    with: None,
+                    distinct: false,
+                    columns: vec![
+                        SelectItem::Column("id".to_string()),
+                        SelectItem::Column("email".to_string()),
+                        SelectItem::Column("name".to_string()),
+                    ],
+                    from: FromItem::Table {
+                        name: "users".to_string(),
+                        alias: None,
+                    },
+                    joins: vec![],
+                    filter: None,
+                    group_by: vec![],
+                    having: None,
+                    compounds: vec![],
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                }),
+            },
+            &context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::InsertSelectDoNothing {
+            table: "archive_users".to_string(),
+            columns: None,
+            target: Some(vec!["id".to_string()]),
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![
+                    SelectItem::Column("id".to_string()),
+                    SelectItem::Column("email".to_string()),
+                    SelectItem::Column("name".to_string()),
+                ],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                distinct: false,
+            }),
+        }
+    );
+}
+
+#[test]
+fn planner_plans_insert_values_scalar_expressions() {
+    let planner = Planner::new();
+    let users = Schema::new(
+        "users",
+        vec![
+            ColumnDef::primary_key("id", ColumnType::Integer),
+            ColumnDef::new("name", ColumnType::Text),
+        ],
+    );
+    let context = PlanningContext::new(
+        HashMap::from([(String::from("users"), users)]),
+        HashMap::new(),
+    );
+
+    let plan = planner
+        .plan_statement(
+            &Statement::InsertManyExpr {
+                table: "users".to_string(),
+                columns: None,
+                or_conflict: None,
+                rows: vec![
+                    vec![
+                        ScalarExpr::Binary {
+                            left: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                            op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                            right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                        },
+                        ScalarExpr::Function {
+                            func: rustsql::sql::ast::ScalarFunc::Lower,
+                            args: vec![ScalarExpr::Literal(Value::from("ALICE"))],
+                        },
+                    ],
+                    vec![
+                        ScalarExpr::Literal(Value::Integer(3)),
+                        ScalarExpr::Function {
+                            func: rustsql::sql::ast::ScalarFunc::Coalesce,
+                            args: vec![
+                                ScalarExpr::Literal(Value::Null),
+                                ScalarExpr::Literal(Value::from("bob")),
+                            ],
+                        },
+                    ],
+                ],
+            },
+            &context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan,
+        Plan::InsertManyExpr {
+            table: "users".to_string(),
+            or_conflict: None,
+            rows: vec![
+                vec![
+                    ScalarExpr::Binary {
+                        left: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                        op: rustsql::sql::ast::ScalarBinaryOp::Add,
+                        right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
+                    },
+                    ScalarExpr::Function {
+                        func: rustsql::sql::ast::ScalarFunc::Lower,
+                        args: vec![ScalarExpr::Literal(Value::from("ALICE"))],
+                    },
+                ],
+                vec![
+                    ScalarExpr::Literal(Value::Integer(3)),
+                    ScalarExpr::Function {
+                        func: rustsql::sql::ast::ScalarFunc::Coalesce,
+                        args: vec![
+                            ScalarExpr::Literal(Value::Null),
+                            ScalarExpr::Literal(Value::from("bob")),
+                        ],
+                    },
+                ],
+            ],
+        }
+    );
+}
+
+#[test]
+fn optimizer_ignores_partial_indexes_for_lookup_plans() {
+    let statement = select_statement(
+        vec![SelectItem::Wildcard],
+        "users",
+        Some(Expr::Compare {
+            column: "email".to_string(),
+            op: CompareOp::Eq,
+            value: Value::from("alice@example.com"),
+        }),
+    );
+    let indexes = vec![IndexMeta {
+        name: "idx_users_email_active".to_string(),
+        columns: vec!["email".to_string()],
+        decorated_columns: None,
+        unique: false,
+        predicate: Some("active = 1".to_string()),
+    }];
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("name", ColumnType::Text),
+                    ColumnDef::new("email", ColumnType::Text),
+                ],
+            ),
+        )]),
+        HashMap::from([("users".to_string(), indexes)]),
+    );
+
+    let plan = optimized_plan(&statement, &context);
+
+    assert_eq!(
+        plan,
+        Plan::SeqScan {
+            table: "users".to_string(),
+            table_alias: None,
+            columns: vec![SelectItem::Wildcard],
+            filter: Some(Expr::Compare {
+                column: "email".to_string(),
+                op: CompareOp::Eq,
+                value: Value::from("alice@example.com"),
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn optimizer_uses_partial_indexes_when_filter_implies_predicate() {
+    let statement = select_statement(
+        vec![SelectItem::Wildcard],
+        "users",
+        Some(Expr::And(
+            Box::new(Expr::Compare {
+                column: "active".to_string(),
+                op: CompareOp::Eq,
+                value: Value::Integer(1),
+            }),
+            Box::new(Expr::CompareScalar {
+                left: ScalarExpr::Function {
+                    func: ScalarFunc::Lower,
+                    args: vec![ScalarExpr::Column("name".to_string())],
+                },
+                op: CompareOp::Eq,
+                right: ScalarExpr::Literal(Value::from("alice")),
+            }),
+        )),
+    );
+    let indexes = vec![IndexMeta {
+        name: "idx_users_active_lower_name".to_string(),
+        columns: vec!["lower(name)".to_string()],
+        decorated_columns: None,
+        unique: false,
+        predicate: Some("active = 1".to_string()),
+    }];
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("name", ColumnType::Text),
+                    ColumnDef::new("active", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::from([("users".to_string(), indexes)]),
+    );
+
+    let plan = optimized_plan(&statement, &context);
+
+    assert_eq!(
+        plan,
+        Plan::IndexScan {
+            table: "users".to_string(),
+            table_alias: None,
+            columns: vec![SelectItem::Wildcard],
+            index: "idx_users_active_lower_name".to_string(),
+            mode: IndexScanMode::Lookup,
+            key_prefix: vec![Value::from("alice")],
+            range: None,
+            filter: Some(Expr::And(
+                Box::new(Expr::Compare {
+                    column: "active".to_string(),
+                    op: CompareOp::Eq,
+                    value: Value::Integer(1),
+                }),
+                Box::new(Expr::CompareScalar {
+                    left: ScalarExpr::Function {
+                        func: ScalarFunc::Lower,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    },
+                    op: CompareOp::Eq,
+                    right: ScalarExpr::Literal(Value::from("alice")),
+                }),
+            )),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn optimizer_uses_partial_indexes_when_filter_implies_conjunctive_predicate() {
+    let statement = select_statement(
+        vec![SelectItem::Wildcard],
+        "users",
+        Some(Expr::And(
+            Box::new(Expr::Compare {
+                column: "active".to_string(),
+                op: CompareOp::Eq,
+                value: Value::Integer(1),
+            }),
+            Box::new(Expr::And(
+                Box::new(Expr::Compare {
+                    column: "tenant_id".to_string(),
+                    op: CompareOp::Eq,
+                    value: Value::Integer(7),
+                }),
+                Box::new(Expr::CompareScalar {
+                    left: ScalarExpr::Function {
+                        func: ScalarFunc::Lower,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    },
+                    op: CompareOp::Eq,
+                    right: ScalarExpr::Literal(Value::from("alice")),
+                }),
+            )),
+        )),
+    );
+    let indexes = vec![IndexMeta {
+        name: "idx_users_active_tenant_lower_name".to_string(),
+        columns: vec!["lower(name)".to_string()],
+        decorated_columns: None,
+        unique: false,
+        predicate: Some("active = 1 AND tenant_id = 7".to_string()),
+    }];
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("name", ColumnType::Text),
+                    ColumnDef::new("active", ColumnType::Integer),
+                    ColumnDef::new("tenant_id", ColumnType::Integer),
+                ],
+            ),
+        )]),
+        HashMap::from([("users".to_string(), indexes)]),
+    );
+
+    let plan = optimized_plan(&statement, &context);
+
+    assert_eq!(
+        plan,
+        Plan::IndexScan {
+            table: "users".to_string(),
+            table_alias: None,
+            columns: vec![SelectItem::Wildcard],
+            index: "idx_users_active_tenant_lower_name".to_string(),
+            mode: IndexScanMode::Lookup,
+            key_prefix: vec![Value::from("alice")],
+            range: None,
+            filter: Some(Expr::And(
+                Box::new(Expr::Compare {
+                    column: "active".to_string(),
+                    op: CompareOp::Eq,
+                    value: Value::Integer(1),
+                }),
+                Box::new(Expr::And(
+                    Box::new(Expr::Compare {
+                        column: "tenant_id".to_string(),
+                        op: CompareOp::Eq,
+                        value: Value::Integer(7),
+                    }),
+                    Box::new(Expr::CompareScalar {
+                        left: ScalarExpr::Function {
+                            func: ScalarFunc::Lower,
+                            args: vec![ScalarExpr::Column("name".to_string())],
+                        },
+                        op: CompareOp::Eq,
+                        right: ScalarExpr::Literal(Value::from("alice")),
+                    }),
+                )),
+            )),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn optimizer_uses_partial_indexes_when_filter_implies_is_null_predicate() {
+    let statement = select_statement(
+        vec![SelectItem::Wildcard],
+        "users",
+        Some(Expr::And(
+            Box::new(Expr::IsNull {
+                column: "deleted_at".to_string(),
+                negated: false,
+            }),
+            Box::new(Expr::CompareScalar {
+                left: ScalarExpr::Function {
+                    func: ScalarFunc::Lower,
+                    args: vec![ScalarExpr::Column("name".to_string())],
+                },
+                op: CompareOp::Eq,
+                right: ScalarExpr::Literal(Value::from("alice")),
+            }),
+        )),
+    );
+    let indexes = vec![IndexMeta {
+        name: "idx_users_live_lower_name".to_string(),
+        columns: vec!["lower(name)".to_string()],
+        decorated_columns: None,
+        unique: false,
+        predicate: Some("deleted_at IS NULL".to_string()),
+    }];
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("name", ColumnType::Text),
+                    ColumnDef::new("deleted_at", ColumnType::Text),
+                ],
+            ),
+        )]),
+        HashMap::from([("users".to_string(), indexes)]),
+    );
+
+    let plan = optimized_plan(&statement, &context);
+
+    assert_eq!(
+        plan,
+        Plan::IndexScan {
+            table: "users".to_string(),
+            table_alias: None,
+            columns: vec![SelectItem::Wildcard],
+            index: "idx_users_live_lower_name".to_string(),
+            mode: IndexScanMode::Lookup,
+            key_prefix: vec![Value::from("alice")],
+            range: None,
+            filter: Some(Expr::And(
+                Box::new(Expr::IsNull {
+                    column: "deleted_at".to_string(),
+                    negated: false,
+                }),
+                Box::new(Expr::CompareScalar {
+                    left: ScalarExpr::Function {
+                        func: ScalarFunc::Lower,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    },
+                    op: CompareOp::Eq,
+                    right: ScalarExpr::Literal(Value::from("alice")),
+                }),
+            )),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            distinct: false,
+        }
+    );
+}
+
+#[test]
+fn optimizer_uses_partial_indexes_when_filter_implies_is_not_null_predicate() {
+    let statement = select_statement(
+        vec![SelectItem::Wildcard],
+        "users",
+        Some(Expr::And(
+            Box::new(Expr::IsNull {
+                column: "deleted_at".to_string(),
+                negated: true,
+            }),
+            Box::new(Expr::CompareScalar {
+                left: ScalarExpr::Function {
+                    func: ScalarFunc::Lower,
+                    args: vec![ScalarExpr::Column("name".to_string())],
+                },
+                op: CompareOp::Eq,
+                right: ScalarExpr::Literal(Value::from("alice")),
+            }),
+        )),
+    );
+    let indexes = vec![IndexMeta {
+        name: "idx_users_deleted_lower_name".to_string(),
+        columns: vec!["lower(name)".to_string()],
+        decorated_columns: None,
+        unique: false,
+        predicate: Some("deleted_at IS NOT NULL".to_string()),
+    }];
+    let context = PlanningContext::new(
+        HashMap::from([(
+            "users".to_string(),
+            Schema::new(
+                "users",
+                vec![
+                    ColumnDef::primary_key("id", ColumnType::Integer),
+                    ColumnDef::new("name", ColumnType::Text),
+                    ColumnDef::new("deleted_at", ColumnType::Text),
+                ],
+            ),
+        )]),
+        HashMap::from([("users".to_string(), indexes)]),
+    );
+
+    let plan = optimized_plan(&statement, &context);
+
+    assert_eq!(
+        plan,
+        Plan::IndexScan {
+            table: "users".to_string(),
+            table_alias: None,
+            columns: vec![SelectItem::Wildcard],
+            index: "idx_users_deleted_lower_name".to_string(),
+            mode: IndexScanMode::Lookup,
+            key_prefix: vec![Value::from("alice")],
+            range: None,
+            filter: Some(Expr::And(
+                Box::new(Expr::IsNull {
+                    column: "deleted_at".to_string(),
+                    negated: true,
+                }),
+                Box::new(Expr::CompareScalar {
+                    left: ScalarExpr::Function {
+                        func: ScalarFunc::Lower,
+                        args: vec![ScalarExpr::Column("name".to_string())],
+                    },
+                    op: CompareOp::Eq,
+                    right: ScalarExpr::Literal(Value::from("alice")),
+                }),
+            )),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            distinct: false,
+        }
+    );
 }
 
 #[test]
@@ -1168,6 +2077,9 @@ fn plans_create_table_with_defaults_checks_and_foreign_keys() {
             CheckOp::Gt,
             Value::Integer(0),
         ))],
+        strict: false,
+        without_rowid: false,
+        if_not_exists: false,
     };
 
     assert!(matches!(
@@ -1249,6 +2161,27 @@ fn planner_plans_alter_table_variants() {
             action: AlterTableAction::RenameColumn {
                 old_name: "name".to_string(),
                 new_name: "full_name".to_string(),
+            },
+        }
+    );
+
+    let drop_column = planner
+        .plan_statement(
+            &Statement::AlterTable {
+                table: "users".to_string(),
+                action: AlterTableAction::DropColumn {
+                    old_name: "name".to_string(),
+                },
+            },
+            &context,
+        )
+        .unwrap();
+    assert_eq!(
+        drop_column,
+        Plan::AlterTable {
+            table: "users".to_string(),
+            action: AlterTableAction::DropColumn {
+                old_name: "name".to_string(),
             },
         }
     );
@@ -1338,7 +2271,10 @@ fn plans_multi_column_create_index_statement() {
                 name: "idx_users_name_email".to_string(),
                 table: "users".to_string(),
                 columns: vec!["name".to_string(), "email".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
+                if_not_exists: false,
             },
             &context,
         )
@@ -1350,7 +2286,10 @@ fn plans_multi_column_create_index_statement() {
             name: "idx_users_name_email".to_string(),
             table: "users".to_string(),
             columns: vec!["name".to_string(), "email".to_string()],
+            decorated_columns: None,
             unique: false,
+            predicate: None,
+            if_not_exists: false,
         }
     );
 }
@@ -1366,7 +2305,10 @@ fn plans_create_unique_index_statement() {
                 name: "idx_users_name".to_string(),
                 table: "users".to_string(),
                 columns: vec!["name".to_string()],
+                decorated_columns: None,
                 unique: true,
+                predicate: None,
+                if_not_exists: false,
             },
             &context,
         )
@@ -1378,7 +2320,10 @@ fn plans_create_unique_index_statement() {
             name: "idx_users_name".to_string(),
             table: "users".to_string(),
             columns: vec!["name".to_string()],
+            decorated_columns: None,
             unique: true,
+            predicate: None,
+            if_not_exists: false,
         }
     );
 }
@@ -1393,13 +2338,44 @@ fn planner_rejects_duplicate_columns_in_create_index() {
                 name: "idx_users_bad".to_string(),
                 table: "users".to_string(),
                 columns: vec!["name".to_string(), "name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
+                if_not_exists: false,
             },
             &context,
         )
         .unwrap_err();
 
     assert!(error.to_string().contains("duplicate index column name"));
+}
+
+#[test]
+fn planner_lowers_drop_if_exists_for_missing_objects_to_noop() {
+    let planner = Planner::new();
+    let context = build_users_context();
+
+    let drop_table = planner
+        .plan_statement(
+            &Statement::DropTable {
+                name: "missing".to_string(),
+                if_exists: true,
+            },
+            &context,
+        )
+        .unwrap();
+    let drop_index = planner
+        .plan_statement(
+            &Statement::DropIndex {
+                name: "missing_idx".to_string(),
+                if_exists: true,
+            },
+            &context,
+        )
+        .unwrap();
+
+    assert_eq!(drop_table, Plan::NoOp);
+    assert_eq!(drop_index, Plan::NoOp);
 }
 
 #[test]
@@ -1426,6 +2402,7 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
             SelectItem::Aggregate {
                 func: AggregateFunc::Count,
                 arg: AggregateArg::Wildcard,
+                filter: None,
                 alias: Some("total".to_string()),
             },
         ],
@@ -1439,10 +2416,12 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
         compounds: vec![],
         order_by: vec![OrderBy {
             expr: OrderByExpr::Column("total".to_string()),
+            collation: None,
             descending: true,
             nulls: None,
         }],
         limit: Some(2),
+        offset: None,
         distinct: false,
         having: None,
     });
@@ -1459,6 +2438,7 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             columns: vec![
@@ -1466,16 +2446,19 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
                 SelectItem::Aggregate {
                     func: AggregateFunc::Count,
                     arg: AggregateArg::Wildcard,
+                    filter: None,
                     alias: Some("total".to_string()),
                 },
             ],
             group_by: vec![ScalarExpr::Column("active".to_string())],
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("total".to_string()),
+                collation: None,
                 descending: true,
                 nulls: None,
             }],
             limit: Some(2),
+            offset: None,
             having: None,
         }
     );
@@ -1507,8 +2490,10 @@ fn plans_aggregate_scalar_expression_arguments() {
                     op: rustsql::sql::ast::ScalarBinaryOp::Add,
                     right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
                 },
+                order_by: vec![],
                 distinct: false,
             },
+            filter: None,
             alias: Some("total".to_string()),
         }],
         from: FromItem::Table {
@@ -1521,6 +2506,7 @@ fn plans_aggregate_scalar_expression_arguments() {
         compounds: vec![],
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
         having: None,
     });
@@ -1537,6 +2523,7 @@ fn plans_aggregate_scalar_expression_arguments() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             columns: vec![SelectItem::Aggregate {
@@ -1547,13 +2534,16 @@ fn plans_aggregate_scalar_expression_arguments() {
                         op: rustsql::sql::ast::ScalarBinaryOp::Add,
                         right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
                     },
+                    order_by: vec![],
                     distinct: false,
                 },
+                filter: None,
                 alias: Some("total".to_string()),
             }],
             group_by: vec![],
             order_by: vec![],
             limit: None,
+            offset: None,
             having: None,
         }
     );
@@ -1581,6 +2571,7 @@ fn planner_rejects_having_reference_to_ungrouped_source_column() {
         columns: vec![SelectItem::Aggregate {
             func: AggregateFunc::Count,
             arg: AggregateArg::Wildcard,
+            filter: None,
             alias: Some("total".to_string()),
         }],
         from: FromItem::Table {
@@ -1593,6 +2584,7 @@ fn planner_rejects_having_reference_to_ungrouped_source_column() {
         compounds: vec![],
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
         having: Some(Expr::Compare {
             column: "age".to_string(),
@@ -1638,10 +2630,12 @@ fn planner_rejects_order_by_ungrouped_source_column_in_grouped_projection() {
         compounds: vec![],
         order_by: vec![OrderBy {
             expr: OrderByExpr::Column("id".to_string()),
+            collation: None,
             descending: true,
             nulls: None,
         }],
         limit: None,
+        offset: None,
         distinct: false,
         having: None,
     });
@@ -1655,7 +2649,7 @@ fn planner_rejects_order_by_ungrouped_source_column_in_grouped_projection() {
 }
 
 #[test]
-fn planner_rejects_sum_non_integer_scalar_expression_argument() {
+fn planner_allows_sum_non_integer_scalar_expression_argument_like_sqlite() {
     let planner = Planner::new();
     let context = PlanningContext::new(
         HashMap::from([(
@@ -1680,8 +2674,10 @@ fn planner_rejects_sum_non_integer_scalar_expression_argument() {
                     op: rustsql::sql::ast::ScalarBinaryOp::Concat,
                     right: Box::new(ScalarExpr::Literal(Value::Text("x".to_string()))),
                 },
+                order_by: vec![],
                 distinct: false,
             },
+            filter: None,
             alias: Some("total".to_string()),
         }],
         from: FromItem::Table {
@@ -1694,15 +2690,46 @@ fn planner_rejects_sum_non_integer_scalar_expression_argument() {
         compounds: vec![],
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
         having: None,
     });
 
-    let error = planner.plan_statement(&statement, &context).unwrap_err();
+    let plan = planner.plan_statement(&statement, &context).unwrap();
 
     assert_eq!(
-        error.to_string(),
-        "plan error: SUM only supports INTEGER columns"
+        plan,
+        Plan::Aggregate {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                distinct: false,
+            }),
+            columns: vec![SelectItem::Aggregate {
+                func: AggregateFunc::Sum,
+                arg: AggregateArg::Expr {
+                    expr: ScalarExpr::Binary {
+                        left: Box::new(ScalarExpr::Column("name".to_string())),
+                        op: rustsql::sql::ast::ScalarBinaryOp::Concat,
+                        right: Box::new(ScalarExpr::Literal(Value::Text("x".to_string()))),
+                    },
+                    order_by: vec![],
+                    distinct: false,
+                },
+                filter: None,
+                alias: Some("total".to_string()),
+            }],
+            group_by: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            having: None,
+        }
     );
 }
 
@@ -1747,6 +2774,8 @@ fn plans_join_query_as_nested_loop_join() {
                 right: "o.user_id".to_string(),
             },
             kind: JoinKind::Inner,
+            using_columns: Vec::new(),
+            natural: false,
         }],
         filter: Some(Expr::Compare {
             column: "o.amount".to_string(),
@@ -1757,10 +2786,12 @@ fn plans_join_query_as_nested_loop_join() {
         compounds: vec![],
         order_by: vec![OrderBy {
             expr: OrderByExpr::Column("u.name".to_string()),
+            collation: None,
             descending: false,
             nulls: None,
         }],
         limit: Some(5),
+        offset: None,
         distinct: false,
         having: None,
     });
@@ -1777,6 +2808,7 @@ fn plans_join_query_as_nested_loop_join() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             joins: vec![JoinPlan {
@@ -1787,6 +2819,7 @@ fn plans_join_query_as_nested_loop_join() {
                     filter: None,
                     order_by: vec![],
                     limit: None,
+                    offset: None,
                     distinct: false,
                 }),
                 on: Expr::CompareColumns {
@@ -1795,6 +2828,7 @@ fn plans_join_query_as_nested_loop_join() {
                     right: "o.user_id".to_string(),
                 },
                 kind: JoinKind::Inner,
+                using_columns: Vec::new(),
             }],
             columns: vec![
                 SelectItem::Column("u.name".to_string()),
@@ -1807,10 +2841,12 @@ fn plans_join_query_as_nested_loop_join() {
             }),
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("u.name".to_string()),
+                collation: None,
                 descending: false,
                 nulls: None,
             }],
             limit: Some(5),
+            offset: None,
             distinct: false,
         }
     );
@@ -1867,6 +2903,7 @@ fn plans_join_with_derived_source_on_right_as_nested_loop_join() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             joins: vec![JoinPlan {
@@ -1888,6 +2925,7 @@ fn plans_join_with_derived_source_on_right_as_nested_loop_join() {
                         filter: None,
                         order_by: vec![],
                         limit: None,
+                        offset: None,
                         distinct: false,
                     }),
                     alias: "t".to_string(),
@@ -1896,6 +2934,7 @@ fn plans_join_with_derived_source_on_right_as_nested_loop_join() {
                     filter: None,
                     order_by: vec![],
                     limit: None,
+                    offset: None,
                     distinct: false,
                 }),
                 on: Expr::CompareScalar {
@@ -1904,6 +2943,7 @@ fn plans_join_with_derived_source_on_right_as_nested_loop_join() {
                     right: rustsql::sql::ast::ScalarExpr::Column("t.id".to_string()),
                 },
                 kind: JoinKind::Inner,
+                using_columns: Vec::new(),
             }],
             columns: vec![
                 SelectItem::Column("u.name".to_string()),
@@ -1912,10 +2952,12 @@ fn plans_join_with_derived_source_on_right_as_nested_loop_join() {
             filter: None,
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("u.name".to_string()),
+                collation: None,
                 descending: false,
                 nulls: None,
             }],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -1997,6 +3039,7 @@ fn plans_aggregate_query_over_derived_source() {
                     filter: None,
                     order_by: vec![],
                     limit: None,
+                    offset: None,
                     distinct: false,
                 }),
                 alias: "t".to_string(),
@@ -2005,6 +3048,7 @@ fn plans_aggregate_query_over_derived_source() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             columns: vec![
@@ -2012,6 +3056,7 @@ fn plans_aggregate_query_over_derived_source() {
                 SelectItem::Aggregate {
                     func: AggregateFunc::Count,
                     arg: AggregateArg::Wildcard,
+                    filter: None,
                     alias: Some("total".to_string()),
                 },
             ],
@@ -2023,10 +3068,12 @@ fn plans_aggregate_query_over_derived_source() {
             }),
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("total".to_string()),
+                collation: None,
                 descending: true,
                 nulls: None,
             }],
             limit: None,
+            offset: None,
         }
     );
 }
@@ -2078,6 +3125,7 @@ fn planner_lowers_single_cte_source_to_aggregate_over_derived_source() {
                     filter: None,
                     order_by: vec![],
                     limit: None,
+                    offset: None,
                     distinct: false,
                 }),
                 alias: "buckets".to_string(),
@@ -2086,6 +3134,7 @@ fn planner_lowers_single_cte_source_to_aggregate_over_derived_source() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             columns: vec![
@@ -2093,6 +3142,7 @@ fn planner_lowers_single_cte_source_to_aggregate_over_derived_source() {
                 SelectItem::Aggregate {
                     func: AggregateFunc::Count,
                     arg: AggregateArg::Wildcard,
+                    filter: None,
                     alias: Some("total".to_string()),
                 },
             ],
@@ -2104,10 +3154,12 @@ fn planner_lowers_single_cte_source_to_aggregate_over_derived_source() {
             }),
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("total".to_string()),
+                collation: None,
                 descending: true,
                 nulls: None,
             }],
             limit: None,
+            offset: None,
         }
     );
 }
@@ -2157,6 +3209,7 @@ fn planner_lowers_chained_cte_references_to_nested_derived_sources() {
                     }),
                     order_by: vec![],
                     limit: None,
+                    offset: None,
                     distinct: false,
                 }),
                 alias: "adults".to_string(),
@@ -2168,6 +3221,7 @@ fn planner_lowers_chained_cte_references_to_nested_derived_sources() {
                 }),
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             alias: "named".to_string(),
@@ -2176,10 +3230,12 @@ fn planner_lowers_chained_cte_references_to_nested_derived_sources() {
             filter: None,
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("id".to_string()),
+                collation: None,
                 descending: false,
                 nulls: None,
             }],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -2254,6 +3310,7 @@ fn plans_aggregate_query_over_joined_derived_source() {
                     filter: None,
                     order_by: vec![],
                     limit: None,
+                    offset: None,
                     distinct: false,
                 }),
                 joins: vec![JoinPlan {
@@ -2275,6 +3332,7 @@ fn plans_aggregate_query_over_joined_derived_source() {
                             filter: None,
                             order_by: vec![],
                             limit: None,
+                            offset: None,
                             distinct: false,
                         }),
                         alias: "t".to_string(),
@@ -2283,6 +3341,7 @@ fn plans_aggregate_query_over_joined_derived_source() {
                         filter: None,
                         order_by: vec![],
                         limit: None,
+                        offset: None,
                         distinct: false,
                     }),
                     on: Expr::CompareScalar {
@@ -2291,11 +3350,13 @@ fn plans_aggregate_query_over_joined_derived_source() {
                         right: ScalarExpr::Column("t.id".to_string()),
                     },
                     kind: JoinKind::Inner,
+                    using_columns: Vec::new(),
                 }],
                 columns: vec![SelectItem::Wildcard],
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             columns: vec![
@@ -2303,6 +3364,7 @@ fn plans_aggregate_query_over_joined_derived_source() {
                 SelectItem::Aggregate {
                     func: AggregateFunc::Count,
                     arg: AggregateArg::Wildcard,
+                    filter: None,
                     alias: Some("total".to_string()),
                 },
             ],
@@ -2314,10 +3376,12 @@ fn plans_aggregate_query_over_joined_derived_source() {
             }),
             order_by: vec![OrderBy {
                 expr: OrderByExpr::Column("t.bucket".to_string()),
+                collation: None,
                 descending: false,
                 nulls: None,
             }],
             limit: None,
+            offset: None,
         }
     );
 }
@@ -2396,6 +3460,7 @@ fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
             SelectItem::Aggregate {
                 func: AggregateFunc::Count,
                 arg: AggregateArg::Wildcard,
+                filter: None,
                 alias: Some("total".to_string()),
             },
         ],
@@ -2417,10 +3482,12 @@ fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
                 op: rustsql::sql::ast::ScalarBinaryOp::Add,
                 right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
             }),
+            collation: None,
             descending: true,
             nulls: None,
         }],
         limit: None,
+        offset: None,
         distinct: false,
         having: Some(Expr::Compare {
             column: "bucket".to_string(),
@@ -2441,6 +3508,7 @@ fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
             }),
             columns: vec![
@@ -2455,6 +3523,7 @@ fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
                 SelectItem::Aggregate {
                     func: AggregateFunc::Count,
                     arg: AggregateArg::Wildcard,
+                    filter: None,
                     alias: Some("total".to_string()),
                 },
             ],
@@ -2474,10 +3543,12 @@ fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
                     op: rustsql::sql::ast::ScalarBinaryOp::Add,
                     right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
                 }),
+                collation: None,
                 descending: true,
                 nulls: None,
             }],
             limit: None,
+            offset: None,
         }
     );
 }
@@ -2527,6 +3598,7 @@ fn planner_rejects_unknown_qualified_column_in_correlated_subquery() {
                 compounds: vec![],
                 order_by: vec![],
                 limit: None,
+                offset: None,
                 distinct: false,
                 having: None,
             }),
@@ -2536,6 +3608,7 @@ fn planner_rejects_unknown_qualified_column_in_correlated_subquery() {
         compounds: vec![],
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
         having: None,
     });
@@ -2593,6 +3666,8 @@ fn planner_rejects_join_condition_reference_to_future_join_alias() {
                     right: rustsql::sql::ast::ScalarExpr::Column("p.order_id".to_string()),
                 },
                 kind: JoinKind::Inner,
+                using_columns: Vec::new(),
+                natural: false,
             },
             JoinClause {
                 source: FromItem::Table {
@@ -2605,6 +3680,8 @@ fn planner_rejects_join_condition_reference_to_future_join_alias() {
                     right: rustsql::sql::ast::ScalarExpr::Column("p.order_id".to_string()),
                 },
                 kind: JoinKind::Inner,
+                using_columns: Vec::new(),
+                natural: false,
             },
         ],
         filter: None,
@@ -2612,6 +3689,7 @@ fn planner_rejects_join_condition_reference_to_future_join_alias() {
         compounds: vec![],
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
         having: None,
     });

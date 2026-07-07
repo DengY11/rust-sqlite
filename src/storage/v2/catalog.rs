@@ -102,7 +102,9 @@ mod tests {
                 IndexMeta {
                     name: "idx_users_name_email".to_string(),
                     columns: vec!["name".to_string(), "email".to_string()],
+                    decorated_columns: None,
                     unique: false,
+                    predicate: None,
                 },
             );
         catalog

@@ -16,7 +16,9 @@ fn name_index() -> IndexMeta {
     IndexMeta {
         name: "idx_users_name".to_string(),
         columns: vec!["name".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }
 }
 
@@ -24,7 +26,9 @@ fn unique_name_index() -> IndexMeta {
     IndexMeta {
         name: "idx_users_name_unique".to_string(),
         columns: vec!["name".to_string()],
+        decorated_columns: None,
         unique: true,
+        predicate: None,
     }
 }
 
@@ -81,7 +85,9 @@ fn memory_storage_renames_table_and_column_and_rewrites_added_column() {
         .add_column(
             txn,
             "users",
-            ColumnDef::new("age", ColumnType::Integer).default_value(Value::Integer(0)),
+            ColumnDef::new("age", ColumnType::Integer).default_value(
+                rustsql::common::types::ColumnDefault::Literal(Value::Integer(0)),
+            ),
         )
         .unwrap();
     storage
@@ -158,13 +164,13 @@ fn memory_storage_rejects_not_null_and_primary_key_null_values() {
             .contains("column 'name' cannot be NULL")
     );
 
-    let primary_key_null_error = storage
+    let row_id = storage
         .insert_row(txn, "users", vec![Value::Null, Value::from("alice")])
-        .unwrap_err();
-    assert!(
-        primary_key_null_error
-            .to_string()
-            .contains("primary key column 'id' cannot be NULL")
+        .unwrap();
+    assert_eq!(row_id, RowId(1));
+    assert_eq!(
+        storage.get_row(txn, "users", row_id).unwrap(),
+        Some(vec![Value::Integer(1), Value::from("alice")])
     );
 
     storage.rollback(txn).unwrap();
@@ -234,7 +240,9 @@ fn memory_storage_enforces_unique_index_on_insert_and_backfill() {
             IndexMeta {
                 name: "idx_users_name_backfill".to_string(),
                 columns: vec!["name".to_string()],
+                decorated_columns: None,
                 unique: true,
+                predicate: None,
             },
         )
         .unwrap_err();
@@ -262,7 +270,7 @@ fn memory_storage_rejects_type_mismatches() {
     assert!(
         error
             .to_string()
-            .contains("column 'id' expected INTEGER but got TEXT")
+            .contains("sqlite rowid column must be INTEGER, got TEXT")
     );
 
     storage.rollback(txn).unwrap();

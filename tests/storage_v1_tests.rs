@@ -17,7 +17,9 @@ fn name_index() -> IndexMeta {
     IndexMeta {
         name: "idx_users_name".to_string(),
         columns: vec!["name".to_string()],
+        decorated_columns: None,
         unique: false,
+        predicate: None,
     }
 }
 
@@ -25,7 +27,9 @@ fn unique_name_index() -> IndexMeta {
     IndexMeta {
         name: "idx_users_name_unique".to_string(),
         columns: vec!["name".to_string()],
+        decorated_columns: None,
         unique: true,
+        predicate: None,
     }
 }
 
@@ -82,7 +86,9 @@ fn file_storage_renames_table_and_column_and_rewrites_added_column() {
         .add_column(
             txn,
             "users",
-            ColumnDef::new("age", ColumnType::Integer).default_value(Value::Integer(0)),
+            ColumnDef::new("age", ColumnType::Integer).default_value(
+                rustsql::common::types::ColumnDefault::Literal(Value::Integer(0)),
+            ),
         )
         .unwrap();
     storage
@@ -241,7 +247,9 @@ fn file_storage_enforces_unique_index_on_insert_and_backfill() {
             IndexMeta {
                 name: "idx_users_name_backfill".to_string(),
                 columns: vec!["name".to_string()],
+                decorated_columns: None,
                 unique: true,
+                predicate: None,
             },
         )
         .unwrap_err();

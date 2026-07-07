@@ -70,7 +70,9 @@ mod tests {
             meta: IndexMeta {
                 name: "idx_users_name".to_string(),
                 columns: vec!["name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             },
             entries: vec![IndexEntryFile {
                 key: vec![Value::from("alice")],

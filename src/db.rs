@@ -24,6 +24,18 @@ pub struct Database<S = MemoryStorage> {
     planner: Planner,
     optimizer: Optimizer,
     current_txn: Cell<Option<TransactionId>>,
+    last_insert_rowid: Cell<i64>,
+    changes: Cell<i64>,
+    total_changes: Cell<i64>,
+    foreign_keys: Cell<bool>,
+    read_uncommitted: Cell<bool>,
+    query_only: Cell<bool>,
+    recursive_triggers: Cell<bool>,
+    trusted_schema: Cell<bool>,
+    threads: Cell<u32>,
+    cache_size: Cell<i64>,
+    busy_timeout: Cell<i64>,
+    reverse_unordered_selects: Cell<bool>,
 }
 
 impl<S: PlanningStorageEngine> Database<S> {
@@ -34,6 +46,18 @@ impl<S: PlanningStorageEngine> Database<S> {
             planner: Planner::new(),
             optimizer: Optimizer::new(),
             current_txn: Cell::new(None),
+            last_insert_rowid: Cell::new(0),
+            changes: Cell::new(0),
+            total_changes: Cell::new(0),
+            foreign_keys: Cell::new(false),
+            read_uncommitted: Cell::new(false),
+            query_only: Cell::new(false),
+            recursive_triggers: Cell::new(false),
+            trusted_schema: Cell::new(false),
+            threads: Cell::new(0),
+            cache_size: Cell::new(2000),
+            busy_timeout: Cell::new(0),
+            reverse_unordered_selects: Cell::new(false),
         }
     }
 
@@ -65,7 +89,22 @@ impl<S: PlanningStorageEngine> Database<S> {
     pub(crate) fn execute_parsed(&self, statements: &[Statement]) -> Result<()> {
         self.validate_execute_batch(statements)?;
 
-        let executor = Executor::new(&self.storage, &self.current_txn);
+        let executor = Executor::new(
+            &self.storage,
+            &self.current_txn,
+            &self.last_insert_rowid,
+            &self.changes,
+            &self.total_changes,
+            &self.foreign_keys,
+            &self.read_uncommitted,
+            &self.query_only,
+            &self.recursive_triggers,
+            &self.trusted_schema,
+            &self.threads,
+            &self.cache_size,
+            &self.busy_timeout,
+            &self.reverse_unordered_selects,
+        );
         for statement in statements {
             let plan = self.plan_statement(statement)?;
             executor.execute(plan)?;
@@ -77,7 +116,22 @@ impl<S: PlanningStorageEngine> Database<S> {
     pub(crate) fn query_parsed(&self, statements: &[Statement]) -> Result<Vec<Row>> {
         self.validate_query_batch(statements)?;
 
-        let executor = Executor::new(&self.storage, &self.current_txn);
+        let executor = Executor::new(
+            &self.storage,
+            &self.current_txn,
+            &self.last_insert_rowid,
+            &self.changes,
+            &self.total_changes,
+            &self.foreign_keys,
+            &self.read_uncommitted,
+            &self.query_only,
+            &self.recursive_triggers,
+            &self.trusted_schema,
+            &self.threads,
+            &self.cache_size,
+            &self.busy_timeout,
+            &self.reverse_unordered_selects,
+        );
         let mut last_rows = Vec::new();
 
         for statement in statements {
@@ -89,24 +143,118 @@ impl<S: PlanningStorageEngine> Database<S> {
     }
 
     pub(crate) fn classify_batch(statements: &[Statement]) -> StatementBatchKind {
-        if statements.iter().all(|statement| {
-            matches!(
-                statement,
-                Statement::Select(_) | Statement::ExplainQueryPlan(_)
-            )
-        }) {
+        if statements.iter().all(Self::is_query_statement) {
             StatementBatchKind::Query
         } else {
             StatementBatchKind::Execute
         }
     }
 
+    fn is_query_statement(statement: &Statement) -> bool {
+        matches!(
+            statement,
+            Statement::Values(_)
+                | Statement::ValuesWith { .. }
+                | Statement::Select(_)
+                | Statement::InsertReturning { .. }
+                | Statement::InsertUpsertReturning { .. }
+                | Statement::InsertManyReturning { .. }
+                | Statement::InsertManyUpsertReturning { .. }
+                | Statement::InsertDoNothingReturning { .. }
+                | Statement::InsertManyDoNothingReturning { .. }
+                | Statement::InsertExprReturning { .. }
+                | Statement::InsertExprUpsertReturning { .. }
+                | Statement::InsertManyExprReturning { .. }
+                | Statement::InsertManyExprUpsertReturning { .. }
+                | Statement::InsertExprDoNothingReturning { .. }
+                | Statement::InsertManyExprDoNothingReturning { .. }
+                | Statement::InsertSelectReturning { .. }
+                | Statement::InsertSelectUpsertReturning { .. }
+                | Statement::InsertSelectDoNothingReturning { .. }
+                | Statement::DeleteReturning { .. }
+                | Statement::DeleteReturningLimited { .. }
+                | Statement::UpdateReturning { .. }
+                | Statement::UpdateReturningLimited { .. }
+                | Statement::ExplainQueryPlan(_)
+                | Statement::PragmaTableInfo { .. }
+                | Statement::PragmaTableXInfo { .. }
+                | Statement::PragmaTableList { .. }
+                | Statement::PragmaIndexList { .. }
+                | Statement::PragmaIndexInfo { .. }
+                | Statement::PragmaIndexXInfo { .. }
+                | Statement::PragmaForeignKeyList { .. }
+                | Statement::PragmaForeignKeyCheck { .. }
+                | Statement::PragmaDatabaseList
+                | Statement::PragmaPageSize
+                | Statement::PragmaPageCount
+                | Statement::PragmaFreelistCount
+                | Statement::PragmaUserVersion
+                | Statement::PragmaApplicationId
+                | Statement::PragmaSchemaVersion
+                | Statement::PragmaForeignKeys
+                | Statement::PragmaReadUncommitted
+                | Statement::PragmaQueryOnly
+                | Statement::PragmaRecursiveTriggers
+                | Statement::PragmaTrustedSchema
+                | Statement::PragmaIgnoreCheckConstraints
+                | Statement::PragmaEncoding
+                | Statement::PragmaCollationList
+                | Statement::PragmaDataVersion
+                | Statement::PragmaQuickCheck
+                | Statement::PragmaIntegrityCheck
+                | Statement::PragmaFunctionList
+                | Statement::PragmaCompileOptions
+                | Statement::PragmaJournalMode
+                | Statement::PragmaSynchronous
+                | Statement::PragmaCacheSize
+                | Statement::PragmaTempStore
+                | Statement::PragmaLockingMode
+                | Statement::PragmaBusyTimeout
+                | Statement::PragmaThreads
+                | Statement::PragmaCaseSensitiveLike
+                | Statement::PragmaReverseUnorderedSelects
+        ) || matches!(statement, Statement::WithDml { statement, .. } if Self::is_query_statement(statement))
+    }
+
+    fn is_returning_statement(statement: &Statement) -> bool {
+        matches!(
+            statement,
+            Statement::InsertReturning { .. }
+                | Statement::InsertUpsertReturning { .. }
+                | Statement::InsertManyReturning { .. }
+                | Statement::InsertManyUpsertReturning { .. }
+                | Statement::InsertDoNothingReturning { .. }
+                | Statement::InsertManyDoNothingReturning { .. }
+                | Statement::InsertExprReturning { .. }
+                | Statement::InsertExprUpsertReturning { .. }
+                | Statement::InsertManyExprReturning { .. }
+                | Statement::InsertManyExprUpsertReturning { .. }
+                | Statement::InsertExprDoNothingReturning { .. }
+                | Statement::InsertManyExprDoNothingReturning { .. }
+                | Statement::InsertSelectReturning { .. }
+                | Statement::InsertSelectUpsertReturning { .. }
+                | Statement::InsertSelectDoNothingReturning { .. }
+                | Statement::DeleteReturning { .. }
+                | Statement::DeleteReturningLimited { .. }
+                | Statement::UpdateReturning { .. }
+                | Statement::UpdateReturningLimited { .. }
+        ) || matches!(statement, Statement::WithDml { statement, .. } if Self::is_returning_statement(statement))
+    }
+
     fn validate_execute_batch(&self, statements: &[Statement]) -> Result<()> {
-        if statements
-            .iter()
-            .any(|statement| matches!(statement, Statement::Select(_)))
-        {
+        if statements.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::Select(_) | Statement::Values(_) | Statement::ValuesWith { .. }
+            )
+        }) {
             return Err(DbError::sql("SELECT statements must use Database::query"));
+        }
+
+        if statements.iter().any(Self::is_returning_statement) {
+            return Err(DbError::sql(
+                "RETURNING statements must use Database::query",
+            ));
         }
 
         if statements
@@ -114,6 +262,53 @@ impl<S: PlanningStorageEngine> Database<S> {
             .any(|statement| matches!(statement, Statement::ExplainQueryPlan(_)))
         {
             return Err(DbError::sql("EXPLAIN statements must use Database::query"));
+        }
+
+        if statements.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::PragmaTableInfo { .. }
+                    | Statement::PragmaTableXInfo { .. }
+                    | Statement::PragmaTableList { .. }
+                    | Statement::PragmaIndexList { .. }
+                    | Statement::PragmaIndexInfo { .. }
+                    | Statement::PragmaIndexXInfo { .. }
+                    | Statement::PragmaForeignKeyList { .. }
+                    | Statement::PragmaForeignKeyCheck { .. }
+                    | Statement::PragmaDatabaseList
+                    | Statement::PragmaPageSize
+                    | Statement::PragmaPageCount
+                    | Statement::PragmaFreelistCount
+                    | Statement::PragmaUserVersion
+                    | Statement::PragmaApplicationId
+                    | Statement::PragmaSchemaVersion
+                    | Statement::PragmaForeignKeys
+                    | Statement::PragmaReadUncommitted
+                    | Statement::PragmaQueryOnly
+                    | Statement::PragmaRecursiveTriggers
+                    | Statement::PragmaTrustedSchema
+                    | Statement::PragmaIgnoreCheckConstraints
+                    | Statement::PragmaEncoding
+                    | Statement::PragmaCollationList
+                    | Statement::PragmaDataVersion
+                    | Statement::PragmaQuickCheck
+                    | Statement::PragmaIntegrityCheck
+                    | Statement::PragmaFunctionList
+                    | Statement::PragmaCompileOptions
+                    | Statement::PragmaJournalMode
+                    | Statement::PragmaSynchronous
+                    | Statement::PragmaCacheSize
+                    | Statement::PragmaTempStore
+                    | Statement::PragmaLockingMode
+                    | Statement::PragmaBusyTimeout
+                    | Statement::PragmaThreads
+                    | Statement::PragmaCaseSensitiveLike
+                    | Statement::PragmaReverseUnorderedSelects
+            )
+        }) {
+            return Err(DbError::sql(
+                "PRAGMA statements that return rows must use Database::query",
+            ));
         }
 
         Ok(())

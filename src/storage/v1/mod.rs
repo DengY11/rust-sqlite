@@ -262,6 +262,27 @@ impl FileStorageInner {
 
         Ok(())
     }
+
+    fn rebuild_indexes_for_schema(
+        &mut self,
+        schema_name: &str,
+        schema: &Schema,
+        rows: &BTreeMap<RowId, Row>,
+    ) -> Result<()> {
+        let Some(indexes) = self.state.indexes.get_mut(schema_name) else {
+            return Ok(());
+        };
+
+        for index in indexes.values_mut() {
+            index.entries.clear();
+            for (row_id, row) in rows {
+                let key = Self::project_index_key(schema, &index.meta, row)?;
+                index.entries.entry(key).or_default().insert(*row_id);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl CatalogStore for FileStorage {
@@ -362,7 +383,10 @@ impl CatalogStore for FileStorage {
                 column.name
             )));
         }
-        let default_value = column.default_value.clone().unwrap_or(Value::Null);
+        let default_value = column
+            .default_value
+            .as_ref()
+            .map_or(Ok(Value::Null), |default| default.evaluate())?;
         let mut updated_schema = schema;
         updated_schema.columns.push(column);
         updated_schema.validate_constraints_metadata()?;
@@ -428,6 +452,42 @@ impl CatalogStore for FileStorage {
                 schema.rename_foreign_key_ref_column(schema_name, old_name, new_name);
             }
         }
+        Ok(())
+    }
+
+    fn drop_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        old_name: &str,
+    ) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let schema = inner.require_schema(schema_name)?.clone();
+        let (updated_schema, removed_index) = schema.drop_column(old_name)?;
+
+        let updated_rows = inner
+            .state
+            .rows
+            .get(schema_name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(row_id, mut row)| {
+                row.remove(removed_index);
+                (row_id, row)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        inner
+            .state
+            .schemas
+            .insert(schema_name.to_string(), updated_schema.clone());
+        inner
+            .state
+            .rows
+            .insert(schema_name.to_string(), updated_rows.clone());
+        inner.rebuild_indexes_for_schema(schema_name, &updated_schema, &updated_rows)?;
         Ok(())
     }
 
@@ -599,7 +659,9 @@ impl TableStore for FileStorage {
                 let key = FileStorageInner::project_index_key(&schema, &index.meta, &row)?;
                 if index.meta.enforces_unique_key(&key)
                     && index.entries.get(&key).is_some_and(|row_ids| {
-                        row_ids.iter().any(|candidate_row_id| *candidate_row_id != row_id)
+                        row_ids
+                            .iter()
+                            .any(|candidate_row_id| *candidate_row_id != row_id)
                     })
                 {
                     return Err(DbError::storage(format!(

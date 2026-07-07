@@ -16,9 +16,10 @@ use crate::sql::planner::PlanningContext;
 use self::btree::BTree;
 use self::catalog::{CatalogState, load_catalog, store_catalog};
 use self::codec::{
-    decode_index_key, decode_row, decode_row_ids, decode_versioned_row, encode_index_key,
-    encode_row, encode_row_ids, encode_uncommitted_row_version, finalize_row_versions,
-    mark_row_deleted, append_row_version, project_index_key, visible_row, VersionedRow,
+    VersionedRow, append_row_version, decode_index_key, decode_row, decode_row_ids,
+    decode_versioned_row, encode_index_key, encode_row, encode_row_ids,
+    encode_uncommitted_row_version, finalize_row_versions, mark_row_deleted, project_index_key,
+    visible_row,
 };
 use self::index_tree::IndexTree;
 use self::pager::{PageWriteSnapshot, Pager};
@@ -43,7 +44,8 @@ pub struct FileStorage {
     session_catalog_snapshots: RefCell<HashMap<TransactionId, CatalogState>>,
 }
 
-fn shared_txn_managers() -> &'static Mutex<HashMap<std::path::PathBuf, Arc<Mutex<StorageTxnManager>>>> {
+fn shared_txn_managers()
+-> &'static Mutex<HashMap<std::path::PathBuf, Arc<Mutex<StorageTxnManager>>>> {
     static MANAGERS: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<StorageTxnManager>>>>> =
         OnceLock::new();
     MANAGERS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -59,10 +61,15 @@ impl FileStorage {
             let mut managers = shared_txn_managers().lock().unwrap();
             managers
                 .entry(path)
-                .or_insert_with(|| Arc::new(Mutex::new(StorageTxnManager::with_next_txn_id(next_txn_id))))
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(StorageTxnManager::with_next_txn_id(next_txn_id)))
+                })
                 .clone()
         };
-        txn_manager.lock().unwrap().sync_next_row_ids(&catalog.next_row_ids);
+        txn_manager
+            .lock()
+            .unwrap()
+            .sync_next_row_ids(&catalog.next_row_ids);
         pager.attach_txn_manager(txn_manager.clone());
 
         Ok(Self {
@@ -94,7 +101,10 @@ impl FileStorage {
         }
     }
 
-    fn planning_catalog_snapshot(&self, transaction_id: Option<TransactionId>) -> Result<CatalogState> {
+    fn planning_catalog_snapshot(
+        &self,
+        transaction_id: Option<TransactionId>,
+    ) -> Result<CatalogState> {
         if let Some(txn_id) = transaction_id {
             let isolation_level = {
                 let manager = self.txn_manager.lock().unwrap();
@@ -197,11 +207,95 @@ impl FileStorage {
         let notifier = { self.txn_manager.lock().unwrap().lock_wait_notifier() };
         loop {
             let observed_epoch = StorageTxnManager::current_lock_wait_epoch(&notifier);
+            let result = self.txn_manager.lock().unwrap().check_write_conflicts(
+                transaction_id,
+                table,
+                index_keys,
+            );
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if is_deadlock_error(&error) => return Err(error),
+                Err(error) if is_waitable_lock_error(&error) => {
+                    StorageTxnManager::wait_for_lock_epoch_change(&notifier, observed_epoch);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn wait_for_table_read_lock(&self, transaction_id: TransactionId, table: &str) -> Result<()> {
+        let notifier = { self.txn_manager.lock().unwrap().lock_wait_notifier() };
+        loop {
+            let observed_epoch = StorageTxnManager::current_lock_wait_epoch(&notifier);
             let result = self
                 .txn_manager
                 .lock()
                 .unwrap()
-                .check_write_conflicts(transaction_id, table, index_keys);
+                .acquire_table_intention_read(transaction_id, table);
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if is_deadlock_error(&error) => return Err(error),
+                Err(error) if is_waitable_lock_error(&error) => {
+                    StorageTxnManager::wait_for_lock_epoch_change(&notifier, observed_epoch);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn wait_for_table_scan_lock(&self, transaction_id: TransactionId, table: &str) -> Result<()> {
+        let notifier = { self.txn_manager.lock().unwrap().lock_wait_notifier() };
+        loop {
+            let observed_epoch = StorageTxnManager::current_lock_wait_epoch(&notifier);
+            let result = self
+                .txn_manager
+                .lock()
+                .unwrap()
+                .acquire_table_read_lock(transaction_id, table);
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if is_deadlock_error(&error) => return Err(error),
+                Err(error) if is_waitable_lock_error(&error) => {
+                    StorageTxnManager::wait_for_lock_epoch_change(&notifier, observed_epoch);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn wait_for_table_write_lock(&self, transaction_id: TransactionId, table: &str) -> Result<()> {
+        let notifier = { self.txn_manager.lock().unwrap().lock_wait_notifier() };
+        loop {
+            let observed_epoch = StorageTxnManager::current_lock_wait_epoch(&notifier);
+            let result = self
+                .txn_manager
+                .lock()
+                .unwrap()
+                .acquire_table_intention_write(transaction_id, table);
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if is_deadlock_error(&error) => return Err(error),
+                Err(error) if is_waitable_lock_error(&error) => {
+                    StorageTxnManager::wait_for_lock_epoch_change(&notifier, observed_epoch);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn wait_for_table_exclusive_lock(
+        &self,
+        transaction_id: TransactionId,
+        table: &str,
+    ) -> Result<()> {
+        let notifier = { self.txn_manager.lock().unwrap().lock_wait_notifier() };
+        loop {
+            let observed_epoch = StorageTxnManager::current_lock_wait_epoch(&notifier);
+            let result = self
+                .txn_manager
+                .lock()
+                .unwrap()
+                .acquire_table_exclusive(transaction_id, table);
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) if is_deadlock_error(&error) => return Err(error),
@@ -224,10 +318,8 @@ impl FileStorage {
                 return Ok(());
             }
 
-            let purge_batch_size = history_list_length
-                .ilog2()
-                .saturating_add(1)
-                .clamp(1, 8) as usize;
+            let purge_batch_size =
+                history_list_length.ilog2().saturating_add(1).clamp(1, 8) as usize;
             let planned_batch = manager.planned_purge_batch(purge_horizon, purge_batch_size);
             if planned_batch.is_empty() {
                 manager.purge_finished_transactions_up_to(purge_horizon);
@@ -344,7 +436,11 @@ impl FileStorage {
     }
 
     fn replay_undo_records(&self, transaction_id: TransactionId) -> Result<()> {
-        let undo_records = self.txn_manager.lock().unwrap().take_undo_records(transaction_id)?;
+        let undo_records = self
+            .txn_manager
+            .lock()
+            .unwrap()
+            .take_undo_records(transaction_id)?;
         if undo_records.is_empty() {
             return Ok(());
         }
@@ -542,7 +638,6 @@ impl FileStorage {
             tree.insert(pager, txn_id, encoded_key, &encode_row_ids(&row_ids)?)
         }
     }
-
 }
 
 impl PlanningStorageEngine for FileStorage {
@@ -591,7 +686,11 @@ impl TransactionManager for FileStorage {
     fn commit(&self, transaction_id: TransactionId) -> Result<()> {
         self.validate_transaction(transaction_id)?;
         self.sync_transaction_page_writes(transaction_id)?;
-        let commit_ts = self.txn_manager.lock().unwrap().reserve_commit_ts(transaction_id)?;
+        let commit_ts = self
+            .txn_manager
+            .lock()
+            .unwrap()
+            .reserve_commit_ts(transaction_id)?;
         self.finalize_transaction_row_versions(transaction_id, commit_ts)?;
 
         {
@@ -623,7 +722,11 @@ impl TransactionManager for FileStorage {
                 self.txn_manager.lock().unwrap().abort(transaction_id)?;
             }
             TxnStatus::Aborted => {
-                let _ = self.txn_manager.lock().unwrap().take_undo_records(transaction_id)?;
+                let _ = self
+                    .txn_manager
+                    .lock()
+                    .unwrap()
+                    .take_undo_records(transaction_id)?;
                 self.txn_manager
                     .lock()
                     .unwrap()
@@ -656,7 +759,9 @@ fn is_deadlock_error(error: &DbError) -> bool {
 
 fn is_waitable_lock_error(error: &DbError) -> bool {
     let message = error.to_string();
-    message.contains("page write conflict")
+    message.contains("table lock wait")
+        || message.contains("table lock conflict")
+        || message.contains("page write conflict")
         || message.contains("page write wait")
         || message.contains("serializable conflict")
         || message.contains("predicate write wait")
@@ -690,7 +795,8 @@ impl FileStorage {
     ) -> Result<Vec<RowId>> {
         let mut visible = Vec::new();
         for row_id in row_ids {
-            let Some(row) = self.visible_row_at_root(transaction_id, table_root_page_id, row_id)? else {
+            let Some(row) = self.visible_row_at_root(transaction_id, table_root_page_id, row_id)?
+            else {
                 continue;
             };
             if project_index_key(schema, index, &row)? == key_values {
@@ -704,6 +810,7 @@ impl FileStorage {
 impl CatalogStore for FileStorage {
     fn create_schema(&self, transaction_id: TransactionId, schema: Schema) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_exclusive_lock(transaction_id, &schema.name)?;
 
         let mut pager = self.pager.borrow_mut();
         let mut catalog = self.catalog.borrow_mut();
@@ -726,6 +833,7 @@ impl CatalogStore for FileStorage {
 
     fn drop_schema(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_exclusive_lock(transaction_id, name)?;
 
         let mut catalog = self.catalog.borrow_mut();
         if catalog.schemas.remove(name).is_none() {
@@ -740,6 +848,7 @@ impl CatalogStore for FileStorage {
 
     fn replace_schema(&self, transaction_id: TransactionId, schema: Schema) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_exclusive_lock(transaction_id, &schema.name)?;
         let mut catalog = self.catalog.borrow_mut();
         if !catalog.schemas.contains_key(&schema.name) {
             return Err(DbError::storage(format!("unknown table: {}", schema.name)));
@@ -755,6 +864,10 @@ impl CatalogStore for FileStorage {
         new_name: &str,
     ) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_exclusive_lock(transaction_id, old_name)?;
+        if old_name != new_name {
+            self.wait_for_table_exclusive_lock(transaction_id, new_name)?;
+        }
         let mut catalog = self.catalog.borrow_mut();
         if catalog.schemas.contains_key(new_name) {
             return Err(DbError::storage(format!(
@@ -796,6 +909,7 @@ impl CatalogStore for FileStorage {
         column: ColumnDef,
     ) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_exclusive_lock(transaction_id, schema_name)?;
         let (schema, root_page_id) = self.table_schema_and_root(schema_name)?;
         if schema.columns.iter().any(|entry| entry.name == column.name) {
             return Err(DbError::storage(format!(
@@ -803,7 +917,10 @@ impl CatalogStore for FileStorage {
                 column.name
             )));
         }
-        let default_value = column.default_value.clone().unwrap_or(Value::Null);
+        let default_value = column
+            .default_value
+            .as_ref()
+            .map_or(Ok(Value::Null), |default| default.evaluate())?;
         let rows = {
             let pager = self.pager.borrow();
             let tree = BTree::from_root(root_page_id);
@@ -850,6 +967,7 @@ impl CatalogStore for FileStorage {
         new_name: &str,
     ) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_exclusive_lock(transaction_id, schema_name)?;
         let (schema, _) = self.table_schema_and_root(schema_name)?;
         if !schema.columns.iter().any(|entry| entry.name == old_name) {
             return Err(DbError::storage(format!(
@@ -887,6 +1005,50 @@ impl CatalogStore for FileStorage {
         Ok(())
     }
 
+    fn drop_column(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        old_name: &str,
+    ) -> Result<()> {
+        self.validate_transaction(transaction_id)?;
+        self.wait_for_table_exclusive_lock(transaction_id, schema_name)?;
+
+        let (schema, _) = self.table_schema_and_root(schema_name)?;
+        let (updated_schema, removed_index) = schema.drop_column(old_name)?;
+
+        let existing_rows = self.scan_rows(transaction_id, schema_name)?;
+        {
+            let mut catalog = self.catalog.borrow_mut();
+            catalog
+                .schemas
+                .insert(schema_name.to_string(), updated_schema.clone());
+            if let Some(indexes) = catalog.indexes.get_mut(schema_name) {
+                indexes.retain(|_, index| !index.columns.iter().any(|column| column == old_name));
+            }
+            let retained_index_names = catalog
+                .indexes
+                .get(schema_name)
+                .map(|indexes| indexes.keys().cloned().collect::<BTreeSet<_>>())
+                .unwrap_or_default();
+            if let Some(index_roots) = catalog.index_roots.get_mut(schema_name) {
+                index_roots.retain(|name, _| retained_index_names.contains(name));
+            }
+        }
+
+        for (row_id, _) in &existing_rows {
+            self.delete_row(transaction_id, schema_name, *row_id)?;
+        }
+        for (row_id, row) in existing_rows {
+            let mut row = row;
+            row.remove(removed_index);
+            self.insert_row(transaction_id, schema_name, row)?;
+            let _ = row_id;
+        }
+
+        Ok(())
+    }
+
     fn get_schema(&self, transaction_id: TransactionId, name: &str) -> Result<Option<Schema>> {
         self.validate_transaction(transaction_id)?;
         Ok(self.catalog.borrow().schemas.get(name).cloned())
@@ -906,6 +1068,7 @@ impl TableStore for FileStorage {
         row: Row,
     ) -> Result<RowId> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_write_lock(transaction_id, schema_name)?;
 
         let (schema, root_page_id) = self.table_schema_and_root(schema_name)?;
         if row.len() != schema.columns.len() {
@@ -935,7 +1098,9 @@ impl TableStore for FileStorage {
             let tree = BTree::from_root(root_page_id);
             tree.scan_all(&pager, transaction_id.0)?
                 .into_iter()
-                .filter_map(|(_, bytes)| visible_row(&bytes, transaction_id.0, &snapshot).transpose())
+                .filter_map(|(_, bytes)| {
+                    visible_row(&bytes, transaction_id.0, &snapshot).transpose()
+                })
                 .collect::<Result<Vec<_>>>()?
         };
         let existing_refs = existing_rows.iter().collect::<Vec<_>>();
@@ -981,11 +1146,11 @@ impl TableStore for FileStorage {
             .get(schema_name)
             .copied()
             .unwrap_or(1);
-        let row_id = self
-            .txn_manager
-            .lock()
-            .unwrap()
-            .allocate_row_id(transaction_id, schema_name, fallback_next_row_id)?;
+        let row_id = self.txn_manager.lock().unwrap().allocate_row_id(
+            transaction_id,
+            schema_name,
+            fallback_next_row_id,
+        )?;
         self.catalog
             .borrow_mut()
             .next_row_ids
@@ -1049,6 +1214,7 @@ impl TableStore for FileStorage {
         row_id: RowId,
     ) -> Result<Option<Row>> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_read_lock(transaction_id, schema_name)?;
 
         let Ok((_, root_page_id)) = self.table_schema_and_root(schema_name) else {
             return Ok(None);
@@ -1070,10 +1236,7 @@ impl TableStore for FileStorage {
         schema_name: &str,
     ) -> Result<Vec<(RowId, Row)>> {
         self.validate_transaction(transaction_id)?;
-        self.txn_manager
-            .lock()
-            .unwrap()
-            .acquire_table_read_lock(transaction_id, schema_name)?;
+        self.wait_for_table_scan_lock(transaction_id, schema_name)?;
 
         let Ok((_, root_page_id)) = self.table_schema_and_root(schema_name) else {
             return Ok(Vec::new());
@@ -1099,6 +1262,7 @@ impl TableStore for FileStorage {
         row_id: RowId,
     ) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_write_lock(transaction_id, schema_name)?;
 
         let Ok((_, root_page_id)) = self.table_schema_and_root(schema_name) else {
             return Ok(());
@@ -1132,7 +1296,9 @@ impl TableStore for FileStorage {
         let mut tree = BTree::from_root(root_page_id);
         let existing_bytes = tree
             .get(&pager, transaction_id.0, row_id.0)?
-            .ok_or_else(|| DbError::storage(format!("missing row {} on table {schema_name}", row_id.0)))?;
+            .ok_or_else(|| {
+                DbError::storage(format!("missing row {} on table {schema_name}", row_id.0))
+            })?;
         self.record_undo(
             transaction_id,
             UndoRecord::DeleteRow {
@@ -1152,7 +1318,8 @@ impl TableStore for FileStorage {
                 },
             )?;
         }
-        if let Some(updated_bytes) = mark_row_deleted(&existing_bytes, transaction_id.0, &snapshot)? {
+        if let Some(updated_bytes) = mark_row_deleted(&existing_bytes, transaction_id.0, &snapshot)?
+        {
             tree.insert(&mut pager, transaction_id.0, row_id.0, &updated_bytes)?;
         }
         if tree.root_page_id() != root_page_id {
@@ -1172,6 +1339,7 @@ impl TableStore for FileStorage {
         row: Row,
     ) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_write_lock(transaction_id, schema_name)?;
 
         let (schema, root_page_id) = self.table_schema_and_root(schema_name)?;
         if row.len() != schema.columns.len() {
@@ -1208,16 +1376,14 @@ impl TableStore for FileStorage {
         for (index_name, index_meta, index_root_page_id) in indexes {
             let old_key = project_index_key(&schema, &index_meta, &existing_row)?;
             let new_key = project_index_key(&schema, &index_meta, &row)?;
-            if !indexed_keys
-                .iter()
-                .any(|(existing_name, existing_key)| existing_name == &index_name && existing_key == &old_key)
-            {
+            if !indexed_keys.iter().any(|(existing_name, existing_key)| {
+                existing_name == &index_name && existing_key == &old_key
+            }) {
                 indexed_keys.push((index_name.clone(), old_key.clone()));
             }
-            if !indexed_keys
-                .iter()
-                .any(|(existing_name, existing_key)| existing_name == &index_name && existing_key == &new_key)
-            {
+            if !indexed_keys.iter().any(|(existing_name, existing_key)| {
+                existing_name == &index_name && existing_key == &new_key
+            }) {
                 indexed_keys.push((index_name.clone(), new_key.clone()));
             }
             index_changes.push((index_name, index_meta, index_root_page_id, old_key, new_key));
@@ -1230,7 +1396,9 @@ impl TableStore for FileStorage {
             tree.scan_all(&pager, transaction_id.0)?
                 .into_iter()
                 .filter(|(candidate_row_id, _)| *candidate_row_id != row_id.0)
-                .filter_map(|(_, bytes)| visible_row(&bytes, transaction_id.0, &snapshot).transpose())
+                .filter_map(|(_, bytes)| {
+                    visible_row(&bytes, transaction_id.0, &snapshot).transpose()
+                })
                 .collect::<Result<Vec<_>>>()?
         };
         let existing_refs = existing_rows.iter().collect::<Vec<_>>();
@@ -1275,7 +1443,9 @@ impl TableStore for FileStorage {
         let mut tree = BTree::from_root(root_page_id);
         let existing_bytes = tree
             .get(&pager, transaction_id.0, row_id.0)?
-            .ok_or_else(|| DbError::storage(format!("missing row {} on table {schema_name}", row_id.0)))?;
+            .ok_or_else(|| {
+                DbError::storage(format!("missing row {} on table {schema_name}", row_id.0))
+            })?;
         self.record_undo(
             transaction_id,
             UndoRecord::DeleteRow {
@@ -1308,7 +1478,9 @@ impl TableStore for FileStorage {
             }
         }
 
-        if let Some(updated_bytes) = append_row_version(&existing_bytes, &row, transaction_id.0, &snapshot)? {
+        if let Some(updated_bytes) =
+            append_row_version(&existing_bytes, &row, transaction_id.0, &snapshot)?
+        {
             tree.insert(&mut pager, transaction_id.0, row_id.0, &updated_bytes)?;
         }
         if tree.root_page_id() != root_page_id {
@@ -1361,6 +1533,7 @@ impl IndexStore for FileStorage {
         index: IndexMeta,
     ) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_exclusive_lock(transaction_id, schema_name)?;
 
         let (schema, table_root_page_id) = self.table_schema_and_root(schema_name)?;
         {
@@ -1426,6 +1599,7 @@ impl IndexStore for FileStorage {
         index_name: &str,
     ) -> Result<()> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_exclusive_lock(transaction_id, schema_name)?;
 
         let mut catalog = self.catalog.borrow_mut();
         let removed = catalog
@@ -1482,6 +1656,7 @@ impl IndexStore for FileStorage {
         key: &[Value],
     ) -> Result<Vec<RowId>> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_read_lock(transaction_id, schema_name)?;
         let (schema, table_root_page_id) = self.table_schema_and_root(schema_name)?;
         let (index, root_page_id) = self.index_meta_and_root(schema_name, index_name)?;
         if key.len() != index.columns.len() {
@@ -1492,15 +1667,16 @@ impl IndexStore for FileStorage {
                 key.len()
             )));
         }
-        self.txn_manager
-            .lock()
-            .unwrap()
-            .acquire_exact_key_lock(transaction_id, schema_name, index_name, key)?;
+        self.txn_manager.lock().unwrap().acquire_exact_key_lock(
+            transaction_id,
+            schema_name,
+            index_name,
+            key,
+        )?;
         let encoded_key = encode_index_key(key)?;
         let pager = self.pager.borrow();
         let tree = IndexTree::from_root(root_page_id);
-        tree
-            .get(&pager, transaction_id.0, &encoded_key)?
+        tree.get(&pager, transaction_id.0, &encoded_key)?
             .map(|bytes| decode_row_ids(&bytes))
             .transpose()?
             .map(|row_ids| {
@@ -1525,6 +1701,7 @@ impl IndexStore for FileStorage {
         key_prefix: &[Value],
     ) -> Result<Vec<RowId>> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_read_lock(transaction_id, schema_name)?;
         let (schema, table_root_page_id) = self.table_schema_and_root(schema_name)?;
         let (index, root_page_id) = self.index_meta_and_root(schema_name, index_name)?;
         if key_prefix.len() > index.columns.len() {
@@ -1535,10 +1712,12 @@ impl IndexStore for FileStorage {
                 key_prefix.len()
             )));
         }
-        self.txn_manager
-            .lock()
-            .unwrap()
-            .acquire_prefix_lock(transaction_id, schema_name, index_name, key_prefix)?;
+        self.txn_manager.lock().unwrap().acquire_prefix_lock(
+            transaction_id,
+            schema_name,
+            index_name,
+            key_prefix,
+        )?;
 
         let pager = self.pager.borrow();
         let tree = IndexTree::from_root(root_page_id);
@@ -1570,6 +1749,7 @@ impl IndexStore for FileStorage {
         upper: Option<(CompareOp, &Value)>,
     ) -> Result<Vec<RowId>> {
         self.validate_transaction(transaction_id)?;
+        self.wait_for_table_read_lock(transaction_id, schema_name)?;
         let (schema, table_root_page_id) = self.table_schema_and_root(schema_name)?;
         let (index, root_page_id) = self.index_meta_and_root(schema_name, index_name)?;
         if key_prefix.len() >= index.columns.len() {

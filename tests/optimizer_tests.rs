@@ -23,22 +23,32 @@ fn optimizer_accepts_all_top_level_statement_plans() {
             name: "users".to_string(),
             columns: vec![ColumnDef::primary_key("id", ColumnType::Integer)],
             constraints: vec![],
+            strict: false,
+            without_rowid: false,
+            if_not_exists: false,
         },
         Plan::CreateIndex {
             name: "idx_users_name".to_string(),
             table: "users".to_string(),
             columns: vec!["name".to_string()],
+            decorated_columns: None,
             unique: false,
+            predicate: None,
+            if_not_exists: false,
         },
         Plan::DropTable {
             name: "users".to_string(),
+            if_exists: false,
         },
         Plan::DropIndex {
             table: "users".to_string(),
             name: "idx_users_name".to_string(),
+            if_exists: false,
         },
+        Plan::NoOp,
         Plan::Insert {
             table: "users".to_string(),
+            or_conflict: None,
             values: vec![Value::Integer(1)],
         },
         Plan::Delete {
@@ -53,7 +63,7 @@ fn optimizer_accepts_all_top_level_statement_plans() {
             table: "users".to_string(),
             assignments: vec![Assignment {
                 column: "name".to_string(),
-                value: Value::from("alice"),
+                value: rustsql::sql::ast::ScalarExpr::Literal(Value::from("alice")),
             }],
             filter: None,
         },
@@ -64,6 +74,7 @@ fn optimizer_accepts_all_top_level_statement_plans() {
             filter: None,
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         },
         Plan::BeginTxn {
@@ -98,7 +109,9 @@ fn optimizer_rewrites_indexable_seq_scan_to_index_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_id".to_string(),
                 columns: vec!["id".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -113,6 +126,7 @@ fn optimizer_rewrites_indexable_seq_scan_to_index_scan() {
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -135,6 +149,7 @@ fn optimizer_rewrites_indexable_seq_scan_to_index_scan() {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -159,7 +174,9 @@ fn optimizer_uses_indexable_and_term_with_scalar_residual_filter() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_id".to_string(),
                 columns: vec!["id".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -186,6 +203,7 @@ fn optimizer_uses_indexable_and_term_with_scalar_residual_filter() {
         filter: Some(filter.clone()),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -204,6 +222,7 @@ fn optimizer_uses_indexable_and_term_with_scalar_residual_filter() {
             filter: Some(filter),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -229,7 +248,9 @@ fn optimizer_does_not_rewrite_scalar_is_null_filter_to_index_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_name".to_string(),
                 columns: vec!["name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -247,6 +268,7 @@ fn optimizer_does_not_rewrite_scalar_is_null_filter_to_index_scan() {
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -276,7 +298,9 @@ fn optimizer_does_not_rewrite_scalar_like_filter_to_index_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_name".to_string(),
                 columns: vec!["name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -290,10 +314,12 @@ fn optimizer_does_not_rewrite_scalar_like_filter_to_index_scan() {
                 args: vec![ScalarExpr::Column("name".to_string())],
             },
             pattern: "a%".to_string(),
+            escape: None,
             negated: false,
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -323,7 +349,9 @@ fn optimizer_does_not_rewrite_scalar_between_filter_to_index_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_age".to_string(),
                 columns: vec!["age".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -343,6 +371,7 @@ fn optimizer_does_not_rewrite_scalar_between_filter_to_index_scan() {
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -372,7 +401,9 @@ fn optimizer_does_not_rewrite_scalar_in_subquery_filter_to_index_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_alias_id".to_string(),
                 columns: vec!["alias_id".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -407,11 +438,13 @@ fn optimizer_does_not_rewrite_scalar_in_subquery_filter_to_index_scan() {
                 having: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
             }),
             negated: false,
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -441,7 +474,9 @@ fn optimizer_does_not_rewrite_scalar_not_in_subquery_filter_to_index_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_alias_id".to_string(),
                 columns: vec!["alias_id".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -476,11 +511,13 @@ fn optimizer_does_not_rewrite_scalar_not_in_subquery_filter_to_index_scan() {
                 having: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
             }),
             negated: true,
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -510,7 +547,9 @@ fn optimizer_does_not_rewrite_scalar_compare_subquery_filter_to_index_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_alias_id".to_string(),
                 columns: vec!["alias_id".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -546,10 +585,12 @@ fn optimizer_does_not_rewrite_scalar_compare_subquery_filter_to_index_scan() {
                 having: None,
                 order_by: vec![],
                 limit: None,
+                offset: None,
             }),
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -579,7 +620,9 @@ fn optimizer_rewrites_between_filter_to_index_range_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_age".to_string(),
                 columns: vec!["age".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -595,6 +638,7 @@ fn optimizer_rewrites_between_filter_to_index_range_scan() {
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -628,13 +672,14 @@ fn optimizer_rewrites_between_filter_to_index_range_scan() {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
 }
 
 #[test]
-fn optimizer_rewrites_prefix_like_filter_to_index_range_scan() {
+fn optimizer_does_not_rewrite_prefix_like_filter_to_binary_index_range_scan() {
     let optimizer = Optimizer::new();
     let context = PlanningContext::new(
         HashMap::from([(
@@ -652,7 +697,9 @@ fn optimizer_rewrites_prefix_like_filter_to_index_range_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_name".to_string(),
                 columns: vec!["name".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -663,45 +710,20 @@ fn optimizer_rewrites_prefix_like_filter_to_index_range_scan() {
         filter: Some(Expr::Like {
             column: "name".to_string(),
             pattern: "ali%".to_string(),
+            escape: None,
             negated: false,
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
-    let optimized = optimizer.optimize_with_context(plan, &context).unwrap();
+    let optimized = optimizer
+        .optimize_with_context(plan.clone(), &context)
+        .unwrap();
 
-    assert_eq!(
-        optimized,
-        Plan::IndexScan {
-            table: "users".to_string(),
-            table_alias: None,
-            columns: vec![SelectItem::Column("id".to_string())],
-            index: "idx_users_name".to_string(),
-            mode: IndexScanMode::Range,
-            key_prefix: vec![],
-            range: Some(IndexRange {
-                column: "name".to_string(),
-                lower: Some(IndexBound {
-                    op: CompareOp::Gte,
-                    value: Value::from("ali"),
-                }),
-                upper: Some(IndexBound {
-                    op: CompareOp::Lt,
-                    value: Value::from("alj"),
-                }),
-            }),
-            filter: Some(Expr::Like {
-                column: "name".to_string(),
-                pattern: "ali%".to_string(),
-                negated: false,
-            }),
-            order_by: vec![],
-            limit: None,
-            distinct: false,
-        }
-    );
+    assert_eq!(optimized, plan);
 }
 
 #[test]
@@ -723,7 +745,9 @@ fn optimizer_rewrites_is_null_filter_to_null_prefix_index_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_email".to_string(),
                 columns: vec!["email".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -737,6 +761,7 @@ fn optimizer_rewrites_is_null_filter_to_null_prefix_index_scan() {
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -758,6 +783,7 @@ fn optimizer_rewrites_is_null_filter_to_null_prefix_index_scan() {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -782,7 +808,9 @@ fn optimizer_does_not_rewrite_is_not_null_filter_to_null_prefix_index_scan() {
             vec![rustsql::common::types::IndexMeta {
                 name: "idx_users_email".to_string(),
                 columns: vec!["email".to_string()],
+                decorated_columns: None,
                 unique: false,
+                predicate: None,
             }],
         )]),
     );
@@ -796,6 +824,7 @@ fn optimizer_does_not_rewrite_is_not_null_filter_to_null_prefix_index_scan() {
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -826,12 +855,16 @@ fn optimizer_prefers_unique_index_when_match_quality_ties() {
                 rustsql::common::types::IndexMeta {
                     name: "idx_users_email_unique".to_string(),
                     columns: vec!["email".to_string()],
+                    decorated_columns: None,
                     unique: true,
+                    predicate: None,
                 },
                 rustsql::common::types::IndexMeta {
                     name: "idx_users_email".to_string(),
                     columns: vec!["email".to_string()],
+                    decorated_columns: None,
                     unique: false,
+                    predicate: None,
                 },
             ],
         )]),
@@ -847,6 +880,7 @@ fn optimizer_prefers_unique_index_when_match_quality_ties() {
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -869,6 +903,7 @@ fn optimizer_prefers_unique_index_when_match_quality_ties() {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );
@@ -895,12 +930,16 @@ fn optimizer_prefers_narrower_index_when_match_quality_and_uniqueness_tie() {
                 rustsql::common::types::IndexMeta {
                     name: "idx_users_email".to_string(),
                     columns: vec!["email".to_string()],
+                    decorated_columns: None,
                     unique: false,
+                    predicate: None,
                 },
                 rustsql::common::types::IndexMeta {
                     name: "idx_users_email_created_at".to_string(),
                     columns: vec!["email".to_string(), "created_at".to_string()],
+                    decorated_columns: None,
                     unique: false,
+                    predicate: None,
                 },
             ],
         )]),
@@ -916,6 +955,7 @@ fn optimizer_prefers_narrower_index_when_match_quality_and_uniqueness_tie() {
         }),
         order_by: vec![],
         limit: None,
+        offset: None,
         distinct: false,
     };
 
@@ -938,6 +978,7 @@ fn optimizer_prefers_narrower_index_when_match_quality_and_uniqueness_tie() {
             }),
             order_by: vec![],
             limit: None,
+            offset: None,
             distinct: false,
         }
     );

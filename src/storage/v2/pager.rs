@@ -144,7 +144,10 @@ impl Pager {
 
         for (page_id, page) in &pages_to_commit {
             write_raw_page(&self.db_path, *page_id, page)?;
-            self.page_cache.lock().unwrap().insert(*page_id, page.clone());
+            self.page_cache
+                .lock()
+                .unwrap()
+                .insert(*page_id, page.clone());
         }
         open_rw(&self.db_path)?.sync_all()?;
 
@@ -163,7 +166,10 @@ impl Pager {
         if let Some(txn_state) = self.txn_page_states.remove(&txn_id) {
             for (page_id, page_write) in txn_state.page_writes.into_iter().rev() {
                 if let Some(before_image) = page_write.before_image {
-                    self.page_cache.lock().unwrap().insert(page_id, before_image);
+                    self.page_cache
+                        .lock()
+                        .unwrap()
+                        .insert(page_id, before_image);
                 } else {
                     self.page_cache.lock().unwrap().remove(&page_id);
                 }
@@ -226,12 +232,12 @@ impl Pager {
             .expect("validated transaction must have a page-write state")
             .page_writes
             .insert(
-            page_id,
-            PageWrite {
-                before_image,
-                after_image: page,
-            },
-        );
+                page_id,
+                PageWrite {
+                    before_image,
+                    after_image: page,
+                },
+            );
         let page = self
             .txn_page_states
             .get(&txn_id)
@@ -319,14 +325,21 @@ impl Pager {
     }
 
     fn cleanup_aborted_transaction_state(&mut self, txn_id: u64) -> Result<()> {
-        let status = self.txn_manager.lock().unwrap().status(TransactionId(txn_id));
+        let status = self
+            .txn_manager
+            .lock()
+            .unwrap()
+            .status(TransactionId(txn_id));
         if !matches!(status, Ok(super::tx_types::TxnStatus::Aborted)) {
             return Ok(());
         }
         if let Some(txn_state) = self.txn_page_states.remove(&txn_id) {
             for (page_id, page_write) in txn_state.page_writes.into_iter().rev() {
                 if let Some(before_image) = page_write.before_image {
-                    self.page_cache.lock().unwrap().insert(page_id, before_image);
+                    self.page_cache
+                        .lock()
+                        .unwrap()
+                        .insert(page_id, before_image);
                 } else {
                     self.page_cache.lock().unwrap().remove(&page_id);
                 }
@@ -337,9 +350,7 @@ impl Pager {
     }
 
     fn wait_for_page_write_lock(&mut self, txn_id: u64, page_id: PageId) -> Result<()> {
-        let notifier = {
-            self.txn_manager.lock().unwrap().lock_wait_notifier()
-        };
+        let notifier = { self.txn_manager.lock().unwrap().lock_wait_notifier() };
         loop {
             let observed_epoch = TxnManager::current_lock_wait_epoch(&notifier);
             let acquire_result = {
@@ -366,7 +377,10 @@ impl Pager {
         }
     }
 
-    fn committed_page_count_after_commit(&self, pages_to_commit: &BTreeMap<PageId, Vec<u8>>) -> u32 {
+    fn committed_page_count_after_commit(
+        &self,
+        pages_to_commit: &BTreeMap<PageId, Vec<u8>>,
+    ) -> u32 {
         pages_to_commit
             .keys()
             .map(|page_id| page_id.0.saturating_add(1))
@@ -555,7 +569,9 @@ mod tests {
         let page_id = pager.allocate_page(setup_txn).unwrap();
         let mut committed_page = empty_page(PageKind::Leaf);
         committed_page[16] = 7;
-        pager.write_page(setup_txn, page_id, committed_page.clone()).unwrap();
+        pager
+            .write_page(setup_txn, page_id, committed_page.clone())
+            .unwrap();
         pager.commit(setup_txn).unwrap();
 
         let txn1 = pager.begin().unwrap();
@@ -563,7 +579,9 @@ mod tests {
 
         let mut updated_page = empty_page(PageKind::Leaf);
         updated_page[16] = 9;
-        pager.write_page(txn1, page_id, updated_page.clone()).unwrap();
+        pager
+            .write_page(txn1, page_id, updated_page.clone())
+            .unwrap();
 
         assert_eq!(pager.read_page(page_id).unwrap()[16], 9);
     }
@@ -578,7 +596,9 @@ mod tests {
         let page_id = pager.allocate_page(setup_txn).unwrap();
         let mut committed_page = empty_page(PageKind::Leaf);
         committed_page[16] = 4;
-        pager.write_page(setup_txn, page_id, committed_page.clone()).unwrap();
+        pager
+            .write_page(setup_txn, page_id, committed_page.clone())
+            .unwrap();
         pager.commit(setup_txn).unwrap();
 
         let txn = pager.begin().unwrap();
@@ -646,7 +666,8 @@ mod tests {
             let mut pager = Pager::open(&writer1_path).unwrap();
             pager.attach_txn_manager(writer1_manager);
             let txn = pager.begin().unwrap();
-            pager.write_page(txn, page_id, empty_page(PageKind::Leaf))
+            pager
+                .write_page(txn, page_id, empty_page(PageKind::Leaf))
                 .unwrap();
             writer1_locked_tx.send(()).unwrap();
             release_writer1_rx.recv().unwrap();
@@ -661,15 +682,18 @@ mod tests {
             let mut pager = Pager::open(&writer2_path).unwrap();
             pager.attach_txn_manager(writer2_manager);
             let txn = pager.begin().unwrap();
-            pager.write_page(txn, page_id, empty_page(PageKind::Leaf))
+            pager
+                .write_page(txn, page_id, empty_page(PageKind::Leaf))
                 .unwrap();
             pager.commit(txn).unwrap();
             writer2_done_tx.send(()).unwrap();
         });
 
-        assert!(writer2_done_rx
-            .recv_timeout(std::time::Duration::from_millis(150))
-            .is_err());
+        assert!(
+            writer2_done_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err()
+        );
         release_writer1_tx.send(()).unwrap();
         writer2_done_rx
             .recv_timeout(std::time::Duration::from_secs(2))
@@ -687,19 +711,23 @@ mod tests {
 
         let setup_txn = pager.begin().unwrap();
         let left_page = pager.allocate_page(setup_txn).unwrap();
-        pager.write_page(setup_txn, left_page, empty_page(PageKind::Leaf))
+        pager
+            .write_page(setup_txn, left_page, empty_page(PageKind::Leaf))
             .unwrap();
         let right_page = pager.allocate_page(setup_txn).unwrap();
-        pager.write_page(setup_txn, right_page, empty_page(PageKind::Leaf))
+        pager
+            .write_page(setup_txn, right_page, empty_page(PageKind::Leaf))
             .unwrap();
         pager.commit(setup_txn).unwrap();
 
         let txn1 = pager.begin().unwrap();
         let txn2 = pager.begin().unwrap();
 
-        pager.write_page(txn1, left_page, empty_page(PageKind::Leaf))
+        pager
+            .write_page(txn1, left_page, empty_page(PageKind::Leaf))
             .unwrap();
-        pager.write_page(txn2, right_page, empty_page(PageKind::Leaf))
+        pager
+            .write_page(txn2, right_page, empty_page(PageKind::Leaf))
             .unwrap();
 
         let first_wait = pager
@@ -727,10 +755,12 @@ mod tests {
 
         let setup_txn = pager.begin().unwrap();
         let left_page = pager.allocate_page(setup_txn).unwrap();
-        pager.write_page(setup_txn, left_page, empty_page(PageKind::Leaf))
+        pager
+            .write_page(setup_txn, left_page, empty_page(PageKind::Leaf))
             .unwrap();
         let right_page = pager.allocate_page(setup_txn).unwrap();
-        pager.write_page(setup_txn, right_page, empty_page(PageKind::Leaf))
+        pager
+            .write_page(setup_txn, right_page, empty_page(PageKind::Leaf))
             .unwrap();
         pager.commit(setup_txn).unwrap();
 
@@ -745,7 +775,8 @@ mod tests {
         right_update[24] = 2;
         pager.write_page(txn2, right_page, right_update).unwrap();
 
-        pager.txn_manager
+        pager
+            .txn_manager
             .lock()
             .unwrap()
             .acquire_page_write(TransactionId(txn1), right_page)
@@ -761,7 +792,8 @@ mod tests {
 
         pager.cleanup_aborted_transaction_state(txn2).unwrap();
 
-        pager.write_page(txn1, right_page, empty_page(PageKind::Leaf))
+        pager
+            .write_page(txn1, right_page, empty_page(PageKind::Leaf))
             .unwrap();
         assert_eq!(pager.read_page(right_page).unwrap()[24], 0);
     }
