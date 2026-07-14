@@ -295,6 +295,105 @@ pub enum CheckOp {
     Lte,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrimSide {
+    Both,
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoundingFunc {
+    Ceil,
+    Ceiling,
+    Floor,
+    Trunc,
+}
+
+impl RoundingFunc {
+    #[must_use]
+    pub(crate) fn sql_name(self) -> &'static str {
+        match self {
+            Self::Ceil => "ceil",
+            Self::Ceiling => "ceiling",
+            Self::Floor => "floor",
+            Self::Trunc => "trunc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnaryMathFunc {
+    Sqrt,
+    Ln,
+    Log10,
+    Log2,
+    Exp,
+    Sin,
+    Cos,
+    Tan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Atan,
+    Acos,
+    Asin,
+    Acosh,
+    Asinh,
+    Atanh,
+    Degrees,
+    Radians,
+}
+
+impl UnaryMathFunc {
+    #[must_use]
+    pub(crate) fn sql_name(self) -> &'static str {
+        match self {
+            Self::Sqrt => "sqrt",
+            Self::Ln => "ln",
+            Self::Log10 => "log10",
+            Self::Log2 => "log2",
+            Self::Exp => "exp",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Tan => "tan",
+            Self::Sinh => "sinh",
+            Self::Cosh => "cosh",
+            Self::Tanh => "tanh",
+            Self::Atan => "atan",
+            Self::Acos => "acos",
+            Self::Asin => "asin",
+            Self::Acosh => "acosh",
+            Self::Asinh => "asinh",
+            Self::Atanh => "atanh",
+            Self::Degrees => "degrees",
+            Self::Radians => "radians",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BinaryMathFunc {
+    Power,
+    Atan2,
+    Log,
+}
+
+impl BinaryMathFunc {
+    #[must_use]
+    pub(crate) fn sql_name(self) -> &'static str {
+        match self {
+            Self::Power => "power",
+            Self::Atan2 => "atan2",
+            Self::Log => "log",
+        }
+    }
+}
+
+fn default_check_collation() -> String {
+    "NOCASE".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckExpr {
     Compare {
@@ -307,6 +406,11 @@ pub enum CheckExpr {
         negated: bool,
     },
     Glob {
+        column: String,
+        pattern: String,
+        negated: bool,
+    },
+    Regexp {
         column: String,
         pattern: String,
         negated: bool,
@@ -340,6 +444,191 @@ pub enum CheckExpr {
         column: String,
         value: Value,
         negated: bool,
+    },
+    LengthCompare {
+        column: String,
+        op: CheckOp,
+        value: Value,
+    },
+    OctetLengthCompare {
+        column: String,
+        op: CheckOp,
+        value: Value,
+    },
+    UnicodeCompare {
+        column: String,
+        op: CheckOp,
+        value: Value,
+    },
+    UnicodeIsNull {
+        column: String,
+        negated: bool,
+    },
+    SignCompare {
+        column: String,
+        op: CheckOp,
+        value: Value,
+    },
+    HexCompare {
+        column: String,
+        op: CheckOp,
+        value: Value,
+    },
+    QuoteCompare {
+        column: String,
+        op: CheckOp,
+        value: Value,
+    },
+    NullIfIsNull {
+        column: String,
+        value: Value,
+        negated: bool,
+    },
+    ReplaceCompare {
+        column: String,
+        pattern: String,
+        replacement: String,
+        op: CheckOp,
+        value: Value,
+    },
+    ReplaceColumnCompare {
+        column: String,
+        pattern: String,
+        replacement: String,
+        op: CheckOp,
+    },
+    RoundCompare {
+        column: String,
+        precision: Option<i32>,
+        op: CheckOp,
+        value: Value,
+    },
+    RoundingCompare {
+        column: String,
+        func: RoundingFunc,
+        op: CheckOp,
+        value: Value,
+    },
+    CastCompare {
+        column: String,
+        target_type: ColumnType,
+        op: CheckOp,
+        value: Value,
+    },
+    MinMaxColumnCompare {
+        column: String,
+        limit: Value,
+        min: bool,
+        op: CheckOp,
+    },
+    ConcatCompare {
+        column: String,
+        suffix: Vec<Value>,
+        op: CheckOp,
+        value: Value,
+    },
+    ConcatWsCompare {
+        column: String,
+        separator: Option<String>,
+        suffix: Vec<Value>,
+        op: CheckOp,
+        value: Value,
+    },
+    JsonValidCompare {
+        column: String,
+        flags: Option<i64>,
+        #[serde(default)]
+        compare: Option<(CheckOp, Value)>,
+    },
+    AbsCompare {
+        column: String,
+        op: CheckOp,
+        value: Value,
+    },
+    UnaryMathCompare {
+        column: String,
+        func: UnaryMathFunc,
+        op: CheckOp,
+        value: Value,
+    },
+    BinaryMathCompare {
+        column: String,
+        func: BinaryMathFunc,
+        argument: Value,
+        #[serde(default)]
+        column_is_second: bool,
+        op: CheckOp,
+        value: Value,
+    },
+    ArithmeticCompare {
+        column: String,
+        addend: Value,
+        op: CheckOp,
+        value: Value,
+    },
+    MultiplyCompare {
+        column: String,
+        factor: Value,
+        op: CheckOp,
+        value: Value,
+    },
+    DivideCompare {
+        column: String,
+        divisor: Value,
+        op: CheckOp,
+        value: Value,
+    },
+    ModuloCompare {
+        column: String,
+        divisor: Value,
+        op: CheckOp,
+        value: Value,
+        #[serde(default)]
+        function_form: bool,
+    },
+    TypeOfCompare {
+        column: String,
+        op: CheckOp,
+        value: Value,
+    },
+    NoCaseCompare {
+        column: String,
+        #[serde(default = "default_check_collation")]
+        collation: String,
+        op: CheckOp,
+        value: Value,
+    },
+    CaseFoldCompare {
+        column: String,
+        upper: bool,
+        op: CheckOp,
+        value: Value,
+    },
+    TrimCompare {
+        column: String,
+        side: TrimSide,
+        characters: Option<String>,
+        op: CheckOp,
+        value: Value,
+    },
+    CoalesceCompare {
+        column: String,
+        fallbacks: Vec<Value>,
+        op: CheckOp,
+        value: Value,
+    },
+    InstrCompare {
+        column: String,
+        needle: Value,
+        op: CheckOp,
+        value: Value,
+    },
+    SubstrCompare {
+        column: String,
+        start: i64,
+        length: Option<i64>,
+        op: CheckOp,
+        value: Value,
     },
     And(Box<CheckExpr>, Box<CheckExpr>),
     Or(Box<CheckExpr>, Box<CheckExpr>),
@@ -633,6 +922,7 @@ impl PrimaryKeyConstraint {
 pub struct ColumnDef {
     pub name: String,
     pub column_type: ColumnType,
+    pub declared_type: Option<String>,
     pub collation: Option<String>,
     pub nullable: bool,
     pub not_null_constraint_name: Option<String>,
@@ -654,12 +944,17 @@ pub struct ColumnDef {
     pub foreign_key: Option<ForeignKey>,
 }
 
+fn default_declared_type(column_type: ColumnType) -> Option<String> {
+    (!matches!(column_type, ColumnType::Any)).then(|| column_type.name().to_string())
+}
+
 impl ColumnDef {
     #[must_use]
     pub fn new(name: impl Into<String>, column_type: ColumnType) -> Self {
         Self {
             name: name.into(),
             column_type,
+            declared_type: default_declared_type(column_type),
             collation: None,
             nullable: true,
             not_null_constraint_name: None,
@@ -687,6 +982,7 @@ impl ColumnDef {
         Self {
             name: name.into(),
             column_type,
+            declared_type: default_declared_type(column_type),
             collation: None,
             nullable: false,
             not_null_constraint_name: None,
@@ -713,6 +1009,17 @@ impl ColumnDef {
     pub fn nullable(mut self, nullable: bool) -> Self {
         self.nullable = nullable;
         self
+    }
+
+    #[must_use]
+    pub fn declared_type(mut self, declared_type: impl Into<String>) -> Self {
+        self.declared_type = Some(declared_type.into());
+        self
+    }
+
+    #[must_use]
+    pub fn pragma_declared_type(&self) -> &str {
+        self.declared_type.as_deref().unwrap_or("")
     }
 
     #[must_use]
@@ -959,10 +1266,28 @@ pub enum TableConstraintOrder {
     Unique(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaObjectType {
+    Table,
+    View,
+}
+
+fn default_schema_object_type() -> SchemaObjectType {
+    SchemaObjectType::Table
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    #[serde(default = "default_schema_object_type")]
+    pub object_type: SchemaObjectType,
+    #[serde(default)]
+    pub create_sql: Option<String>,
+    #[serde(skip)]
+    pub view_select: Option<crate::sql::ast::SelectStatement>,
+    #[serde(default)]
+    pub view_columns: Option<Vec<String>>,
     pub checks: Vec<CheckConstraint>,
     pub foreign_keys: Vec<ForeignKey>,
     pub primary_key_constraint: Option<PrimaryKeyConstraint>,
@@ -979,6 +1304,10 @@ impl Schema {
         Self {
             name: name.into(),
             columns,
+            object_type: SchemaObjectType::Table,
+            create_sql: None,
+            view_select: None,
+            view_columns: None,
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             primary_key_constraint: None,
@@ -987,6 +1316,36 @@ impl Schema {
             strict: false,
             without_rowid: false,
         }
+    }
+
+    #[must_use]
+    pub fn view(
+        name: impl Into<String>,
+        columns: Vec<ColumnDef>,
+        view_columns: Option<Vec<String>>,
+        select: crate::sql::ast::SelectStatement,
+        create_sql: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            object_type: SchemaObjectType::View,
+            create_sql: Some(create_sql.into()),
+            view_select: Some(select),
+            view_columns,
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            primary_key_constraint: None,
+            unique_constraints: Vec::new(),
+            table_constraint_order: Vec::new(),
+            strict: false,
+            without_rowid: false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_view(&self) -> bool {
+        self.object_type == SchemaObjectType::View
     }
 
     #[must_use]
@@ -1324,7 +1683,8 @@ impl Schema {
 
         for (column, value) in self.columns.iter().zip(row.iter()) {
             if matches!(value, Value::Null) {
-                let null_allowed_primary_key = column.primary_key
+                let null_allowed_primary_key = !self.strict
+                    && column.primary_key
                     && matches!(column.column_type, ColumnType::Integer)
                     && matches!(column.primary_key_sort_order, Some(SortOrder::Desc));
                 if null_allowed_primary_key {
@@ -1358,6 +1718,53 @@ impl Schema {
         }
 
         Ok(())
+    }
+
+    pub fn normalize_strict_row_values(&self, row: Row) -> Result<Row> {
+        if !self.strict {
+            return Ok(row);
+        }
+
+        self.columns
+            .iter()
+            .zip(row)
+            .map(|(column, value)| self.normalize_strict_value(column, value))
+            .collect()
+    }
+
+    fn normalize_strict_value(&self, column: &ColumnDef, value: Value) -> Result<Value> {
+        if matches!(value, Value::Null) || matches!(column.column_type, ColumnType::Any) {
+            return Ok(value);
+        }
+
+        let original_type = value.type_name();
+        let normalized = match column.column_type {
+            ColumnType::Any => Some(value),
+            ColumnType::Integer => strict_integer_value(value),
+            ColumnType::Real => strict_real_value(value),
+            ColumnType::Text => strict_text_value(value),
+            ColumnType::Blob => match value {
+                Value::Blob(_) => Some(value),
+                _ => None,
+            },
+            ColumnType::Numeric | ColumnType::Boolean => {
+                if column.column_type.matches_value(&value) {
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+        };
+
+        normalized.ok_or_else(|| {
+            DbError::storage(format!(
+                "cannot store {} value in {} column {}.{}",
+                original_type.to_ascii_uppercase(),
+                column.column_type.name(),
+                self.name,
+                column.name
+            ))
+        })
     }
 
     pub fn validate_check_constraints(&self, row: &Row) -> Result<()> {
@@ -1404,12 +1811,44 @@ impl Schema {
             CheckExpr::Compare { column, .. }
             | CheckExpr::IsNull { column, .. }
             | CheckExpr::Glob { column, .. }
+            | CheckExpr::Regexp { column, .. }
             | CheckExpr::Like { column, .. }
             | CheckExpr::InList { column, .. }
             | CheckExpr::Between { column, .. }
             | CheckExpr::IsBool { column, .. }
             | CheckExpr::Truthy { column }
-            | CheckExpr::IsDistinct { column, .. } => {
+            | CheckExpr::IsDistinct { column, .. }
+            | CheckExpr::LengthCompare { column, .. }
+            | CheckExpr::OctetLengthCompare { column, .. }
+            | CheckExpr::UnicodeCompare { column, .. }
+            | CheckExpr::UnicodeIsNull { column, .. }
+            | CheckExpr::SignCompare { column, .. }
+            | CheckExpr::HexCompare { column, .. }
+            | CheckExpr::QuoteCompare { column, .. }
+            | CheckExpr::NullIfIsNull { column, .. }
+            | CheckExpr::ReplaceCompare { column, .. }
+            | CheckExpr::ReplaceColumnCompare { column, .. }
+            | CheckExpr::RoundCompare { column, .. }
+            | CheckExpr::RoundingCompare { column, .. }
+            | CheckExpr::CastCompare { column, .. }
+            | CheckExpr::MinMaxColumnCompare { column, .. }
+            | CheckExpr::ConcatCompare { column, .. }
+            | CheckExpr::ConcatWsCompare { column, .. }
+            | CheckExpr::JsonValidCompare { column, .. }
+            | CheckExpr::AbsCompare { column, .. }
+            | CheckExpr::UnaryMathCompare { column, .. }
+            | CheckExpr::BinaryMathCompare { column, .. }
+            | CheckExpr::ArithmeticCompare { column, .. }
+            | CheckExpr::MultiplyCompare { column, .. }
+            | CheckExpr::DivideCompare { column, .. }
+            | CheckExpr::ModuloCompare { column, .. }
+            | CheckExpr::TypeOfCompare { column, .. }
+            | CheckExpr::NoCaseCompare { column, .. }
+            | CheckExpr::CaseFoldCompare { column, .. }
+            | CheckExpr::TrimCompare { column, .. }
+            | CheckExpr::CoalesceCompare { column, .. }
+            | CheckExpr::InstrCompare { column, .. }
+            | CheckExpr::SubstrCompare { column, .. } => {
                 if self.has_column(column) {
                     Ok(())
                 } else {
@@ -1453,8 +1892,22 @@ impl Schema {
                 let value = self.value_for_column(row, column)?;
                 match value {
                     Value::Null => Ok(None),
-                    Value::Text(value) => Ok(Some(matches_glob_pattern(value, pattern) ^ *negated)),
-                    _ => Ok(Some(false ^ *negated)),
+                    value => Ok(Some(
+                        matches_glob_pattern(&sqlite_text_like_value(value), pattern) ^ *negated,
+                    )),
+                }
+            }
+            CheckExpr::Regexp {
+                column,
+                pattern,
+                negated,
+            } => {
+                let value = self.value_for_column(row, column)?;
+                match value {
+                    Value::Null => Ok(None),
+                    value => Ok(Some(
+                        sqlite_check_regexp(pattern, &sqlite_text_like_value(value))? ^ *negated,
+                    )),
                 }
             }
             CheckExpr::Like {
@@ -1466,11 +1919,14 @@ impl Schema {
                 let value = self.value_for_column(row, column)?;
                 match value {
                     Value::Null => Ok(None),
-                    Value::Text(value) => Ok(Some(
-                        matches_like_pattern(value, pattern, escape, case_sensitive_like)?
-                            ^ *negated,
+                    value => Ok(Some(
+                        matches_like_pattern(
+                            &sqlite_text_like_value(value),
+                            pattern,
+                            escape,
+                            case_sensitive_like,
+                        )? ^ *negated,
                     )),
-                    _ => Ok(Some(false ^ *negated)),
                 }
             }
             CheckExpr::InList {
@@ -1543,6 +1999,405 @@ impl Schema {
                 let matches = Self::check_values_are_not_distinct(left, value);
                 Ok(Some(matches ^ *negated))
             }
+            CheckExpr::LengthCompare { column, op, value } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(length) = sqlite_check_length(left) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Integer(length),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::OctetLengthCompare { column, op, value } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(length) = sqlite_check_octet_length(left) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Integer(length),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::UnicodeCompare { column, op, value } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(codepoint) = sqlite_check_unicode(left) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Integer(codepoint),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::UnicodeIsNull { column, negated } => {
+                let left = self.value_for_column(row, column)?;
+                Ok(Some(sqlite_check_unicode(left).is_none() ^ *negated))
+            }
+            CheckExpr::SignCompare { column, op, value } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(sign) = sqlite_check_sign(left) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Integer(sign),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::HexCompare { column, op, value } => {
+                let left = self.value_for_column(row, column)?;
+                let hex = sqlite_check_hex(left);
+                Ok(Self::evaluate_check_compare(&Value::Text(hex), *op, value))
+            }
+            CheckExpr::QuoteCompare { column, op, value } => {
+                let left = self.value_for_column(row, column)?;
+                let quoted = sqlite_check_quote(left);
+                Ok(Self::evaluate_check_compare(
+                    &Value::Text(quoted),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::NullIfIsNull {
+                column,
+                value,
+                negated,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let is_null = sqlite_check_nullif(left, value);
+                Ok(Some(is_null ^ *negated))
+            }
+            CheckExpr::ReplaceCompare {
+                column,
+                pattern,
+                replacement,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(replaced) = sqlite_check_replace(left, pattern, replacement) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Text(replaced),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::ReplaceColumnCompare {
+                column,
+                pattern,
+                replacement,
+                op,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(replaced) = sqlite_check_replace(left, pattern, replacement) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Text(replaced),
+                    *op,
+                    left,
+                ))
+            }
+            CheckExpr::RoundCompare {
+                column,
+                precision,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(rounded) = sqlite_check_round(left, *precision) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Real(rounded),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::RoundingCompare {
+                column,
+                func,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(rounded) = sqlite_check_rounding(left, *func) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(&rounded, *op, value))
+            }
+            CheckExpr::CastCompare {
+                column,
+                target_type,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let casted = sqlite_check_cast(left, *target_type);
+                Ok(Self::evaluate_check_compare(&casted, *op, value))
+            }
+            CheckExpr::MinMaxColumnCompare {
+                column,
+                limit,
+                min,
+                op,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(candidate) = sqlite_check_min_max(left, limit, *min) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(candidate, *op, left))
+            }
+            CheckExpr::ConcatCompare {
+                column,
+                suffix,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let concatenated = sqlite_check_concat(left, suffix);
+                Ok(Self::evaluate_check_compare(
+                    &Value::Text(concatenated),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::ConcatWsCompare {
+                column,
+                separator,
+                suffix,
+                op,
+                value,
+            } => {
+                let Some(separator) = separator else {
+                    return Ok(None);
+                };
+                let left = self.value_for_column(row, column)?;
+                let concatenated = sqlite_check_concat_ws(left, separator, suffix);
+                Ok(Self::evaluate_check_compare(
+                    &Value::Text(concatenated),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::JsonValidCompare {
+                column,
+                flags,
+                compare,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(valid) = sqlite_check_json_valid(left, *flags) else {
+                    return Ok(None);
+                };
+                if let Some((op, value)) = compare {
+                    return Ok(Self::evaluate_check_compare(
+                        &Value::Integer(i64::from(valid)),
+                        *op,
+                        value,
+                    ));
+                }
+                Ok(Some(valid))
+            }
+            CheckExpr::AbsCompare { column, op, value } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(abs_value) = sqlite_check_abs(left) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(&abs_value, *op, value))
+            }
+            CheckExpr::UnaryMathCompare {
+                column,
+                func,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(result) = sqlite_check_unary_math(left, *func) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Real(result),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::BinaryMathCompare {
+                column,
+                func,
+                argument,
+                column_is_second,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(result) =
+                    sqlite_check_binary_math(left, argument, *func, *column_is_second)
+                else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Real(result),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::ArithmeticCompare {
+                column,
+                addend,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(sum) = sqlite_check_add(left, addend) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(&sum, *op, value))
+            }
+            CheckExpr::MultiplyCompare {
+                column,
+                factor,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(product) = sqlite_check_multiply(left, factor) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(&product, *op, value))
+            }
+            CheckExpr::DivideCompare {
+                column,
+                divisor,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(quotient) = sqlite_check_divide(left, divisor) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(&quotient, *op, value))
+            }
+            CheckExpr::ModuloCompare {
+                column,
+                divisor,
+                op,
+                value,
+                ..
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(remainder) = sqlite_check_modulo(left, divisor) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(&remainder, *op, value))
+            }
+            CheckExpr::TypeOfCompare { column, op, value } => {
+                let left = self.value_for_column(row, column)?;
+                Ok(Self::evaluate_check_compare(
+                    &Value::Text(sqlite_typeof_name(left).to_string()),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::NoCaseCompare {
+                column,
+                collation,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let left = sqlite_check_collated_value(left, collation);
+                let right = sqlite_check_collated_value(value, collation);
+                Ok(Self::evaluate_check_compare(&left, *op, &right))
+            }
+            CheckExpr::CaseFoldCompare {
+                column,
+                upper,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                if matches!(left, Value::Null) {
+                    return Ok(None);
+                }
+                let text = sqlite_text_like_value(left);
+                let folded = if *upper {
+                    sqlite_ascii_upper(&text)
+                } else {
+                    sqlite_ascii_lower(&text)
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Text(folded),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::TrimCompare {
+                column,
+                side,
+                characters,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                if matches!(left, Value::Null) {
+                    return Ok(None);
+                }
+                let text = sqlite_trim(&sqlite_text_like_value(left), *side, characters.as_deref());
+                Ok(Self::evaluate_check_compare(&Value::Text(text), *op, value))
+            }
+            CheckExpr::CoalesceCompare {
+                column,
+                fallbacks,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let fallback = fallbacks
+                    .iter()
+                    .find(|value| !matches!(value, Value::Null))
+                    .unwrap_or(&Value::Null);
+                let candidate = if matches!(left, Value::Null) {
+                    fallback
+                } else {
+                    left
+                };
+                Ok(Self::evaluate_check_compare(candidate, *op, value))
+            }
+            CheckExpr::InstrCompare {
+                column,
+                needle,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                let Some(position) = sqlite_check_instr(left, needle) else {
+                    return Ok(None);
+                };
+                Ok(Self::evaluate_check_compare(
+                    &Value::Integer(position),
+                    *op,
+                    value,
+                ))
+            }
+            CheckExpr::SubstrCompare {
+                column,
+                start,
+                length,
+                op,
+                value,
+            } => {
+                let left = self.value_for_column(row, column)?;
+                if matches!(left, Value::Null) {
+                    return Ok(None);
+                }
+                let text = sqlite_substr_text(&sqlite_text_like_value(left), *start, *length);
+                Ok(Self::evaluate_check_compare(&Value::Text(text), *op, value))
+            }
             CheckExpr::And(left, right) => {
                 let left = self.evaluate_check_expr(left, row, case_sensitive_like)?;
                 let right = self.evaluate_check_expr(right, row, case_sensitive_like)?;
@@ -1601,6 +2456,9 @@ impl Schema {
         let ordering = match (left, right) {
             (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
             (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+            (Value::Integer(left), Value::Real(right)) => (*left as f64).total_cmp(right),
+            (Value::Real(left), Value::Integer(right)) => left.total_cmp(&(*right as f64)),
+            (Value::Real(left), Value::Real(right)) => left.total_cmp(right),
             (Value::Blob(left), Value::Blob(right)) => left.cmp(right),
             (Value::Text(left), Value::Text(right)) => left.cmp(right),
             _ => return Some(false),
@@ -1670,12 +2528,44 @@ fn rename_check_expr_column(expr: &mut CheckExpr, old_name: &str, new_name: &str
         CheckExpr::Compare { column, .. }
         | CheckExpr::IsNull { column, .. }
         | CheckExpr::Glob { column, .. }
+        | CheckExpr::Regexp { column, .. }
         | CheckExpr::Like { column, .. }
         | CheckExpr::InList { column, .. }
         | CheckExpr::Between { column, .. }
         | CheckExpr::IsBool { column, .. }
         | CheckExpr::Truthy { column }
-        | CheckExpr::IsDistinct { column, .. } => {
+        | CheckExpr::IsDistinct { column, .. }
+        | CheckExpr::LengthCompare { column, .. }
+        | CheckExpr::OctetLengthCompare { column, .. }
+        | CheckExpr::UnicodeCompare { column, .. }
+        | CheckExpr::UnicodeIsNull { column, .. }
+        | CheckExpr::SignCompare { column, .. }
+        | CheckExpr::HexCompare { column, .. }
+        | CheckExpr::QuoteCompare { column, .. }
+        | CheckExpr::NullIfIsNull { column, .. }
+        | CheckExpr::ReplaceCompare { column, .. }
+        | CheckExpr::ReplaceColumnCompare { column, .. }
+        | CheckExpr::RoundCompare { column, .. }
+        | CheckExpr::RoundingCompare { column, .. }
+        | CheckExpr::CastCompare { column, .. }
+        | CheckExpr::MinMaxColumnCompare { column, .. }
+        | CheckExpr::ConcatCompare { column, .. }
+        | CheckExpr::ConcatWsCompare { column, .. }
+        | CheckExpr::JsonValidCompare { column, .. }
+        | CheckExpr::AbsCompare { column, .. }
+        | CheckExpr::UnaryMathCompare { column, .. }
+        | CheckExpr::BinaryMathCompare { column, .. }
+        | CheckExpr::ArithmeticCompare { column, .. }
+        | CheckExpr::MultiplyCompare { column, .. }
+        | CheckExpr::DivideCompare { column, .. }
+        | CheckExpr::ModuloCompare { column, .. }
+        | CheckExpr::TypeOfCompare { column, .. }
+        | CheckExpr::NoCaseCompare { column, .. }
+        | CheckExpr::CaseFoldCompare { column, .. }
+        | CheckExpr::TrimCompare { column, .. }
+        | CheckExpr::CoalesceCompare { column, .. }
+        | CheckExpr::InstrCompare { column, .. }
+        | CheckExpr::SubstrCompare { column, .. } => {
             if column == old_name {
                 *column = new_name.to_string();
             }
@@ -1702,6 +2592,10 @@ fn check_references_column(expr: &CheckExpr, column: &str) -> bool {
             column: expr_column,
             ..
         }
+        | CheckExpr::Regexp {
+            column: expr_column,
+            ..
+        }
         | CheckExpr::Like {
             column: expr_column,
             ..
@@ -1724,6 +2618,130 @@ fn check_references_column(expr: &CheckExpr, column: &str) -> bool {
         | CheckExpr::IsDistinct {
             column: expr_column,
             ..
+        }
+        | CheckExpr::LengthCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::OctetLengthCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::UnicodeCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::UnicodeIsNull {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::SignCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::HexCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::QuoteCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::NullIfIsNull {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::ReplaceCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::ReplaceColumnCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::RoundCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::RoundingCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::CastCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::MinMaxColumnCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::ConcatCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::ConcatWsCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::JsonValidCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::AbsCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::UnaryMathCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::BinaryMathCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::ArithmeticCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::MultiplyCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::DivideCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::ModuloCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::TypeOfCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::NoCaseCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::CaseFoldCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::TrimCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::CoalesceCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::InstrCompare {
+            column: expr_column,
+            ..
+        }
+        | CheckExpr::SubstrCompare {
+            column: expr_column,
+            ..
         } => expr_column == column,
         CheckExpr::And(left, right) | CheckExpr::Or(left, right) => {
             check_references_column(left, column) || check_references_column(right, column)
@@ -1741,6 +2759,758 @@ fn sqlite_check_truthy(value: &Value) -> bool {
         Value::Text(value) => sqlite_text_numeric_prefix(value) != 0.0,
         Value::Blob(value) => sqlite_text_numeric_prefix(&String::from_utf8_lossy(value)) != 0.0,
     }
+}
+
+fn sqlite_check_length(value: &Value) -> Option<i64> {
+    match value {
+        Value::Null => None,
+        Value::Blob(value) => Some(value.len() as i64),
+        Value::Text(value) => Some(sqlite_text_prefix_before_nul(value).chars().count() as i64),
+        value => Some(sqlite_text_like_value(value).chars().count() as i64),
+    }
+}
+
+fn sqlite_check_octet_length(value: &Value) -> Option<i64> {
+    match value {
+        Value::Null => None,
+        Value::Blob(value) => Some(value.len() as i64),
+        Value::Text(value) => Some(value.len() as i64),
+        Value::Integer(value) => Some(value.to_string().len() as i64),
+        Value::Real(value) => Some(sqlite_real_to_text(*value).len() as i64),
+        Value::Boolean(_) => Some(1),
+    }
+}
+
+fn sqlite_check_unicode(value: &Value) -> Option<i64> {
+    if matches!(value, Value::Null) {
+        return None;
+    }
+    sqlite_text_prefix_before_nul(&sqlite_text_like_value(value))
+        .chars()
+        .next()
+        .map(|ch| i64::from(u32::from(ch)))
+}
+
+fn sqlite_check_sign(value: &Value) -> Option<i64> {
+    match value {
+        Value::Null => None,
+        Value::Boolean(value) => Some(if *value { 1 } else { 0 }),
+        Value::Integer(value) => Some(value.signum()),
+        Value::Real(value) => Some(sqlite_sign_real(*value)),
+        Value::Text(value) => {
+            let value = value.trim();
+            if let Ok(value) = value.parse::<i64>() {
+                Some(value.signum())
+            } else {
+                value.parse::<f64>().ok().map(sqlite_sign_real)
+            }
+        }
+        Value::Blob(_) => None,
+    }
+}
+
+fn sqlite_sign_real(value: f64) -> i64 {
+    if value > 0.0 {
+        1
+    } else if value < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn sqlite_check_hex(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Blob(value) => sqlite_hex_bytes(value),
+        Value::Text(value) => sqlite_hex_bytes(value.as_bytes()),
+        Value::Integer(value) => sqlite_hex_bytes(value.to_string().as_bytes()),
+        Value::Real(value) => sqlite_hex_bytes(sqlite_real_to_text(*value).as_bytes()),
+        Value::Boolean(value) => {
+            if *value {
+                "31".to_string()
+            } else {
+                "30".to_string()
+            }
+        }
+    }
+}
+
+fn sqlite_check_quote(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(value) => {
+            if *value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        Value::Integer(value) => value.to_string(),
+        Value::Real(value) => sqlite_real_to_text_for_quote(*value),
+        Value::Blob(value) => format!("X'{}'", sqlite_hex_bytes(value)),
+        Value::Text(value) => {
+            format!(
+                "'{}'",
+                sqlite_text_prefix_before_nul(value).replace('\'', "''")
+            )
+        }
+    }
+}
+
+fn sqlite_check_nullif(left: &Value, right: &Value) -> bool {
+    matches!(left, Value::Null) || Schema::check_values_are_not_distinct(left, right)
+}
+
+fn sqlite_check_replace(value: &Value, pattern: &str, replacement: &str) -> Option<String> {
+    if matches!(value, Value::Null) {
+        return None;
+    }
+    let text = sqlite_text_like_value(value);
+    let value = sqlite_text_prefix_before_nul(&text);
+    if pattern.is_empty() {
+        Some(value.to_string())
+    } else {
+        Some(value.replace(pattern, replacement))
+    }
+}
+
+fn sqlite_check_round(value: &Value, precision: Option<i32>) -> Option<f64> {
+    if matches!(value, Value::Null) {
+        return None;
+    }
+    let value = sqlite_check_numeric_real(value);
+    Some(sqlite_round_f64(value, precision.unwrap_or(0)))
+}
+
+#[must_use]
+pub fn sqlite_round_f64(value: f64, precision: i32) -> f64 {
+    let precision = precision.clamp(0, 30);
+    if !value.is_finite() {
+        return value;
+    }
+    if precision > 18 {
+        let factor = 10_f64.powi(precision);
+        return (value * factor).round() / factor;
+    }
+
+    let sign = if value.is_sign_negative() { -1.0 } else { 1.0 };
+    let value = value.abs();
+    if value == 0.0 {
+        return sign * 0.0;
+    }
+
+    let bits = value.to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (mantissa, binary_shift) = if exponent_bits == 0 {
+        (u128::from(fraction), -1074)
+    } else {
+        (
+            u128::from((1_u64 << 52) | fraction),
+            exponent_bits - 1023 - 52,
+        )
+    };
+    let pow10 = 10_u128.pow(precision as u32);
+    let Some(numerator) = mantissa.checked_mul(pow10) else {
+        let factor = 10_f64.powi(precision);
+        return sign * ((value * factor).round() / factor);
+    };
+
+    let rounded = if binary_shift >= 0 {
+        let shift = binary_shift as u32;
+        if shift >= 128 {
+            let factor = 10_f64.powi(precision);
+            return sign * ((value * factor).round() / factor);
+        }
+        let Some(scaled) = numerator.checked_shl(shift) else {
+            let factor = 10_f64.powi(precision);
+            return sign * ((value * factor).round() / factor);
+        };
+        scaled
+    } else {
+        let denominator_shift = (-binary_shift) as u32;
+        if denominator_shift >= 127 {
+            return sign * 0.0;
+        }
+        let denominator = 1_u128 << denominator_shift;
+        let Some(doubled_numerator) = numerator.checked_mul(2) else {
+            let factor = 10_f64.powi(precision);
+            return sign * ((value * factor).round() / factor);
+        };
+        let Some(rounding_numerator) = doubled_numerator.checked_add(denominator) else {
+            let factor = 10_f64.powi(precision);
+            return sign * ((value * factor).round() / factor);
+        };
+        rounding_numerator / (denominator << 1)
+    };
+
+    sign * (rounded as f64) / (pow10 as f64)
+}
+
+fn sqlite_check_rounding(value: &Value, func: RoundingFunc) -> Option<Value> {
+    match value {
+        Value::Null | Value::Blob(_) => None,
+        Value::Boolean(value) => Some(Value::Integer(if *value { 1 } else { 0 })),
+        Value::Integer(value) => Some(Value::Integer(*value)),
+        Value::Real(value) => Some(Value::Real(match func {
+            RoundingFunc::Ceil | RoundingFunc::Ceiling => value.ceil(),
+            RoundingFunc::Floor => value.floor(),
+            RoundingFunc::Trunc => value.trunc(),
+        })),
+        Value::Text(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let parsed = trimmed.parse::<f64>().ok()?;
+            Some(Value::Real(match func {
+                RoundingFunc::Ceil | RoundingFunc::Ceiling => parsed.ceil(),
+                RoundingFunc::Floor => parsed.floor(),
+                RoundingFunc::Trunc => parsed.trunc(),
+            }))
+        }
+    }
+}
+
+fn sqlite_check_cast(value: &Value, target_type: ColumnType) -> Value {
+    match target_type {
+        ColumnType::Any => value.clone(),
+        ColumnType::Text => match value {
+            Value::Null => Value::Null,
+            value => Value::Text(sqlite_text_like_value(value)),
+        },
+        ColumnType::Blob => match value {
+            Value::Null => Value::Null,
+            Value::Blob(value) => Value::Blob(value.clone()),
+            value => Value::Blob(sqlite_text_like_value(value).into_bytes()),
+        },
+        ColumnType::Integer => match value {
+            Value::Null => Value::Null,
+            Value::Integer(value) => Value::Integer(*value),
+            Value::Boolean(value) => Value::Integer(if *value { 1 } else { 0 }),
+            Value::Real(value) => Value::Integer(*value as i64),
+            Value::Text(value) => Value::Integer(sqlite_text_integer_prefix(value)),
+            Value::Blob(value) => {
+                Value::Integer(sqlite_text_integer_prefix(&String::from_utf8_lossy(value)))
+            }
+        },
+        ColumnType::Numeric => match value {
+            Value::Null => Value::Null,
+            Value::Integer(value) => Value::Integer(*value),
+            Value::Boolean(value) => Value::Integer(if *value { 1 } else { 0 }),
+            Value::Real(value) => Value::Real(*value),
+            Value::Text(value) => sqlite_text_numeric_value(value),
+            Value::Blob(value) => sqlite_text_numeric_value(&String::from_utf8_lossy(value)),
+        },
+        ColumnType::Real => match value {
+            Value::Null => Value::Null,
+            Value::Integer(value) => Value::Real(*value as f64),
+            Value::Boolean(value) => Value::Real(if *value { 1.0 } else { 0.0 }),
+            Value::Real(value) => Value::Real(*value),
+            Value::Text(value) => Value::Real(sqlite_text_real_prefix(value)),
+            Value::Blob(value) => {
+                Value::Real(sqlite_text_real_prefix(&String::from_utf8_lossy(value)))
+            }
+        },
+        ColumnType::Boolean => match value {
+            Value::Null => Value::Null,
+            Value::Boolean(value) => Value::Boolean(*value),
+            Value::Integer(value) => Value::Boolean(*value != 0),
+            Value::Real(value) => Value::Boolean(*value != 0.0),
+            Value::Text(value) => Value::Boolean(!value.is_empty() && value != "0"),
+            Value::Blob(value) => Value::Boolean(!value.is_empty() && value != b"0"),
+        },
+    }
+}
+
+fn sqlite_check_min_max<'a>(left: &'a Value, right: &'a Value, min: bool) -> Option<&'a Value> {
+    if matches!(left, Value::Null) || matches!(right, Value::Null) {
+        return None;
+    }
+    let ordering = left.partial_cmp(right)?;
+    if (min && ordering.is_gt()) || (!min && ordering.is_lt()) {
+        Some(right)
+    } else {
+        Some(left)
+    }
+}
+
+fn sqlite_check_concat(value: &Value, suffix: &[Value]) -> String {
+    let mut result = String::new();
+    if !matches!(value, Value::Null) {
+        result.push_str(&sqlite_text_like_value(value));
+    }
+    for value in suffix {
+        if !matches!(value, Value::Null) {
+            result.push_str(&sqlite_text_like_value(value));
+        }
+    }
+    result
+}
+
+fn sqlite_check_concat_ws(value: &Value, separator: &str, suffix: &[Value]) -> String {
+    let mut parts = Vec::new();
+    if !matches!(value, Value::Null) {
+        parts.push(sqlite_text_like_value(value));
+    }
+    for value in suffix {
+        if !matches!(value, Value::Null) {
+            parts.push(sqlite_text_like_value(value));
+        }
+    }
+    parts.join(separator)
+}
+
+fn sqlite_check_json_valid(value: &Value, flags: Option<i64>) -> Option<bool> {
+    if matches!(value, Value::Null) {
+        return None;
+    }
+    let json = sqlite_text_like_value(value);
+    Some(if flags.is_some_and(|flags| flags & 0x02 != 0) {
+        serde_json::from_str::<serde_json::Value>(&json).is_ok()
+            || sqlite_json5_to_json(&json)
+                .as_deref()
+                .is_some_and(|json| serde_json::from_str::<serde_json::Value>(json).is_ok())
+    } else {
+        serde_json::from_str::<serde_json::Value>(&json).is_ok()
+    })
+}
+
+fn sqlite_json5_to_json(json: &str) -> Option<String> {
+    let mut out = String::with_capacity(json.len());
+    let mut chars = json.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if ch == '/' {
+            if let Some((_, '/')) = chars.peek().copied() {
+                chars.next();
+                for (_, ch) in chars.by_ref() {
+                    if ch == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+                continue;
+            }
+            if let Some((_, '*')) = chars.peek().copied() {
+                chars.next();
+                let mut prev = '\0';
+                for (_, ch) in chars.by_ref() {
+                    if prev == '*' && ch == '/' {
+                        break;
+                    }
+                    prev = ch;
+                }
+                continue;
+            }
+        }
+
+        if ch == '\'' {
+            out.push('"');
+            let mut escaped = false;
+            for (_, value_ch) in chars.by_ref() {
+                if escaped {
+                    out.push(value_ch);
+                    escaped = false;
+                    continue;
+                }
+                if value_ch == '\\' {
+                    out.push(value_ch);
+                    escaped = true;
+                    continue;
+                }
+                if value_ch == '\'' {
+                    out.push('"');
+                    break;
+                }
+                if value_ch == '"' {
+                    out.push('\\');
+                }
+                out.push(value_ch);
+            }
+            continue;
+        }
+
+        if is_json5_identifier_start(ch) {
+            let start = index;
+            let mut end = index + ch.len_utf8();
+            while let Some((next_index, next_ch)) = chars.peek().copied() {
+                if !is_json5_identifier_continue(next_ch) {
+                    break;
+                }
+                chars.next();
+                end = next_index + next_ch.len_utf8();
+            }
+            let ident = &json[start..end];
+            if json[end..].trim_start().starts_with(':') {
+                out.push('"');
+                out.push_str(ident);
+                out.push('"');
+            } else {
+                out.push_str(ident);
+            }
+            continue;
+        }
+
+        out.push(ch);
+    }
+
+    let normalized = strip_json5_trailing_commas(&out);
+    (normalized != json).then_some(normalized)
+}
+
+fn is_json5_identifier_start(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphabetic()
+}
+
+fn is_json5_identifier_continue(ch: char) -> bool {
+    is_json5_identifier_start(ch) || ch.is_ascii_digit()
+}
+
+fn strip_json5_trailing_commas(json: &str) -> String {
+    let chars = json.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(json.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ',' {
+            let mut next = index + 1;
+            while next < chars.len() && chars[next].is_whitespace() {
+                next += 1;
+            }
+            if next < chars.len() && matches!(chars[next], '}' | ']') {
+                index += 1;
+                continue;
+            }
+        }
+        out.push(ch);
+        index += 1;
+    }
+    out
+}
+
+fn sqlite_hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+fn sqlite_check_abs(value: &Value) -> Option<Value> {
+    match value {
+        Value::Null => None,
+        Value::Integer(value) => value
+            .checked_abs()
+            .map(Value::Integer)
+            .or_else(|| Some(Value::Real((*value as f64).abs()))),
+        Value::Real(value) => Some(Value::Real(value.abs())),
+        Value::Boolean(value) => Some(Value::Integer(if *value { 1 } else { 0 })),
+        Value::Text(value) => Some(Value::Real(sqlite_text_numeric_prefix(value).abs())),
+        Value::Blob(value) => Some(Value::Real(
+            sqlite_text_numeric_prefix(&String::from_utf8_lossy(value)).abs(),
+        )),
+    }
+}
+
+fn sqlite_check_unary_math(value: &Value, func: UnaryMathFunc) -> Option<f64> {
+    let numeric = sqlite_check_math_arg(value)?;
+
+    match func {
+        UnaryMathFunc::Sqrt if numeric < 0.0 => None,
+        UnaryMathFunc::Sqrt => Some(numeric.sqrt()),
+        UnaryMathFunc::Ln if numeric <= 0.0 => None,
+        UnaryMathFunc::Ln => Some(numeric.ln()),
+        UnaryMathFunc::Log10 if numeric <= 0.0 => None,
+        UnaryMathFunc::Log10 => Some(numeric.log10()),
+        UnaryMathFunc::Log2 if numeric <= 0.0 => None,
+        UnaryMathFunc::Log2 => Some(numeric.log2()),
+        UnaryMathFunc::Exp => Some(numeric.exp()),
+        UnaryMathFunc::Sin => Some(numeric.sin()),
+        UnaryMathFunc::Cos => Some(numeric.cos()),
+        UnaryMathFunc::Tan => Some(numeric.tan()),
+        UnaryMathFunc::Sinh => Some(numeric.sinh()),
+        UnaryMathFunc::Cosh => Some(numeric.cosh()),
+        UnaryMathFunc::Tanh => Some(numeric.tanh()),
+        UnaryMathFunc::Atan => Some(numeric.atan()),
+        UnaryMathFunc::Acos if !(-1.0..=1.0).contains(&numeric) => None,
+        UnaryMathFunc::Acos => Some(numeric.acos()),
+        UnaryMathFunc::Asin if !(-1.0..=1.0).contains(&numeric) => None,
+        UnaryMathFunc::Asin => Some(numeric.asin()),
+        UnaryMathFunc::Acosh if numeric < 1.0 => None,
+        UnaryMathFunc::Acosh => Some(numeric.acosh()),
+        UnaryMathFunc::Asinh => Some(numeric.asinh()),
+        UnaryMathFunc::Atanh if numeric <= -1.0 || numeric >= 1.0 => None,
+        UnaryMathFunc::Atanh => Some(numeric.atanh()),
+        UnaryMathFunc::Degrees => Some(numeric.to_degrees()),
+        UnaryMathFunc::Radians => Some(numeric.to_radians()),
+    }
+}
+
+fn sqlite_check_binary_math(
+    column_value: &Value,
+    argument: &Value,
+    func: BinaryMathFunc,
+    column_is_second: bool,
+) -> Option<f64> {
+    let column_value = sqlite_check_math_arg(column_value)?;
+    let argument = sqlite_check_math_arg(argument)?;
+    let (left, right) = if column_is_second {
+        (argument, column_value)
+    } else {
+        (column_value, argument)
+    };
+    let result = match func {
+        BinaryMathFunc::Power => left.powf(right),
+        BinaryMathFunc::Atan2 => left.atan2(right),
+        BinaryMathFunc::Log if left <= 0.0 || right <= 0.0 || left == 1.0 => return None,
+        BinaryMathFunc::Log => right.log(left),
+    };
+    result.is_finite().then_some(result)
+}
+
+fn sqlite_check_math_arg(value: &Value) -> Option<f64> {
+    match value {
+        Value::Null | Value::Blob(_) => None,
+        Value::Boolean(value) => {
+            if *value {
+                Some(1.0)
+            } else {
+                Some(0.0)
+            }
+        }
+        Value::Integer(value) => Some(*value as f64),
+        Value::Real(value) => Some(*value),
+        Value::Text(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            trimmed.parse::<f64>().ok()
+        }
+    }
+}
+
+fn sqlite_check_add(left: &Value, right: &Value) -> Option<Value> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Integer(left), Value::Integer(right)) => left
+            .checked_add(*right)
+            .map(Value::Integer)
+            .or_else(|| Some(Value::Real(*left as f64 + *right as f64))),
+        _ => Some(Value::Real(
+            sqlite_check_numeric_real(left) + sqlite_check_numeric_real(right),
+        )),
+    }
+}
+
+fn sqlite_check_multiply(left: &Value, right: &Value) -> Option<Value> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Integer(left), Value::Integer(right)) => left
+            .checked_mul(*right)
+            .map(Value::Integer)
+            .or_else(|| Some(Value::Real(*left as f64 * *right as f64))),
+        _ => Some(Value::Real(
+            sqlite_check_numeric_real(left) * sqlite_check_numeric_real(right),
+        )),
+    }
+}
+
+fn sqlite_check_divide(left: &Value, right: &Value) -> Option<Value> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (_, Value::Integer(0)) => None,
+        (_, Value::Real(value)) if *value == 0.0 => None,
+        (Value::Integer(left), Value::Integer(right)) => Some(Value::Integer(left / right)),
+        _ => Some(Value::Real(
+            sqlite_check_numeric_real(left) / sqlite_check_numeric_real(right),
+        )),
+    }
+}
+
+fn sqlite_check_modulo(left: &Value, right: &Value) -> Option<Value> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        _ => {
+            let left = sqlite_check_numeric_real(left) as i64;
+            let right = sqlite_check_numeric_real(right) as i64;
+            if right == 0 {
+                None
+            } else {
+                Some(Value::Integer(left % right))
+            }
+        }
+    }
+}
+
+fn sqlite_check_numeric_real(value: &Value) -> f64 {
+    match value {
+        Value::Null => 0.0,
+        Value::Boolean(value) => {
+            if *value {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Value::Integer(value) => *value as f64,
+        Value::Real(value) => *value,
+        Value::Text(value) => sqlite_text_numeric_prefix(value),
+        Value::Blob(value) => sqlite_text_numeric_prefix(&String::from_utf8_lossy(value)),
+    }
+}
+
+fn sqlite_typeof_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Boolean(_) | Value::Integer(_) => "integer",
+        Value::Real(_) => "real",
+        Value::Blob(_) => "blob",
+        Value::Text(_) => "text",
+    }
+}
+
+fn sqlite_check_collated_value(value: &Value, collation: &str) -> Value {
+    match (value, collation.to_ascii_uppercase().as_str()) {
+        (Value::Text(value), "NOCASE") => Value::Text(sqlite_ascii_lower(value)),
+        (Value::Text(value), "RTRIM") => Value::Text(value.trim_end_matches(' ').to_string()),
+        (value, _) => value.clone(),
+    }
+}
+
+fn sqlite_real_to_text(value: f64) -> String {
+    if value == f64::INFINITY {
+        return "Inf".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-Inf".to_string();
+    }
+
+    let rendered = value.to_string();
+    if rendered.contains(['.', 'e', 'E']) {
+        rendered
+    } else {
+        format!("{rendered}.0")
+    }
+}
+
+fn sqlite_real_to_text_for_quote(value: f64) -> String {
+    if value == f64::INFINITY {
+        return "9.0e+999".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-9.0e+999".to_string();
+    }
+
+    let rendered = value.to_string();
+    if rendered.contains(['.', 'e', 'E']) {
+        rendered
+    } else {
+        format!("{rendered}.0")
+    }
+}
+
+fn sqlite_ascii_lower(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_uppercase() {
+                ch.to_ascii_lowercase()
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn sqlite_ascii_upper(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_lowercase() {
+                ch.to_ascii_uppercase()
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn sqlite_trim(value: &str, side: TrimSide, characters: Option<&str>) -> String {
+    let characters = characters.unwrap_or(" ");
+    let matches_trim_char = |ch| characters.chars().any(|candidate| candidate == ch);
+    match side {
+        TrimSide::Both => value.trim_matches(matches_trim_char).to_string(),
+        TrimSide::Start => value.trim_start_matches(matches_trim_char).to_string(),
+        TrimSide::End => value.trim_end_matches(matches_trim_char).to_string(),
+    }
+}
+
+fn sqlite_check_instr(value: &Value, needle: &Value) -> Option<i64> {
+    if matches!(value, Value::Null) || matches!(needle, Value::Null) {
+        return None;
+    }
+    if let (Value::Blob(haystack), Value::Blob(needle)) = (value, needle) {
+        if needle.is_empty() {
+            return Some(1);
+        }
+        return haystack
+            .windows(needle.len())
+            .position(|window| window == needle.as_slice())
+            .map(|index| index as i64 + 1)
+            .or(Some(0));
+    }
+    let haystack = sqlite_text_like_value(value);
+    let needle = sqlite_text_like_value(needle);
+    if needle.is_empty() {
+        return Some(1);
+    }
+    haystack
+        .find(&needle)
+        .map(|byte_index| haystack[..byte_index].chars().count() as i64 + 1)
+        .or(Some(0))
+}
+
+fn sqlite_substr_text(value: &str, start: i64, length: Option<i64>) -> String {
+    if length.is_some_and(|length| length <= 0) {
+        return String::new();
+    }
+    let chars = value.chars().collect::<Vec<_>>();
+    let len = chars.len() as i64;
+    let start_index = if start > 0 {
+        start - 1
+    } else if start < 0 {
+        len + start
+    } else {
+        0
+    };
+    let start_index = start_index.clamp(0, len) as usize;
+    chars
+        .into_iter()
+        .skip(start_index)
+        .take(length.map_or(usize::MAX, |length| length as usize))
+        .collect()
+}
+
+fn sqlite_text_prefix_before_nul(value: &str) -> &str {
+    value.split_once('\0').map_or(value, |(prefix, _)| prefix)
 }
 
 fn sqlite_text_numeric_prefix(value: &str) -> f64 {
@@ -1815,6 +3585,57 @@ fn sqlite_text_numeric_prefix(value: &str) -> f64 {
     }
 }
 
+fn sqlite_text_integer_prefix(value: &str) -> i64 {
+    let numeric = sqlite_text_numeric_prefix(value);
+    if numeric.is_nan() {
+        0
+    } else if numeric >= i64::MAX as f64 {
+        i64::MAX
+    } else if numeric <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        numeric as i64
+    }
+}
+
+fn sqlite_text_real_prefix(value: &str) -> f64 {
+    sqlite_text_numeric_prefix(value)
+}
+
+fn sqlite_text_numeric_value(value: &str) -> Value {
+    let numeric = sqlite_text_numeric_prefix(value);
+    if numeric.is_finite() && numeric.fract() == 0.0 {
+        Value::Integer(numeric as i64)
+    } else {
+        Value::Real(numeric)
+    }
+}
+
+fn sqlite_text_like_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Boolean(value) => {
+            if *value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        Value::Integer(value) => value.to_string(),
+        Value::Real(value) => {
+            if *value == f64::INFINITY {
+                "Inf".to_string()
+            } else if *value == f64::NEG_INFINITY {
+                "-Inf".to_string()
+            } else {
+                value.to_string()
+            }
+        }
+        Value::Blob(value) => String::from_utf8_lossy(value).into_owned(),
+        Value::Text(value) => value.clone(),
+    }
+}
+
 fn matches_glob_pattern(value: &str, pattern: &str) -> bool {
     fn matches_char_class(pattern: &[char], start: usize, ch: char) -> Option<(bool, usize)> {
         let mut index = start + 1;
@@ -1870,6 +3691,106 @@ fn matches_glob_pattern(value: &str, pattern: &str) -> bool {
     let value = value.chars().collect::<Vec<_>>();
     let pattern = pattern.chars().collect::<Vec<_>>();
     inner(&value, &pattern)
+}
+
+fn sqlite_check_regexp(pattern: &str, value: &str) -> Result<bool> {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let value = sqlite_text_prefix_before_nul(value)
+        .chars()
+        .collect::<Vec<_>>();
+    if matches!(pattern.first(), Some('^')) {
+        return regexp_match_here(&pattern, 1, &value, 0);
+    }
+    for index in 0..=value.len() {
+        if regexp_match_here(&pattern, 0, &value, index)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn regexp_match_here(
+    pattern: &[char],
+    p_index: usize,
+    value: &[char],
+    v_index: usize,
+) -> Result<bool> {
+    if p_index == pattern.len() {
+        return Ok(true);
+    }
+    if pattern[p_index] == '$' && p_index + 1 == pattern.len() {
+        return Ok(v_index == value.len());
+    }
+    let (_, next_index) = regexp_atom_matches(pattern, p_index, '\0')?;
+    if next_index < pattern.len() && pattern[next_index] == '*' {
+        return regexp_match_star(pattern, p_index, next_index + 1, value, v_index);
+    }
+    if v_index >= value.len() {
+        return Ok(false);
+    }
+    let (matches, next_index) = regexp_atom_matches(pattern, p_index, value[v_index])?;
+    Ok(matches && regexp_match_here(pattern, next_index, value, v_index + 1)?)
+}
+
+fn regexp_match_star(
+    pattern: &[char],
+    atom_index: usize,
+    rest_index: usize,
+    value: &[char],
+    mut v_index: usize,
+) -> Result<bool> {
+    if regexp_match_here(pattern, rest_index, value, v_index)? {
+        return Ok(true);
+    }
+    while v_index < value.len() {
+        let (matches, _) = regexp_atom_matches(pattern, atom_index, value[v_index])?;
+        if !matches {
+            break;
+        }
+        v_index += 1;
+        if regexp_match_here(pattern, rest_index, value, v_index)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn regexp_atom_matches(pattern: &[char], index: usize, value: char) -> Result<(bool, usize)> {
+    if pattern[index] == '.' {
+        return Ok((true, index + 1));
+    }
+    if pattern[index] != '[' {
+        return Ok((pattern[index] == value, index + 1));
+    }
+
+    let mut cursor = index + 1;
+    let negated = matches!(pattern.get(cursor), Some('^'));
+    if negated {
+        cursor += 1;
+    }
+    let mut matched = false;
+    let mut saw_member = false;
+    while cursor < pattern.len() {
+        if pattern[cursor] == ']' && saw_member {
+            return Ok((matched ^ negated, cursor + 1));
+        }
+        if cursor + 2 < pattern.len() && pattern[cursor + 1] == '-' && pattern[cursor + 2] != ']' {
+            let start = pattern[cursor];
+            let end = pattern[cursor + 2];
+            if start <= value && value <= end {
+                matched = true;
+            }
+            cursor += 3;
+            saw_member = true;
+            continue;
+        }
+        if pattern[cursor] == value {
+            matched = true;
+        }
+        cursor += 1;
+        saw_member = true;
+    }
+    Err(DbError::storage("unclosed '['"))
 }
 
 fn matches_like_pattern(
@@ -1957,6 +3878,64 @@ fn sql_expr_mentions_identifier(expr: &str, identifier: &str) -> bool {
     }
 
     false
+}
+
+fn strict_integer_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Integer(_) => Some(value),
+        Value::Boolean(value) => Some(Value::Integer(i64::from(value))),
+        Value::Real(value) if value.is_finite() && value.fract() == 0.0 => {
+            if value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+                Some(Value::Integer(value as i64))
+            } else {
+                None
+            }
+        }
+        Value::Text(value) => {
+            let trimmed = value.trim();
+            if let Ok(integer) = trimmed.parse::<i64>() {
+                Some(Value::Integer(integer))
+            } else if let Ok(real) = trimmed.parse::<f64>() {
+                if real.is_finite()
+                    && real.fract() == 0.0
+                    && real >= i64::MIN as f64
+                    && real <= i64::MAX as f64
+                {
+                    Some(Value::Integer(real as i64))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn strict_real_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Real(_) => Some(value),
+        Value::Integer(value) => Some(Value::Real(value as f64)),
+        Value::Boolean(value) => Some(Value::Real(if value { 1.0 } else { 0.0 })),
+        Value::Text(value) => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(Value::Real),
+        _ => None,
+    }
+}
+
+fn strict_text_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Text(_) => Some(value),
+        Value::Integer(value) => Some(Value::Text(value.to_string())),
+        Value::Real(value) => Some(Value::Text(value.to_string())),
+        Value::Boolean(value) => Some(Value::Text(if value { "1" } else { "0" }.to_string())),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

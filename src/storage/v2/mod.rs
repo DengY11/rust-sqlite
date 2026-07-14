@@ -933,9 +933,11 @@ impl CatalogStore for FileStorage {
         for (_, bytes) in &rows {
             let mut candidate = decode_row(bytes)?;
             candidate.push(default_value.clone());
+            let candidate = updated_schema.normalize_strict_row_values(candidate)?;
             updated_schema.validate_row_values(&candidate)?;
             updated_schema.validate_check_constraints(&candidate)?;
         }
+        let normalized_schema = updated_schema.clone();
         {
             self.catalog
                 .borrow_mut()
@@ -948,6 +950,7 @@ impl CatalogStore for FileStorage {
         for (row_id, bytes) in rows {
             let mut row = decode_row(&bytes)?;
             row.push(default_value.clone());
+            let row = normalized_schema.normalize_strict_row_values(row)?;
             tree.insert(&mut pager, transaction_id.0, row_id, &encode_row(&row)?)?;
         }
         if tree.root_page_id() != root_page_id {

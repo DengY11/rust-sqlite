@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::common::error::{DbError, Result};
 use crate::common::types::{
     CheckConstraint, CheckExpr, CheckOp, ColumnDef, ColumnDefault, ForeignKey,
-    PrimaryKeyConstraint, Row, RowId, Schema, SortOrder, TableConstraintOrder, Value,
+    PrimaryKeyConstraint, Row, RowId, Schema, SortOrder, TableConstraintOrder, TrimSide, Value,
 };
 use crate::sql::parser::parse_check_constraint_expression;
 
@@ -20,12 +20,22 @@ const SQLITE_VERSION_NUMBER: u32 = 3_046_000;
 pub(crate) struct WritableDatabase {
     pub tables: BTreeMap<String, WritableTable>,
     pub indexes: BTreeMap<String, BTreeMap<String, crate::common::types::IndexMeta>>,
+    pub extra_schema_objects: Vec<WritableSchemaObject>,
     pub sqlite_sequence: BTreeMap<String, u64>,
     pub sqlite_sequence_exists: bool,
     pub contains_without_rowid_tables: bool,
     pub user_version: u32,
     pub application_id: u32,
     pub schema_version: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WritableSchemaObject {
+    pub entry_type: String,
+    pub name: String,
+    pub table_name: String,
+    pub root_page: u32,
+    pub sql: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,8 +74,9 @@ pub(crate) fn write_database(path: &Path, database: &WritableDatabase) -> Result
         .then_some("sqlite_sequence".to_string());
     let table_names = database
         .tables
-        .keys()
-        .cloned()
+        .iter()
+        .filter(|(_, table)| !table.schema.is_view())
+        .map(|(name, _)| name.clone())
         .chain(sqlite_sequence_name.clone())
         .collect::<Vec<_>>();
     let table_root_pages = table_names
@@ -88,9 +99,12 @@ pub(crate) fn write_database(path: &Path, database: &WritableDatabase) -> Result
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
 
-    let reserved_root_pages = database
+    let physical_table_count = database
         .tables
-        .len()
+        .values()
+        .filter(|table| !table.schema.is_view())
+        .count();
+    let reserved_root_pages = physical_table_count
         .checked_add(usize::from(sqlite_sequence_name.is_some()))
         .ok_or_else(|| DbError::storage("sqlite reserved root page count overflow"))?
         .checked_add(index_root_pages.len())
@@ -100,6 +114,9 @@ pub(crate) fn write_database(path: &Path, database: &WritableDatabase) -> Result
     let mut pages = BTreeMap::new();
 
     for (table_name, table) in &database.tables {
+        if table.schema.is_view() {
+            continue;
+        }
         let root_page = table_root_pages
             .get(table_name)
             .copied()
@@ -178,6 +195,9 @@ fn collect_physical_indexes(
         let table = database.tables.get(table_name).ok_or_else(|| {
             DbError::storage(format!("missing table {table_name} for indexed metadata"))
         })?;
+        if table.schema.is_view() {
+            continue;
+        }
         for (index_name, index) in indexes {
             if is_synthesized_without_rowid_primary_key_index(&table.schema, index, table_name) {
                 continue;
@@ -230,12 +250,25 @@ fn build_sqlite_schema_page(
         .map(|(index, (table_name, table))| {
             let row_id = u64::try_from(index + 1)
                 .map_err(|_| DbError::storage("sqlite schema rowid overflow"))?;
-            let root_page = table_root_pages.get(table_name).copied().ok_or_else(|| {
-                DbError::storage(format!("missing root page for table {table_name}"))
-            })?;
-            let create_sql = render_create_table(&table.schema);
+            let root_page = if table.schema.is_view() {
+                0
+            } else {
+                table_root_pages.get(table_name).copied().ok_or_else(|| {
+                    DbError::storage(format!("missing root page for table {table_name}"))
+                })?
+            };
+            let object_type = if table.schema.is_view() {
+                "view"
+            } else {
+                "table"
+            };
+            let create_sql = table
+                .schema
+                .create_sql
+                .clone()
+                .unwrap_or_else(|| render_create_table(&table.schema));
             let payload = encode_record(&[
-                Value::from("table"),
+                Value::from(object_type),
                 Value::Text(table_name.clone()),
                 Value::Text(table_name.clone()),
                 Value::Integer(i64::from(root_page)),
@@ -275,6 +308,19 @@ fn build_sqlite_schema_page(
         })
         .collect::<Result<Vec<_>>>()?;
     cells.extend(index_cells);
+
+    for object in &database.extra_schema_objects {
+        let row_id = u64::try_from(cells.len() + 1)
+            .map_err(|_| DbError::storage("sqlite schema rowid overflow"))?;
+        let payload = encode_record(&[
+            Value::Text(object.entry_type.clone()),
+            Value::Text(object.name.clone()),
+            Value::Text(object.table_name.clone()),
+            Value::Integer(i64::from(object.root_page)),
+            object.sql.clone().map_or(Value::Null, Value::Text),
+        ])?;
+        cells.push((row_id, payload));
+    }
 
     if database.sqlite_sequence_exists {
         let row_id = u64::try_from(cells.len() + 1)
@@ -1485,10 +1531,9 @@ fn render_create_index(table: &str, index: &crate::common::types::IndexMeta) -> 
 }
 
 fn render_column_def(schema: &Schema, column: &ColumnDef) -> String {
-    let mut rendered = if matches!(column.column_type, crate::common::types::ColumnType::Any) {
-        column.name.clone()
-    } else {
-        format!("{} {}", column.name, column.column_type.name())
+    let mut rendered = match column.pragma_declared_type() {
+        "" => column.name.clone(),
+        declared_type => format!("{} {}", column.name, declared_type),
     };
     if let Some(collation) = &column.collation {
         rendered.push_str(" COLLATE ");
@@ -1710,6 +1755,17 @@ fn render_check_expr(expr: &CheckExpr) -> String {
                 render_literal(&Value::from(pattern.as_str()))
             )
         }
+        CheckExpr::Regexp {
+            column,
+            pattern,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!(
+                "{column} {not}REGEXP {}",
+                render_literal(&Value::from(pattern.as_str()))
+            )
+        }
         CheckExpr::Like {
             column,
             pattern,
@@ -1771,6 +1827,387 @@ fn render_check_expr(expr: &CheckExpr) -> String {
         } => {
             let not = if *negated { "" } else { "NOT " };
             format!("{column} IS {not}DISTINCT FROM {}", render_literal(value))
+        }
+        CheckExpr::LengthCompare { column, op, value } => {
+            format!(
+                "length({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::OctetLengthCompare { column, op, value } => {
+            format!(
+                "octet_length({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::UnicodeCompare { column, op, value } => {
+            format!(
+                "unicode({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::UnicodeIsNull { column, negated } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("unicode({column}) IS {not}NULL")
+        }
+        CheckExpr::SignCompare { column, op, value } => {
+            format!(
+                "sign({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::HexCompare { column, op, value } => {
+            format!(
+                "hex({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::QuoteCompare { column, op, value } => {
+            format!(
+                "quote({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::NullIfIsNull {
+            column,
+            value,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("nullif({column}, {}) IS {not}NULL", render_literal(value))
+        }
+        CheckExpr::ReplaceCompare {
+            column,
+            pattern,
+            replacement,
+            op,
+            value,
+        } => {
+            format!(
+                "replace({column}, {}, {}) {} {}",
+                render_literal(&Value::from(pattern.as_str())),
+                render_literal(&Value::from(replacement.as_str())),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::ReplaceColumnCompare {
+            column,
+            pattern,
+            replacement,
+            op,
+        } => {
+            format!(
+                "replace({column}, {}, {}) {} {column}",
+                render_literal(&Value::from(pattern.as_str())),
+                render_literal(&Value::from(replacement.as_str())),
+                render_check_op(*op)
+            )
+        }
+        CheckExpr::RoundCompare {
+            column,
+            precision,
+            op,
+            value,
+        } => {
+            let args = precision
+                .map(|precision| format!(", {precision}"))
+                .unwrap_or_default();
+            format!(
+                "round({column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::RoundingCompare {
+            column,
+            func,
+            op,
+            value,
+        } => {
+            format!(
+                "{}({column}) {} {}",
+                func.sql_name(),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::CastCompare {
+            column,
+            target_type,
+            op,
+            value,
+        } => {
+            format!(
+                "CAST({column} AS {}) {} {}",
+                target_type.name(),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::MinMaxColumnCompare {
+            column,
+            limit,
+            min,
+            op,
+        } => {
+            let func = if *min { "min" } else { "max" };
+            format!(
+                "{func}({column}, {}) {} {column}",
+                render_literal(limit),
+                render_check_op(*op)
+            )
+        }
+        CheckExpr::ConcatCompare {
+            column,
+            suffix,
+            op,
+            value,
+        } => {
+            let args = suffix
+                .iter()
+                .map(|value| format!(", {}", render_literal(value)))
+                .collect::<String>();
+            format!(
+                "concat({column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::ConcatWsCompare {
+            column,
+            separator,
+            suffix,
+            op,
+            value,
+        } => {
+            let separator = separator
+                .as_ref()
+                .map(|separator| render_literal(&Value::from(separator.as_str())))
+                .unwrap_or_else(|| render_literal(&Value::Null));
+            let args = suffix
+                .iter()
+                .map(|value| format!(", {}", render_literal(value)))
+                .collect::<String>();
+            format!(
+                "concat_ws({separator}, {column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::JsonValidCompare {
+            column,
+            flags,
+            compare,
+        } => {
+            let args = flags.map(|flags| format!(", {flags}")).unwrap_or_default();
+            let expr = format!("json_valid({column}{args})");
+            if let Some((op, value)) = compare {
+                format!("{expr} {} {}", render_check_op(*op), render_literal(value))
+            } else {
+                expr
+            }
+        }
+        CheckExpr::AbsCompare { column, op, value } => {
+            format!(
+                "abs({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::UnaryMathCompare {
+            column,
+            func,
+            op,
+            value,
+        } => {
+            format!(
+                "{}({column}) {} {}",
+                func.sql_name(),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::BinaryMathCompare {
+            column,
+            func,
+            argument,
+            column_is_second,
+            op,
+            value,
+        } => {
+            let rendered_argument = render_literal(argument);
+            let args = if *column_is_second {
+                format!("{rendered_argument}, {column}")
+            } else {
+                format!("{column}, {rendered_argument}")
+            };
+            format!(
+                "{}({args}) {} {}",
+                func.sql_name(),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::ArithmeticCompare {
+            column,
+            addend,
+            op,
+            value,
+        } => {
+            format!(
+                "({column} + {}) {} {}",
+                render_literal(addend),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::MultiplyCompare {
+            column,
+            factor,
+            op,
+            value,
+        } => {
+            format!(
+                "({column} * {}) {} {}",
+                render_literal(factor),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::DivideCompare {
+            column,
+            divisor,
+            op,
+            value,
+        } => {
+            format!(
+                "({column} / {}) {} {}",
+                render_literal(divisor),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::ModuloCompare {
+            column,
+            divisor,
+            op,
+            value,
+            function_form,
+        } => {
+            let expr = if *function_form {
+                format!("mod({column}, {})", render_literal(divisor))
+            } else {
+                format!("({column} % {})", render_literal(divisor))
+            };
+            format!("{expr} {} {}", render_check_op(*op), render_literal(value))
+        }
+        CheckExpr::TypeOfCompare { column, op, value } => {
+            format!(
+                "typeof({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::NoCaseCompare {
+            column,
+            collation,
+            op,
+            value,
+        } => {
+            format!(
+                "{column} COLLATE {collation} {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::CaseFoldCompare {
+            column,
+            upper,
+            op,
+            value,
+        } => {
+            let func = if *upper { "upper" } else { "lower" };
+            format!(
+                "{func}({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::TrimCompare {
+            column,
+            side,
+            characters,
+            op,
+            value,
+        } => {
+            let func = match side {
+                TrimSide::Both => "trim",
+                TrimSide::Start => "ltrim",
+                TrimSide::End => "rtrim",
+            };
+            let args = characters
+                .as_ref()
+                .map(|characters| {
+                    format!(", {}", render_literal(&Value::from(characters.as_str())))
+                })
+                .unwrap_or_default();
+            format!(
+                "{func}({column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::CoalesceCompare {
+            column,
+            fallbacks,
+            op,
+            value,
+        } => {
+            let args = fallbacks
+                .iter()
+                .map(|fallback| format!(", {}", render_literal(fallback)))
+                .collect::<String>();
+            format!(
+                "coalesce({column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::InstrCompare {
+            column,
+            needle,
+            op,
+            value,
+        } => {
+            format!(
+                "instr({column}, {}) {} {}",
+                render_literal(needle),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::SubstrCompare {
+            column,
+            start,
+            length,
+            op,
+            value,
+        } => {
+            let length = length
+                .map(|length| format!(", {length}"))
+                .unwrap_or_default();
+            format!(
+                "substr({column}, {start}{length}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
         }
         CheckExpr::And(left, right) => {
             format!(

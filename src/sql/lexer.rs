@@ -61,6 +61,8 @@ pub enum TokenKind {
     Or,
     Like,
     Glob,
+    Regexp,
+    Match,
     Escape,
     Between,
     Begin,
@@ -74,6 +76,8 @@ pub enum TokenKind {
     Serializable,
     Commit,
     Rollback,
+    Savepoint,
+    Release,
     Case,
     When,
     Then,
@@ -414,12 +418,12 @@ impl<'a> Lexer<'a> {
             }
             let text = &self.input[hex_start..self.offset];
             let normalized = text.replace('_', "");
-            let value = i64::from_str_radix(&normalized, 16).map_err(|error| {
+            let value = u64::from_str_radix(&normalized, 16).map_err(|error| {
                 DbError::sql(format!(
                     "invalid hexadecimal integer literal '0x{text}': {error}"
                 ))
             })?;
-            return Ok(TokenKind::Integer(value));
+            return Ok(TokenKind::Integer(value as i64));
         }
         while matches!(self.peek(), Some('0'..='9' | '_')) {
             self.advance_char();
@@ -459,10 +463,16 @@ impl<'a> Lexer<'a> {
                 .map_err(|error| DbError::sql(format!("invalid real literal '{text}': {error}")))?;
             Ok(TokenKind::Real(value))
         } else {
-            let value = text.replace('_', "").parse::<i64>().map_err(|error| {
-                DbError::sql(format!("invalid integer literal '{text}': {error}"))
-            })?;
-            Ok(TokenKind::Integer(value))
+            let normalized = text.replace('_', "");
+            match normalized.parse::<i64>() {
+                Ok(value) => Ok(TokenKind::Integer(value)),
+                Err(_) => {
+                    let value = normalized.parse::<f64>().map_err(|error| {
+                        DbError::sql(format!("invalid integer literal '{text}': {error}"))
+                    })?;
+                    Ok(TokenKind::Real(value))
+                }
+            }
         }
     }
 
@@ -553,6 +563,8 @@ impl<'a> Lexer<'a> {
             "OR" => TokenKind::Or,
             "LIKE" => TokenKind::Like,
             "GLOB" => TokenKind::Glob,
+            "REGEXP" => TokenKind::Regexp,
+            "MATCH" => TokenKind::Match,
             "ESCAPE" => TokenKind::Escape,
             "BETWEEN" => TokenKind::Between,
             "BEGIN" => TokenKind::Begin,
@@ -566,6 +578,8 @@ impl<'a> Lexer<'a> {
             "SERIALIZABLE" => TokenKind::Serializable,
             "COMMIT" => TokenKind::Commit,
             "ROLLBACK" => TokenKind::Rollback,
+            "SAVEPOINT" => TokenKind::Savepoint,
+            "RELEASE" => TokenKind::Release,
             "CASE" => TokenKind::Case,
             "WHEN" => TokenKind::When,
             "THEN" => TokenKind::Then,

@@ -145,11 +145,21 @@ impl IndexSelectionPass {
                 escape: None,
                 negated,
                 ..
-            } => !negated && Self::prefix_like_bounds(pattern).is_some(),
+            } => {
+                !negated
+                    && Self::literal_text_pattern(pattern)
+                        .and_then(Self::prefix_like_bounds)
+                        .is_some()
+            }
             Expr::LikeScalar { .. } => false,
             Expr::GlobScalar {
                 pattern, negated, ..
-            } => !negated && Self::prefix_glob_bounds(pattern).is_some(),
+            } => {
+                !negated
+                    && Self::literal_text_pattern(pattern)
+                        .and_then(Self::prefix_glob_bounds)
+                        .is_some()
+            }
             Expr::BetweenScalar { negated, .. } => !negated,
             Expr::InListScalar {
                 expr,
@@ -174,7 +184,12 @@ impl IndexSelectionPass {
             Expr::Between { negated, .. } => !negated,
             Expr::Glob {
                 pattern, negated, ..
-            } => !negated && Self::prefix_glob_bounds(pattern).is_some(),
+            } => {
+                !negated
+                    && Self::literal_text_pattern(pattern)
+                        .and_then(Self::prefix_glob_bounds)
+                        .is_some()
+            }
             Expr::InList { negated, .. } => !negated,
             Expr::Like { .. } => false,
             Expr::CompareColumns { .. }
@@ -672,12 +687,44 @@ impl IndexSelectionPass {
                 negated: true,
             } => summary.non_null_terms.contains(column),
             CheckExpr::Glob { .. }
+            | CheckExpr::Regexp { .. }
             | CheckExpr::Like { .. }
             | CheckExpr::InList { .. }
             | CheckExpr::Between { .. }
             | CheckExpr::IsBool { .. }
             | CheckExpr::Truthy { .. }
-            | CheckExpr::IsDistinct { .. } => false,
+            | CheckExpr::IsDistinct { .. }
+            | CheckExpr::LengthCompare { .. }
+            | CheckExpr::OctetLengthCompare { .. }
+            | CheckExpr::UnicodeCompare { .. }
+            | CheckExpr::UnicodeIsNull { .. }
+            | CheckExpr::SignCompare { .. }
+            | CheckExpr::HexCompare { .. }
+            | CheckExpr::QuoteCompare { .. }
+            | CheckExpr::NullIfIsNull { .. }
+            | CheckExpr::ReplaceCompare { .. }
+            | CheckExpr::ReplaceColumnCompare { .. }
+            | CheckExpr::RoundCompare { .. }
+            | CheckExpr::RoundingCompare { .. }
+            | CheckExpr::CastCompare { .. }
+            | CheckExpr::MinMaxColumnCompare { .. }
+            | CheckExpr::ConcatCompare { .. }
+            | CheckExpr::ConcatWsCompare { .. }
+            | CheckExpr::JsonValidCompare { .. }
+            | CheckExpr::AbsCompare { .. }
+            | CheckExpr::UnaryMathCompare { .. }
+            | CheckExpr::BinaryMathCompare { .. }
+            | CheckExpr::ArithmeticCompare { .. }
+            | CheckExpr::MultiplyCompare { .. }
+            | CheckExpr::DivideCompare { .. }
+            | CheckExpr::ModuloCompare { .. }
+            | CheckExpr::TypeOfCompare { .. }
+            | CheckExpr::NoCaseCompare { .. }
+            | CheckExpr::CaseFoldCompare { .. }
+            | CheckExpr::TrimCompare { .. }
+            | CheckExpr::CoalesceCompare { .. }
+            | CheckExpr::InstrCompare { .. }
+            | CheckExpr::SubstrCompare { .. } => false,
             CheckExpr::And(left, right) => {
                 self.partial_check_expr_matches(left, summary)
                     && self.partial_check_expr_matches(right, summary)
@@ -791,7 +838,9 @@ impl IndexSelectionPass {
                 escape: None,
                 negated: false,
             } => {
-                let Some((lower, upper)) = Self::prefix_like_bounds(pattern) else {
+                let Some((lower, upper)) =
+                    Self::literal_text_pattern(pattern).and_then(Self::prefix_like_bounds)
+                else {
                     return false;
                 };
                 let entry = summary
@@ -809,7 +858,9 @@ impl IndexSelectionPass {
                 pattern,
                 negated: false,
             } => {
-                let Some((lower, upper)) = Self::prefix_glob_bounds(pattern) else {
+                let Some((lower, upper)) =
+                    Self::literal_text_pattern(pattern).and_then(Self::prefix_glob_bounds)
+                else {
                     return false;
                 };
                 let entry = summary.range_terms.entry(column.clone()).or_default();
@@ -822,7 +873,9 @@ impl IndexSelectionPass {
                 pattern,
                 negated: false,
             } => {
-                let Some((lower, upper)) = Self::prefix_glob_bounds(pattern) else {
+                let Some((lower, upper)) =
+                    Self::literal_text_pattern(pattern).and_then(Self::prefix_glob_bounds)
+                else {
                     return false;
                 };
                 let entry = summary
@@ -1013,6 +1066,13 @@ impl IndexSelectionPass {
         }
     }
 
+    fn literal_text_pattern(pattern: &ScalarExpr) -> Option<&str> {
+        match pattern {
+            ScalarExpr::Literal(Value::Text(value)) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
     fn value_to_literal_expr(value: Value) -> ScalarExpr {
         ScalarExpr::Literal(value)
     }
@@ -1028,6 +1088,7 @@ impl IndexSelectionPass {
         match expr {
             ScalarExpr::Literal(value) => value.to_string(),
             ScalarExpr::Column(name) => name.clone(),
+            ScalarExpr::UnaryPlus(expr) => format!("+{}", Self::scalar_expr_key(expr)),
             ScalarExpr::UnaryMinus(expr) => format!("-{}", Self::scalar_expr_key(expr)),
             ScalarExpr::BitNot(expr) => format!("~{}", Self::scalar_expr_key(expr)),
             ScalarExpr::Not(expr) => format!("NOT {}", Self::scalar_expr_key(expr)),
@@ -1087,13 +1148,13 @@ impl IndexSelectionPass {
                 escape,
                 negated,
             } => format!(
-                "{} {}LIKE '{}'{}",
+                "{} {}LIKE {}{}",
                 Self::scalar_expr_key(expr),
                 if *negated { "NOT " } else { "" },
-                pattern,
+                Self::scalar_expr_key(pattern),
                 escape
                     .as_ref()
-                    .map(|escape| format!(" ESCAPE '{}'", escape.replace('\'', "''")))
+                    .map(|escape| format!(" ESCAPE {}", Self::scalar_expr_key(escape)))
                     .unwrap_or_default()
             ),
             ScalarExpr::Glob {
@@ -1101,10 +1162,10 @@ impl IndexSelectionPass {
                 pattern,
                 negated,
             } => format!(
-                "{} {}GLOB '{}'",
+                "{} {}GLOB {}",
                 Self::scalar_expr_key(expr),
                 if *negated { "NOT " } else { "" },
-                pattern
+                Self::scalar_expr_key(pattern)
             ),
             ScalarExpr::Between {
                 expr,
@@ -1215,6 +1276,7 @@ impl IndexSelectionPass {
                     ScalarFunc::SqliteVersion => "SQLITE_VERSION",
                     ScalarFunc::SqliteCompileOptionUsed => "SQLITE_COMPILEOPTION_USED",
                     ScalarFunc::SqliteCompileOptionGet => "SQLITE_COMPILEOPTION_GET",
+                    ScalarFunc::SqliteLog => "SQLITE_LOG",
                     ScalarFunc::Likely => "LIKELY",
                     ScalarFunc::Unlikely => "UNLIKELY",
                     ScalarFunc::Likelihood => "LIKELIHOOD",
@@ -1256,6 +1318,8 @@ impl IndexSelectionPass {
                     ScalarFunc::Replace => "REPLACE",
                     ScalarFunc::LikeFunc => "LIKE",
                     ScalarFunc::GlobFunc => "GLOB",
+                    ScalarFunc::RegexpFunc => "REGEXP",
+                    ScalarFunc::MatchFunc => "MATCH",
                     ScalarFunc::Quote => "QUOTE",
                     ScalarFunc::Unicode => "UNICODE",
                     ScalarFunc::Trim => "TRIM",
@@ -1269,27 +1333,38 @@ impl IndexSelectionPass {
                     ScalarFunc::Coalesce => "COALESCE",
                     ScalarFunc::IfNull => "IFNULL",
                     ScalarFunc::NullIf => "NULLIF",
+                    ScalarFunc::Unknown => "UNKNOWN",
                     ScalarFunc::Json => "JSON",
+                    ScalarFunc::Jsonb => "JSONB",
                     ScalarFunc::JsonValid => "JSON_VALID",
                     ScalarFunc::JsonErrorPosition => "JSON_ERROR_POSITION",
                     ScalarFunc::JsonPretty => "JSON_PRETTY",
                     ScalarFunc::JsonQuote => "JSON_QUOTE",
                     ScalarFunc::JsonExtract => "JSON_EXTRACT",
+                    ScalarFunc::JsonbExtract => "JSONB_EXTRACT",
                     ScalarFunc::JsonType => "JSON_TYPE",
                     ScalarFunc::JsonArray => "JSON_ARRAY",
+                    ScalarFunc::JsonbArray => "JSONB_ARRAY",
                     ScalarFunc::JsonObject => "JSON_OBJECT",
+                    ScalarFunc::JsonbObject => "JSONB_OBJECT",
                     ScalarFunc::JsonArrayLength => "JSON_ARRAY_LENGTH",
                     ScalarFunc::JsonRemove => "JSON_REMOVE",
+                    ScalarFunc::JsonbRemove => "JSONB_REMOVE",
                     ScalarFunc::JsonSet => "JSON_SET",
+                    ScalarFunc::JsonbSet => "JSONB_SET",
                     ScalarFunc::JsonInsert => "JSON_INSERT",
+                    ScalarFunc::JsonbInsert => "JSONB_INSERT",
                     ScalarFunc::JsonReplace => "JSON_REPLACE",
+                    ScalarFunc::JsonbReplace => "JSONB_REPLACE",
                     ScalarFunc::JsonPatch => "JSON_PATCH",
+                    ScalarFunc::JsonbPatch => "JSONB_PATCH",
                 },
                 args.iter()
                     .map(Self::scalar_expr_key)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            ScalarExpr::WindowFunction { .. } => "ROW_NUMBER()".to_string(),
             ScalarExpr::Aggregate { func, arg, .. } => Self::aggregate_expr_key(*func, arg),
             ScalarExpr::Tuple(values) => format!(
                 "({})",
@@ -1308,6 +1383,7 @@ impl IndexSelectionPass {
             match func {
                 AggregateFunc::Count => "COUNT",
                 AggregateFunc::Sum => "SUM",
+                AggregateFunc::DecimalSum => "DECIMAL_SUM",
                 AggregateFunc::Avg => "AVG",
                 AggregateFunc::Total => "TOTAL",
                 AggregateFunc::Median => "MEDIAN",
@@ -1316,7 +1392,9 @@ impl IndexSelectionPass {
                 AggregateFunc::PercentileDisc => "PERCENTILE_DISC",
                 AggregateFunc::GroupConcat => "GROUP_CONCAT",
                 AggregateFunc::JsonGroupArray => "JSON_GROUP_ARRAY",
+                AggregateFunc::JsonbGroupArray => "JSONB_GROUP_ARRAY",
                 AggregateFunc::JsonGroupObject => "JSON_GROUP_OBJECT",
+                AggregateFunc::JsonbGroupObject => "JSONB_GROUP_OBJECT",
                 AggregateFunc::Min => "MIN",
                 AggregateFunc::Max => "MAX",
             },

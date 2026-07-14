@@ -9,15 +9,18 @@ pub(crate) const SINGLE_ROW_SOURCE_TABLE: &str = "__rustsql_single_row__";
 pub enum FromItem {
     Table {
         name: String,
+        schema: Option<String>,
         alias: Option<String>,
     },
     TableIndexed {
         name: String,
+        schema: Option<String>,
         alias: Option<String>,
         index: String,
     },
     TableNotIndexed {
         name: String,
+        schema: Option<String>,
         alias: Option<String>,
     },
     Subquery {
@@ -29,6 +32,11 @@ pub enum FromItem {
         rows: Vec<Vec<ScalarExpr>>,
         alias: Option<String>,
         columns: Option<Vec<String>>,
+    },
+    PragmaTableFunction {
+        name: String,
+        argument: Option<String>,
+        alias: Option<String>,
     },
 }
 
@@ -88,14 +96,24 @@ pub enum CteBody {
     Values(Vec<Vec<ScalarExpr>>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableIndexHint {
+    IndexedBy(String),
+    NotIndexed,
+}
+
 impl SelectStatement {
     #[must_use]
     pub fn base_table(&self) -> Option<(&str, Option<&str>)> {
         match &self.from {
-            FromItem::Table { name, alias }
+            FromItem::Table { name, alias, .. }
             | FromItem::TableIndexed { name, alias, .. }
-            | FromItem::TableNotIndexed { name, alias } => Some((name.as_str(), alias.as_deref())),
-            FromItem::Subquery { .. } | FromItem::Values { .. } => None,
+            | FromItem::TableNotIndexed { name, alias, .. } => {
+                Some((name.as_str(), alias.as_deref()))
+            }
+            FromItem::Subquery { .. }
+            | FromItem::Values { .. }
+            | FromItem::PragmaTableFunction { .. } => None,
         }
     }
 }
@@ -163,6 +181,7 @@ pub enum AlterTableAction {
 pub enum AggregateFunc {
     Count,
     Sum,
+    DecimalSum,
     Avg,
     Total,
     Median,
@@ -171,7 +190,9 @@ pub enum AggregateFunc {
     PercentileDisc,
     GroupConcat,
     JsonGroupArray,
+    JsonbGroupArray,
     JsonGroupObject,
+    JsonbGroupObject,
     Min,
     Max,
 }
@@ -216,14 +237,31 @@ pub enum Statement {
         strict: bool,
         without_rowid: bool,
         if_not_exists: bool,
+        temporary: bool,
     },
     CreateTableAs {
         name: String,
         if_not_exists: bool,
         select: SelectStatement,
+        temporary: bool,
+    },
+    CreateTableAsValues {
+        name: String,
+        if_not_exists: bool,
+        with: Option<WithClause>,
+        rows: Vec<Vec<ScalarExpr>>,
+        temporary: bool,
+    },
+    CreateView {
+        name: String,
+        columns: Option<Vec<String>>,
+        if_not_exists: bool,
+        select: SelectStatement,
+        temporary: bool,
     },
     CreateIndex {
         name: String,
+        schema: Option<String>,
         table: String,
         columns: Vec<String>,
         decorated_columns: Option<Vec<String>>,
@@ -231,16 +269,36 @@ pub enum Statement {
         predicate: Option<String>,
         if_not_exists: bool,
     },
+    CreateTrigger {
+        name: String,
+        schema: Option<String>,
+        table: String,
+        sql: String,
+        if_not_exists: bool,
+    },
     DropTable {
         name: String,
+        schema: Option<String>,
+        if_exists: bool,
+    },
+    DropView {
+        name: String,
+        schema: Option<String>,
         if_exists: bool,
     },
     DropIndex {
         name: String,
+        schema: Option<String>,
+        if_exists: bool,
+    },
+    DropTrigger {
+        name: String,
+        schema: Option<String>,
         if_exists: bool,
     },
     AlterTable {
         table: String,
+        schema: Option<String>,
         action: AlterTableAction,
     },
     Insert {
@@ -440,12 +498,16 @@ pub enum Statement {
     },
     Delete {
         table: String,
+        schema: Option<String>,
         table_alias: Option<String>,
+        index_hint: Option<TableIndexHint>,
         filter: Option<Expr>,
     },
     DeleteLimited {
         table: String,
+        schema: Option<String>,
         table_alias: Option<String>,
+        index_hint: Option<TableIndexHint>,
         filter: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
@@ -453,13 +515,17 @@ pub enum Statement {
     },
     DeleteReturning {
         table: String,
+        schema: Option<String>,
         table_alias: Option<String>,
+        index_hint: Option<TableIndexHint>,
         filter: Option<Expr>,
         returning: Vec<SelectItem>,
     },
     DeleteReturningLimited {
         table: String,
+        schema: Option<String>,
         table_alias: Option<String>,
+        index_hint: Option<TableIndexHint>,
         filter: Option<Expr>,
         returning: Vec<SelectItem>,
         order_by: Vec<OrderBy>,
@@ -468,14 +534,22 @@ pub enum Statement {
     },
     Update {
         table: String,
+        schema: Option<String>,
         table_alias: Option<String>,
+        index_hint: Option<TableIndexHint>,
+        or_conflict: Option<String>,
         assignments: Vec<Assignment>,
+        from: Option<FromItem>,
         filter: Option<Expr>,
     },
     UpdateLimited {
         table: String,
+        schema: Option<String>,
         table_alias: Option<String>,
+        index_hint: Option<TableIndexHint>,
+        or_conflict: Option<String>,
         assignments: Vec<Assignment>,
+        from: Option<FromItem>,
         filter: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
@@ -483,15 +557,23 @@ pub enum Statement {
     },
     UpdateReturning {
         table: String,
+        schema: Option<String>,
         table_alias: Option<String>,
+        index_hint: Option<TableIndexHint>,
+        or_conflict: Option<String>,
         assignments: Vec<Assignment>,
+        from: Option<FromItem>,
         filter: Option<Expr>,
         returning: Vec<SelectItem>,
     },
     UpdateReturningLimited {
         table: String,
+        schema: Option<String>,
         table_alias: Option<String>,
+        index_hint: Option<TableIndexHint>,
+        or_conflict: Option<String>,
         assignments: Vec<Assignment>,
+        from: Option<FromItem>,
         filter: Option<Expr>,
         returning: Vec<SelectItem>,
         order_by: Vec<OrderBy>,
@@ -510,9 +592,11 @@ pub enum Statement {
     Vacuum,
     PragmaTableInfo {
         table: String,
+        schema: Option<String>,
     },
     PragmaTableXInfo {
         table: String,
+        schema: Option<String>,
     },
     PragmaTableList {
         table: Option<String>,
@@ -520,21 +604,30 @@ pub enum Statement {
     },
     PragmaIndexList {
         table: String,
+        schema: Option<String>,
     },
     PragmaIndexInfo {
         index: String,
+        schema: Option<String>,
     },
     PragmaIndexXInfo {
         index: String,
+        schema: Option<String>,
     },
     PragmaForeignKeyList {
         table: String,
+        schema: Option<String>,
     },
     PragmaForeignKeyCheck {
         table: Option<String>,
+        schema: Option<String>,
     },
     PragmaForeignKeys,
     SetPragmaForeignKeys {
+        enabled: bool,
+    },
+    PragmaDeferForeignKeys,
+    SetPragmaDeferForeignKeys {
         enabled: bool,
     },
     PragmaReadUncommitted,
@@ -543,6 +636,10 @@ pub enum Statement {
     },
     PragmaQueryOnly,
     SetPragmaQueryOnly {
+        enabled: bool,
+    },
+    PragmaCountChanges,
+    SetPragmaCountChanges {
         enabled: bool,
     },
     PragmaRecursiveTriggers,
@@ -558,27 +655,123 @@ pub enum Statement {
         enabled: bool,
     },
     PragmaEncoding,
+    SetPragmaEncoding,
     PragmaCollationList,
     PragmaDataVersion,
     PragmaQuickCheck,
     PragmaIntegrityCheck,
     PragmaFunctionList,
     PragmaCompileOptions,
-    PragmaJournalMode,
-    PragmaSynchronous,
-    PragmaCacheSize,
+    PragmaPragmaList,
+    PragmaModuleList,
+    PragmaStats,
+    PragmaJournalMode {
+        schema: Option<String>,
+    },
+    SetPragmaJournalMode {
+        mode: String,
+        schema: Option<String>,
+    },
+    PragmaSynchronous {
+        schema: Option<String>,
+    },
+    SetPragmaSynchronous {
+        value: i64,
+        schema: Option<String>,
+    },
+    PragmaCacheSize {
+        schema: Option<String>,
+    },
     SetPragmaCacheSize {
         value: i64,
+        schema: Option<String>,
+    },
+    PragmaCacheSpill,
+    SetPragmaCacheSpill {
+        value: Option<i64>,
     },
     PragmaTempStore,
-    PragmaLockingMode,
+    SetPragmaTempStore {
+        value: i64,
+    },
+    PragmaLockingMode {
+        schema: Option<String>,
+    },
+    SetPragmaLockingMode {
+        mode: String,
+        schema: Option<String>,
+    },
+    PragmaMmapSize,
+    SetPragmaMmapSize {
+        value: i64,
+    },
+    PragmaAutoVacuum,
+    SetPragmaAutoVacuum {
+        value: Option<i64>,
+    },
+    PragmaSecureDelete {
+        schema: Option<String>,
+    },
+    SetPragmaSecureDelete {
+        value: Option<i64>,
+        schema: Option<String>,
+    },
+    PragmaWalAutocheckpoint,
+    SetPragmaWalAutocheckpoint {
+        value: Option<i64>,
+    },
+    PragmaWalCheckpoint,
     PragmaBusyTimeout,
     SetPragmaBusyTimeout {
         value: i64,
     },
+    PragmaAnalysisLimit,
+    SetPragmaAnalysisLimit {
+        value: Option<u32>,
+    },
+    PragmaJournalSizeLimit,
+    SetPragmaJournalSizeLimit {
+        value: i64,
+    },
+    PragmaSoftHeapLimit,
+    SetPragmaSoftHeapLimit {
+        value: i64,
+    },
+    PragmaHardHeapLimit,
+    SetPragmaHardHeapLimit {
+        value: i64,
+    },
     PragmaThreads,
     SetPragmaThreads {
-        value: u32,
+        value: Option<u32>,
+    },
+    PragmaAutomaticIndex,
+    SetPragmaAutomaticIndex {
+        enabled: bool,
+    },
+    PragmaCellSizeCheck,
+    SetPragmaCellSizeCheck {
+        enabled: bool,
+    },
+    PragmaFullColumnNames,
+    SetPragmaFullColumnNames {
+        enabled: bool,
+    },
+    PragmaShortColumnNames,
+    SetPragmaShortColumnNames {
+        enabled: bool,
+    },
+    PragmaFullFsync,
+    SetPragmaFullFsync {
+        enabled: bool,
+    },
+    PragmaCheckpointFullFsync,
+    SetPragmaCheckpointFullFsync {
+        enabled: bool,
+    },
+    PragmaEmptyResultCallbacks,
+    SetPragmaEmptyResultCallbacks {
+        enabled: bool,
     },
     PragmaCaseSensitiveLike,
     SetPragmaCaseSensitiveLike {
@@ -589,27 +782,61 @@ pub enum Statement {
         enabled: bool,
     },
     PragmaOptimize,
+    PragmaShrinkMemory,
+    PragmaIncrementalVacuum,
     PragmaDatabaseList,
-    PragmaPageSize,
-    PragmaPageCount,
-    PragmaFreelistCount,
-    PragmaUserVersion,
+    PragmaPageSize {
+        schema: Option<String>,
+    },
+    SetPragmaPageSize {
+        value: u32,
+        schema: Option<String>,
+    },
+    PragmaPageCount {
+        schema: Option<String>,
+    },
+    PragmaMaxPageCount,
+    SetPragmaMaxPageCount {
+        value: Option<i64>,
+    },
+    PragmaFreelistCount {
+        schema: Option<String>,
+    },
+    PragmaUserVersion {
+        schema: Option<String>,
+    },
     SetPragmaUserVersion {
         value: u32,
+        schema: Option<String>,
     },
-    PragmaApplicationId,
+    PragmaApplicationId {
+        schema: Option<String>,
+    },
     SetPragmaApplicationId {
         value: u32,
+        schema: Option<String>,
     },
-    PragmaSchemaVersion,
+    PragmaSchemaVersion {
+        schema: Option<String>,
+    },
     SetPragmaSchemaVersion {
         value: u32,
+        schema: Option<String>,
     },
     Begin {
         isolation_level: Option<IsolationLevel>,
     },
     Commit,
     Rollback,
+    Savepoint {
+        name: String,
+    },
+    RollbackTo {
+        name: String,
+    },
+    Release {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -645,6 +872,7 @@ pub enum ScalarExpr {
     Literal(Value),
     Column(String),
     Tuple(Vec<ScalarExpr>),
+    UnaryPlus(Box<ScalarExpr>),
     UnaryMinus(Box<ScalarExpr>),
     BitNot(Box<ScalarExpr>),
     Not(Box<ScalarExpr>),
@@ -681,13 +909,13 @@ pub enum ScalarExpr {
     },
     Like {
         expr: Box<ScalarExpr>,
-        pattern: String,
-        escape: Option<String>,
+        pattern: Box<ScalarExpr>,
+        escape: Option<Box<ScalarExpr>>,
         negated: bool,
     },
     Glob {
         expr: Box<ScalarExpr>,
-        pattern: String,
+        pattern: Box<ScalarExpr>,
         negated: bool,
     },
     Between {
@@ -720,6 +948,16 @@ pub enum ScalarExpr {
         func: ScalarFunc,
         args: Vec<ScalarExpr>,
     },
+    WindowFunction {
+        func: WindowFunc,
+        args: Vec<ScalarExpr>,
+        partition_by: Vec<ScalarExpr>,
+        order_by: Vec<OrderBy>,
+        frame: WindowFrame,
+        exclude: WindowExclude,
+        window_name: Option<String>,
+        filter: Option<Box<Expr>>,
+    },
     Aggregate {
         func: AggregateFunc,
         arg: Box<AggregateArg>,
@@ -741,6 +979,116 @@ pub enum ScalarBinaryOp {
     Concat,
     JsonExtract,
     JsonExtractText,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Lag,
+    Lead,
+    Ntile,
+    PercentRank,
+    CumeDist,
+    FirstValue,
+    LastValue,
+    NthValue,
+    Count,
+    Sum,
+    Avg,
+    Total,
+    Min,
+    Max,
+    GroupConcat,
+    JsonGroupArray,
+    JsonGroupObject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrame {
+    Default,
+    RangePrecedingToCurrentRow(WindowRangeOffset),
+    RangePrecedingToPreceding {
+        start: WindowRangeOffset,
+        end: WindowRangeOffset,
+    },
+    RangePrecedingToFollowing {
+        preceding: WindowRangeOffset,
+        following: WindowRangeOffset,
+    },
+    RangePrecedingToUnboundedFollowing(WindowRangeOffset),
+    RangeUnboundedPrecedingToPreceding(WindowRangeOffset),
+    RangeUnboundedPrecedingToFollowing(WindowRangeOffset),
+    RangeCurrentRowToFollowing(WindowRangeOffset),
+    RangeFollowingToFollowing {
+        start: WindowRangeOffset,
+        end: WindowRangeOffset,
+    },
+    RangeFollowingToUnboundedFollowing(WindowRangeOffset),
+    GroupsPrecedingToCurrentRow(usize),
+    GroupsPrecedingToPreceding {
+        start: usize,
+        end: usize,
+    },
+    GroupsPrecedingToFollowing {
+        preceding: usize,
+        following: usize,
+    },
+    GroupsPrecedingToUnboundedFollowing(usize),
+    GroupsCurrentRow,
+    GroupsCurrentRowToFollowing(usize),
+    GroupsCurrentRowToUnboundedFollowing,
+    GroupsFollowingToFollowing {
+        start: usize,
+        end: usize,
+    },
+    GroupsFollowingToUnboundedFollowing(usize),
+    GroupsUnboundedPrecedingToCurrentRow,
+    GroupsUnboundedPrecedingAndFollowing,
+    RowsPrecedingToCurrentRow(usize),
+    RowsPrecedingToPreceding {
+        start: usize,
+        end: usize,
+    },
+    RowsPrecedingToFollowing {
+        preceding: usize,
+        following: usize,
+    },
+    RowsPrecedingToUnboundedFollowing(usize),
+    RowsCurrentRow,
+    RowsCurrentRowToFollowing(usize),
+    RowsCurrentRowToUnboundedFollowing,
+    RowsFollowingToFollowing {
+        start: usize,
+        end: usize,
+    },
+    RowsFollowingToUnboundedFollowing(usize),
+    RowsUnboundedPrecedingToCurrentRow,
+    RowsUnboundedPrecedingAndFollowing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowRangeOffset(u64);
+
+impl WindowRangeOffset {
+    #[must_use]
+    pub fn new(value: f64) -> Self {
+        Self(value.to_bits())
+    }
+
+    #[must_use]
+    pub fn value(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowExclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,6 +1117,7 @@ pub enum ScalarFunc {
     SqliteSourceId,
     SqliteCompileOptionUsed,
     SqliteCompileOptionGet,
+    SqliteLog,
     Sign,
     RandomBlob,
     Random,
@@ -812,6 +1161,8 @@ pub enum ScalarFunc {
     Replace,
     LikeFunc,
     GlobFunc,
+    RegexpFunc,
+    MatchFunc,
     Quote,
     Unicode,
     Char,
@@ -826,21 +1177,31 @@ pub enum ScalarFunc {
     Coalesce,
     IfNull,
     NullIf,
+    Unknown,
     Json,
+    Jsonb,
     JsonValid,
     JsonErrorPosition,
     JsonPretty,
     JsonQuote,
     JsonExtract,
+    JsonbExtract,
     JsonType,
     JsonArray,
+    JsonbArray,
     JsonObject,
+    JsonbObject,
     JsonArrayLength,
     JsonRemove,
+    JsonbRemove,
     JsonSet,
+    JsonbSet,
     JsonInsert,
+    JsonbInsert,
     JsonReplace,
+    JsonbReplace,
     JsonPatch,
+    JsonbPatch,
     LastInsertRowId,
 }
 
@@ -916,24 +1277,24 @@ pub enum Expr {
     },
     Like {
         column: String,
-        pattern: String,
-        escape: Option<String>,
+        pattern: Box<ScalarExpr>,
+        escape: Option<Box<ScalarExpr>>,
         negated: bool,
     },
     LikeScalar {
         expr: ScalarExpr,
-        pattern: String,
-        escape: Option<String>,
+        pattern: Box<ScalarExpr>,
+        escape: Option<Box<ScalarExpr>>,
         negated: bool,
     },
     Glob {
         column: String,
-        pattern: String,
+        pattern: Box<ScalarExpr>,
         negated: bool,
     },
     GlobScalar {
         expr: ScalarExpr,
-        pattern: String,
+        pattern: Box<ScalarExpr>,
         negated: bool,
     },
     Between {
@@ -981,6 +1342,7 @@ mod tests {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         };
         assert_eq!(
             statement,
@@ -991,6 +1353,7 @@ mod tests {
                 strict: false,
                 without_rowid: false,
                 if_not_exists: false,
+                temporary: false,
             }
         );
     }
@@ -1056,6 +1419,7 @@ mod tests {
                 columns: vec![SelectItem::Column("id".to_string())],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -1073,6 +1437,7 @@ mod tests {
                 columns: vec![SelectItem::Column("id".to_string())],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],

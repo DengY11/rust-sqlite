@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::error::{DbError, Result};
-use crate::common::types::{ColumnType, Row, Schema, Value};
+use crate::common::types::{ColumnType, Row, Schema, Value, sqlite_round_f64};
 use crate::sql::ast::{CompareOp, ScalarBinaryOp, ScalarExpr, ScalarFunc};
 use crate::sql::parser::parse_scalar_sql_expression;
 
@@ -61,6 +61,7 @@ fn require_scalar_expr_columns(schema: &Schema, expr: &ScalarExpr) -> Result<()>
             schema.column_index(name)?;
             Ok(())
         }
+        ScalarExpr::UnaryPlus(expr) => require_scalar_expr_columns(schema, expr),
         ScalarExpr::UnaryMinus(expr) => require_scalar_expr_columns(schema, expr),
         ScalarExpr::BitNot(expr) => require_scalar_expr_columns(schema, expr),
         ScalarExpr::Not(expr) => require_scalar_expr_columns(schema, expr),
@@ -70,9 +71,24 @@ fn require_scalar_expr_columns(schema: &Schema, expr: &ScalarExpr) -> Result<()>
             require_scalar_expr_columns(schema, left)?;
             require_scalar_expr_columns(schema, right)
         }
-        ScalarExpr::IsBool { expr, .. }
-        | ScalarExpr::Like { expr, .. }
-        | ScalarExpr::Glob { expr, .. } => require_scalar_expr_columns(schema, expr),
+        ScalarExpr::IsBool { expr, .. } => require_scalar_expr_columns(schema, expr),
+        ScalarExpr::Glob { expr, pattern, .. } => {
+            require_scalar_expr_columns(schema, expr)?;
+            require_scalar_expr_columns(schema, pattern)
+        }
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            require_scalar_expr_columns(schema, expr)?;
+            require_scalar_expr_columns(schema, pattern)?;
+            if let Some(escape) = escape {
+                require_scalar_expr_columns(schema, escape)?;
+            }
+            Ok(())
+        }
         ScalarExpr::InList { expr, values, .. } => {
             require_scalar_expr_columns(schema, expr)?;
             for value in values {
@@ -82,7 +98,8 @@ fn require_scalar_expr_columns(schema: &Schema, expr: &ScalarExpr) -> Result<()>
         }
         ScalarExpr::InSubquery { .. }
         | ScalarExpr::Subquery { .. }
-        | ScalarExpr::CompareSubquery { .. } => Err(DbError::plan(
+        | ScalarExpr::CompareSubquery { .. }
+        | ScalarExpr::WindowFunction { .. } => Err(DbError::plan(
             "subqueries are not allowed in index expressions",
         )),
         ScalarExpr::Between {
@@ -130,6 +147,7 @@ fn is_constant_scalar_expr(expr: &ScalarExpr) -> bool {
         ScalarExpr::Literal(_) => true,
         ScalarExpr::Tuple(items) => items.iter().all(is_constant_scalar_expr),
         ScalarExpr::Column(_) => false,
+        ScalarExpr::UnaryPlus(expr) => is_constant_scalar_expr(expr),
         ScalarExpr::UnaryMinus(expr) => is_constant_scalar_expr(expr),
         ScalarExpr::BitNot(expr) => is_constant_scalar_expr(expr),
         ScalarExpr::Not(expr) => is_constant_scalar_expr(expr),
@@ -138,15 +156,29 @@ fn is_constant_scalar_expr(expr: &ScalarExpr) -> bool {
         ScalarExpr::Is { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
             is_constant_scalar_expr(left) && is_constant_scalar_expr(right)
         }
-        ScalarExpr::IsBool { expr, .. }
-        | ScalarExpr::Like { expr, .. }
-        | ScalarExpr::Glob { expr, .. } => is_constant_scalar_expr(expr),
+        ScalarExpr::IsBool { expr, .. } => is_constant_scalar_expr(expr),
+        ScalarExpr::Glob { expr, pattern, .. } => {
+            is_constant_scalar_expr(expr) && is_constant_scalar_expr(pattern)
+        }
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            is_constant_scalar_expr(expr)
+                && is_constant_scalar_expr(pattern)
+                && escape
+                    .as_ref()
+                    .is_none_or(|expr| is_constant_scalar_expr(expr))
+        }
         ScalarExpr::InList { expr, values, .. } => {
             is_constant_scalar_expr(expr) && values.iter().all(is_constant_scalar_expr)
         }
         ScalarExpr::InSubquery { .. }
         | ScalarExpr::Subquery { .. }
-        | ScalarExpr::CompareSubquery { .. } => false,
+        | ScalarExpr::CompareSubquery { .. }
+        | ScalarExpr::WindowFunction { .. } => false,
         ScalarExpr::Between {
             expr, low, high, ..
         } => {
@@ -195,15 +227,35 @@ fn contains_current_time_scalar_expr(expr: &ScalarExpr) -> bool {
     match expr {
         ScalarExpr::Literal(_) | ScalarExpr::Column(_) => false,
         ScalarExpr::Tuple(items) => items.iter().any(contains_current_time_scalar_expr),
-        ScalarExpr::UnaryMinus(expr) | ScalarExpr::BitNot(expr) | ScalarExpr::Not(expr) | ScalarExpr::Collate { expr, .. } | ScalarExpr::Cast { expr, .. } => {
+        ScalarExpr::UnaryPlus(expr)
+        | ScalarExpr::UnaryMinus(expr)
+        | ScalarExpr::BitNot(expr)
+        | ScalarExpr::Not(expr)
+        | ScalarExpr::Collate { expr, .. }
+        | ScalarExpr::Cast { expr, .. } => {
             contains_current_time_scalar_expr(expr)
         }
         ScalarExpr::Is { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
             contains_current_time_scalar_expr(left) || contains_current_time_scalar_expr(right)
         }
-        ScalarExpr::IsBool { expr, .. }
-        | ScalarExpr::Like { expr, .. }
-        | ScalarExpr::Glob { expr, .. } => contains_current_time_scalar_expr(expr),
+        ScalarExpr::IsBool { expr, .. } => {
+            contains_current_time_scalar_expr(expr)
+        }
+        ScalarExpr::Glob { expr, pattern, .. } => {
+            contains_current_time_scalar_expr(expr) || contains_current_time_scalar_expr(pattern)
+        }
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            contains_current_time_scalar_expr(expr)
+                || contains_current_time_scalar_expr(pattern)
+                || escape
+                    .as_ref()
+                    .is_some_and(|expr| contains_current_time_scalar_expr(expr))
+        }
         ScalarExpr::InList { expr, values, .. } => {
             contains_current_time_scalar_expr(expr)
                 || values.iter().any(contains_current_time_scalar_expr)
@@ -212,7 +264,7 @@ fn contains_current_time_scalar_expr(expr: &ScalarExpr) -> bool {
         | ScalarExpr::CompareSubquery { left: expr, .. } => {
             contains_current_time_scalar_expr(expr)
         }
-        ScalarExpr::Subquery { .. } => false,
+        ScalarExpr::Subquery { .. } | ScalarExpr::WindowFunction { .. } => false,
         ScalarExpr::Between {
             expr, low, high, ..
         } => {
@@ -281,17 +333,28 @@ fn evaluate_scalar_expr_with_like_mode(
                 ))
             })?
         }
+        ScalarExpr::UnaryPlus(expr) => {
+            evaluate_scalar_expr_with_like_mode(schema, row, expr, case_sensitive_like)?
+        }
         ScalarExpr::UnaryMinus(expr) => {
             match evaluate_scalar_expr_with_like_mode(schema, row, expr, case_sensitive_like)? {
-                Value::Integer(value) => Value::Integer(-value),
+                Value::Integer(value) => Value::Integer(
+                    value
+                        .checked_neg()
+                        .ok_or_else(|| DbError::storage("integer overflow"))?,
+                ),
                 Value::Real(value) => Value::Real(-value),
                 Value::Null => Value::Null,
-                value => {
-                    return Err(DbError::storage(format!(
-                        "unary - expects numeric value but got {}",
-                        value.type_name()
-                    )));
-                }
+                value => match coerce_arithmetic_value(&value)? {
+                    Value::Integer(value) => Value::Integer(
+                        value
+                            .checked_neg()
+                            .ok_or_else(|| DbError::storage("integer overflow"))?,
+                    ),
+                    Value::Real(value) => Value::Real(-value),
+                    Value::Null => Value::Null,
+                    _ => unreachable!("sqlite arithmetic coercion only returns numeric values"),
+                },
             }
         }
         ScalarExpr::BitNot(expr) => {
@@ -354,7 +417,8 @@ fn evaluate_scalar_expr_with_like_mode(
         }
         ScalarExpr::InSubquery { .. }
         | ScalarExpr::Subquery { .. }
-        | ScalarExpr::CompareSubquery { .. } => {
+        | ScalarExpr::CompareSubquery { .. }
+        | ScalarExpr::WindowFunction { .. } => {
             return Err(DbError::plan(
                 "subqueries are not allowed in index expressions",
             ));
@@ -364,22 +428,46 @@ fn evaluate_scalar_expr_with_like_mode(
             pattern,
             escape,
             negated,
-        } => match evaluate_scalar_expr_with_like_mode(schema, row, expr, case_sensitive_like)? {
-            Value::Text(value) => Value::Boolean(
-                matches_like_pattern(&value, pattern, escape, case_sensitive_like)? ^ *negated,
-            ),
-            Value::Null => Value::Null,
-            _ => Value::Null,
-        },
+        } => {
+            let pattern = evaluate_like_pattern(schema, row, pattern, case_sensitive_like)?;
+            if matches!(pattern, LikeEscapeValue::Null) {
+                return Ok(Value::Null);
+            }
+            let escape = evaluate_like_escape(schema, row, escape, case_sensitive_like)?;
+            if matches!(escape, LikeEscapeValue::Null) {
+                return Ok(Value::Null);
+            }
+            let pattern = pattern.as_option_string().unwrap_or_default();
+            let escape = escape.as_option_string();
+            match evaluate_scalar_expr_with_like_mode(schema, row, expr, case_sensitive_like)? {
+                Value::Null => Value::Null,
+                value => Value::Boolean(
+                    matches_like_pattern(
+                        &coerce_text_like_value(&value),
+                        pattern,
+                        escape,
+                        case_sensitive_like,
+                    )? ^ *negated,
+                ),
+            }
+        }
         ScalarExpr::Glob {
             expr,
             pattern,
             negated,
-        } => match evaluate_scalar_expr_with_like_mode(schema, row, expr, case_sensitive_like)? {
-            Value::Text(value) => Value::Boolean(matches_glob_pattern(&value, pattern) ^ *negated),
-            Value::Null => Value::Null,
-            _ => Value::Null,
-        },
+        } => {
+            let pattern = evaluate_like_pattern(schema, row, pattern, case_sensitive_like)?;
+            if matches!(pattern, LikeEscapeValue::Null) {
+                return Ok(Value::Null);
+            }
+            let pattern = pattern.as_option_string().unwrap_or_default();
+            match evaluate_scalar_expr_with_like_mode(schema, row, expr, case_sensitive_like)? {
+                Value::Null => Value::Null,
+                value => Value::Boolean(
+                    matches_glob_pattern(&coerce_text_like_value(&value), pattern) ^ *negated,
+                ),
+            }
+        }
         ScalarExpr::Between {
             expr,
             low,
@@ -552,10 +640,14 @@ fn evaluate_scalar_function(
             expect_arity("LENGTH", &args, 1)?;
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Text(value) => Ok(Value::Integer(value.chars().count() as i64)),
+                Value::Text(value) => Ok(Value::Integer(
+                    sqlite_text_prefix_before_nul(value).chars().count() as i64,
+                )),
                 Value::Blob(value) => Ok(Value::Integer(value.len() as i64)),
                 value => Ok(Value::Integer(
-                    coerce_text_like_value(value).chars().count() as i64,
+                    sqlite_text_prefix_before_nul(&coerce_text_like_value(value))
+                        .chars()
+                        .count() as i64,
                 )),
             }
         }
@@ -691,14 +783,13 @@ fn evaluate_scalar_function(
                 Value::Real(value) => Ok(Value::Real(value.abs())),
                 Value::Boolean(value) => Ok(Value::Real(if value { 1.0_f64 } else { 0.0_f64 })),
                 Value::Text(ref value) => Ok(Value::Real(
-                    value.trim().parse::<f64>().unwrap_or(0.0).abs(),
+                    real_from_numeric_value(&sqlite_text_arithmetic_prefix(value))?.abs(),
                 )),
                 Value::Blob(ref value) => Ok(Value::Real(
-                    String::from_utf8_lossy(value)
-                        .trim()
-                        .parse::<f64>()
-                        .unwrap_or(0.0)
-                        .abs(),
+                    real_from_numeric_value(&sqlite_text_arithmetic_prefix(
+                        &String::from_utf8_lossy(value),
+                    ))?
+                    .abs(),
                 )),
             }
         }
@@ -720,7 +811,7 @@ fn evaluate_scalar_function(
         ScalarFunc::Hex => {
             expect_arity("HEX", &args, 1)?;
             match &args[0] {
-                Value::Null => Ok(Value::Null),
+                Value::Null => Ok(Value::Text(String::new())),
                 Value::Blob(value) => Ok(Value::Text(
                     value
                         .iter()
@@ -772,6 +863,7 @@ fn evaluate_scalar_function(
                     0
                 })),
                 Value::Text(value) => {
+                    let value = value.trim();
                     if let Ok(value) = value.parse::<i64>() {
                         Ok(Value::Integer(value.signum()))
                     } else if let Ok(value) = value.parse::<f64>() {
@@ -807,11 +899,12 @@ fn evaluate_scalar_function(
                         0.0
                     }
                 }
-                Value::Text(ref value) => value.trim().parse::<f64>().unwrap_or(0.0),
-                Value::Blob(ref value) => String::from_utf8_lossy(value)
-                    .trim()
-                    .parse::<f64>()
-                    .unwrap_or(0.0),
+                Value::Text(ref value) => {
+                    real_from_numeric_value(&sqlite_text_arithmetic_prefix(value))?
+                }
+                Value::Blob(ref value) => real_from_numeric_value(&sqlite_text_arithmetic_prefix(
+                    &String::from_utf8_lossy(value),
+                ))?,
             };
             let precision = if args.len() == 2 {
                 match args[1] {
@@ -842,26 +935,21 @@ fn evaluate_scalar_function(
             } else {
                 0
             };
-            let factor = 10_f64.powi(precision);
-            Ok(Value::Real((value * factor).round() / factor))
+            Ok(Value::Real(sqlite_round_f64(value, precision)))
         }
         ScalarFunc::Char => {
             let mut result = String::new();
             for arg in args {
                 let code_point = match cast_value(arg, ColumnType::Integer)? {
-                    Value::Null => 0,
+                    Value::Null => continue,
                     Value::Integer(value) => value,
                     _ => unreachable!("integer cast must yield INTEGER or NULL"),
                 };
 
-                let normalized = if code_point < 0 {
-                    0
-                } else {
-                    u32::try_from(code_point)
-                        .map_err(|_| DbError::storage("CHAR code point out of range"))?
-                };
-                let ch = char::from_u32(normalized)
-                    .ok_or_else(|| DbError::storage("CHAR received invalid code point"))?;
+                let ch = u32::try_from(code_point)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or(char::REPLACEMENT_CHARACTER);
                 result.push(ch);
             }
             Ok(Value::Text(result))
@@ -869,13 +957,11 @@ fn evaluate_scalar_function(
         ScalarFunc::ZeroBlob => {
             expect_arity("ZEROBLOB", &args, 1)?;
             let length = match cast_value(args[0].clone(), ColumnType::Integer)? {
-                Value::Null => return Ok(Value::Null),
+                Value::Null => 0,
                 Value::Integer(value) => value,
                 _ => unreachable!("integer cast must yield INTEGER or NULL"),
             };
-            if length < 0 {
-                return Err(DbError::storage("ZEROBLOB length must be non-negative"));
-            }
+            let length = length.max(0);
             let length = usize::try_from(length)
                 .map_err(|_| DbError::storage("ZEROBLOB length is too large"))?;
             Ok(Value::Blob(vec![0; length]))
@@ -1105,6 +1191,9 @@ fn evaluate_scalar_function(
             sqlite_unary_math_function(&args[0], "RADIANS", |value| Some(value.to_radians()))
         }
         ScalarFunc::Concat => {
+            if args.is_empty() {
+                return Err(DbError::storage("CONCAT expects at least 1 argument"));
+            }
             let mut result = String::new();
             for arg in args {
                 match arg {
@@ -1115,8 +1204,8 @@ fn evaluate_scalar_function(
             Ok(Value::Text(result))
         }
         ScalarFunc::ConcatWs => {
-            if args.is_empty() {
-                return Err(DbError::storage("CONCAT_WS expects at least 1 argument"));
+            if args.len() < 2 {
+                return Err(DbError::storage("CONCAT_WS expects at least 2 arguments"));
             }
 
             let separator = match &args[0] {
@@ -1144,7 +1233,9 @@ fn evaluate_scalar_function(
                 value => coerce_text_like_value(value),
             };
 
-            Ok(Value::Text(sqlite_printf(&format, &args[1..])?))
+            Ok(sqlite_printf(&format, &args[1..])?
+                .map(Value::Text)
+                .unwrap_or(Value::Null))
         }
         ScalarFunc::Unhex => {
             if !matches!(args.len(), 1 | 2) {
@@ -1170,7 +1261,10 @@ fn evaluate_scalar_function(
 
             let mut filtered = String::with_capacity(value.len());
             for ch in value.chars() {
-                if ignore.as_ref().is_some_and(|ignore| ignore.contains(ch)) {
+                if ignore
+                    .as_ref()
+                    .is_some_and(|ignore| ignore.contains(ch) && !ch.is_ascii_hexdigit())
+                {
                     continue;
                 }
                 filtered.push(ch);
@@ -1256,7 +1350,7 @@ fn evaluate_scalar_function(
             match value {
                 Value::Blob(value) => Ok(Value::Blob(sqlite_substr_blob(value, start, length))),
                 value => Ok(Value::Text(sqlite_substr_text(
-                    &coerce_text_like_value(value),
+                    sqlite_text_prefix_before_nul(&coerce_text_like_value(value)),
                     start,
                     length,
                 ))),
@@ -1277,33 +1371,14 @@ fn evaluate_scalar_function(
         }),
         ScalarFunc::Instr => {
             expect_arity("INSTR", &args, 2)?;
-
-            let haystack = match &args[0] {
-                Value::Null => return Ok(Value::Null),
-                value => coerce_text_like_value(value),
-            };
-
-            let needle = match &args[1] {
-                Value::Null => return Ok(Value::Null),
-                value => coerce_text_like_value(value),
-            };
-
-            if needle.is_empty() {
-                return Ok(Value::Integer(1));
-            }
-
-            let position = haystack
-                .find(&needle)
-                .map(|byte_index| haystack[..byte_index].chars().count() as i64 + 1)
-                .unwrap_or(0);
-            Ok(Value::Integer(position))
+            sqlite_instr_value(&args[0], &args[1])
         }
         ScalarFunc::Replace => {
             expect_arity("REPLACE", &args, 3)?;
 
             let value = match &args[0] {
                 Value::Null => return Ok(Value::Null),
-                value => coerce_text_like_value(value),
+                value => sqlite_text_prefix_before_nul(&coerce_text_like_value(value)).to_string(),
             };
 
             let pattern = match &args[1] {
@@ -1329,6 +1404,18 @@ fn evaluate_scalar_function(
                     args.len()
                 )));
             }
+            let escape = if let Some(escape) = args.get(2) {
+                match escape {
+                    Value::Null => return Ok(Value::Null),
+                    value => {
+                        let text = coerce_text_like_value(value);
+                        let _ = like_escape_char(Some(text.as_str()))?;
+                        Some(text)
+                    }
+                }
+            } else {
+                None
+            };
             let pattern = match &args[0] {
                 Value::Null => return Ok(Value::Null),
                 value => coerce_text_like_value(value),
@@ -1337,18 +1424,10 @@ fn evaluate_scalar_function(
                 Value::Null => return Ok(Value::Null),
                 value => coerce_text_like_value(value),
             };
-            let escape = if let Some(escape) = args.get(2) {
-                match escape {
-                    Value::Null => return Ok(Value::Null),
-                    value => Some(coerce_text_like_value(value)),
-                }
-            } else {
-                None
-            };
             Ok(Value::Boolean(matches_like_pattern(
                 &value,
                 &pattern,
-                &escape,
+                escape.as_deref(),
                 case_sensitive_like,
             )?))
         }
@@ -1363,6 +1442,24 @@ fn evaluate_scalar_function(
                 value => coerce_text_like_value(value),
             };
             Ok(Value::Boolean(matches_glob_pattern(&value, &pattern)))
+        }
+        ScalarFunc::RegexpFunc => {
+            expect_arity("REGEXP", &args, 2)?;
+            let pattern = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                value => coerce_text_like_value(value),
+            };
+            let value = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                value => coerce_text_like_value(value),
+            };
+            Ok(Value::Boolean(sqlite_regexp_matches(&pattern, &value)?))
+        }
+        ScalarFunc::MatchFunc => {
+            expect_arity("MATCH", &args, 2)?;
+            Err(DbError::storage(
+                "unable to use function MATCH in the requested context",
+            ))
         }
         ScalarFunc::NullIf => {
             expect_arity("NULLIF", &args, 2)?;
@@ -1393,11 +1490,13 @@ fn evaluate_scalar_function(
             expect_arity("UNICODE", &args, 1)?;
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                value => Ok(coerce_text_like_value(value)
-                    .chars()
-                    .next()
-                    .map(|ch| Value::Integer(i64::from(u32::from(ch))))
-                    .unwrap_or(Value::Null)),
+                value => Ok(
+                    sqlite_text_prefix_before_nul(&coerce_text_like_value(value))
+                        .chars()
+                        .next()
+                        .map(|ch| Value::Integer(i64::from(u32::from(ch))))
+                        .unwrap_or(Value::Null),
+                ),
             }
         }
         ScalarFunc::Quote => {
@@ -1412,7 +1511,7 @@ fn evaluate_scalar_function(
                     }
                 }
                 Value::Integer(value) => value.to_string(),
-                Value::Real(value) => sqlite_real_to_text(*value),
+                Value::Real(value) => sqlite_real_to_text_for_quote(*value),
                 Value::Blob(value) => format!(
                     "X'{}'",
                     value
@@ -1420,7 +1519,12 @@ fn evaluate_scalar_function(
                         .map(|byte| format!("{byte:02X}"))
                         .collect::<String>()
                 ),
-                Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
+                Value::Text(value) => {
+                    format!(
+                        "'{}'",
+                        sqlite_text_prefix_before_nul(value).replace('\'', "''")
+                    )
+                }
             };
             Ok(Value::Text(quoted))
         }
@@ -1471,11 +1575,25 @@ fn evaluate_scalar_function(
                 Value::Null => return Ok(Value::Null),
                 value => coerce_text_like_value(value),
             };
-            let path = match &args[1] {
-                Value::Null => return Ok(Value::Null),
-                value => coerce_text_like_value(value),
-            };
-            json_extract_value(&json, &path)
+            if args.len() == 2 {
+                let path = match &args[1] {
+                    Value::Null => return Ok(Value::Null),
+                    value => coerce_text_like_value(value),
+                };
+                json_extract_value(&json, &path)
+            } else {
+                let paths = args[1..]
+                    .iter()
+                    .map(|value| match value {
+                        Value::Null => None,
+                        value => Some(coerce_text_like_value(value)),
+                    })
+                    .collect::<Vec<_>>();
+                if paths.iter().any(Option::is_none) {
+                    return Ok(Value::Null);
+                }
+                json_extract_multi_value(&json, &paths)
+            }
         }
         ScalarFunc::JsonType => {
             if !matches!(args.len(), 1 | 2) {
@@ -1520,6 +1638,10 @@ fn evaluate_scalar_function(
         ScalarFunc::JsonInsert => json_write_value("json_insert", &args, JsonWriteMode::Insert),
         ScalarFunc::JsonReplace => json_write_value("json_replace", &args, JsonWriteMode::Replace),
         ScalarFunc::JsonPatch => json_patch_value(&args),
+        ScalarFunc::SqliteLog => {
+            expect_arity("SQLITE_LOG", &args, 2)?;
+            Ok(Value::Null)
+        }
         ScalarFunc::MinScalar => {
             if args.is_empty() {
                 return Err(DbError::storage("MIN expects at least 1 argument"));
@@ -1570,7 +1692,7 @@ where
     Ok(Value::Text(trim(&value, &characters)))
 }
 
-fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
+fn sqlite_printf(format: &str, args: &[Value]) -> Result<Option<String>> {
     let mut rendered = String::new();
     let mut chars = format.chars().peekable();
     let mut arg_index = 0usize;
@@ -1597,6 +1719,7 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
                 ',' => flags.grouping = true,
                 '0' => flags.zero_pad = true,
                 '#' => flags.alternate = true,
+                '!' => flags.alternate_form_2 = true,
                 _ => break,
             }
             chars.next();
@@ -1656,11 +1779,17 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
             chars.next();
         }
 
-        let spec = chars
-            .next()
-            .ok_or_else(|| DbError::storage("PRINTF format string ended after %"))?;
-        let arg = args.get(arg_index).cloned().unwrap_or(Value::Null);
-        arg_index += 1;
+        let Some(spec) = chars.next() else {
+            rendered.push('%');
+            break;
+        };
+        let arg = if spec == 'n' {
+            Value::Null
+        } else {
+            let arg = args.get(arg_index).cloned().unwrap_or(Value::Null);
+            arg_index += 1;
+            arg
+        };
 
         match spec {
             'd' | 'i' => {
@@ -1707,11 +1836,37 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
                 let rendered_value = format_sqlite_unsigned_integer(value, flags, precision);
                 push_sqlite_printf_numeric(&mut rendered, &rendered_value, width, flags);
             }
+            'r' => {
+                let value = sqlite_printf_integer_arg(&arg);
+                let mut rendered_value = format_sqlite_signed_integer(value, flags, precision);
+                rendered_value.push_str(sqlite_ordinal_suffix(value));
+                push_sqlite_printf_numeric(&mut rendered, &rendered_value, width, flags);
+            }
+            'f' => {
+                let value = sqlite_printf_real_arg(&arg);
+                let mut rendered_value = if let Some(infinity) = sqlite_printf_infinity_text(value)
+                {
+                    infinity
+                } else if let Some(precision) = precision {
+                    format!("{value:.precision$}")
+                } else {
+                    format!("{value:.6}")
+                };
+                if flags.alternate && !rendered_value.contains('.') {
+                    rendered_value.push('.');
+                }
+                rendered_value = apply_sqlite_numeric_flags(rendered_value, flags);
+                push_sqlite_printf_numeric(&mut rendered, &rendered_value, width, flags);
+            }
             'e' | 'E' => {
                 let value = sqlite_printf_real_arg(&arg);
                 let precision = precision.unwrap_or(6);
-                let mut rendered_value = format!("{value:.precision$e}");
-                rendered_value = normalize_sqlite_exponent(rendered_value, spec);
+                let mut rendered_value = if let Some(infinity) = sqlite_printf_infinity_text(value)
+                {
+                    infinity
+                } else {
+                    normalize_sqlite_exponent(format!("{value:.precision$e}"), spec)
+                };
                 if flags.alternate {
                     rendered_value = ensure_sqlite_exponent_decimal_point(rendered_value);
                 }
@@ -1721,7 +1876,8 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
             'g' | 'G' => {
                 let value = sqlite_printf_real_arg(&arg);
                 let precision = precision.unwrap_or(6);
-                let mut rendered_value = sqlite_printf_general_float(value, precision);
+                let mut rendered_value = sqlite_printf_infinity_text(value)
+                    .unwrap_or_else(|| sqlite_printf_general_float(value, precision));
                 if spec == 'G' {
                     rendered_value = rendered_value.replace('e', "E");
                 }
@@ -1810,13 +1966,34 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
                 }
             }
             'n' => {}
+            'c' => {
+                let rendered_value = match arg {
+                    Value::Null => String::new(),
+                    value => {
+                        let repeat = precision.unwrap_or(1).max(1);
+                        coerce_text_like_value(&value)
+                            .chars()
+                            .next()
+                            .map(|ch| ch.to_string().repeat(repeat))
+                            .unwrap_or_default()
+                    }
+                };
+                push_sqlite_printf_text(
+                    &mut rendered,
+                    &rendered_value,
+                    width,
+                    flags.left_align && !flags.zero_pad,
+                );
+            }
             's' => {
                 let mut value = match arg {
                     Value::Null => String::new(),
-                    value => coerce_text_like_value(&value),
+                    value => {
+                        sqlite_text_prefix_before_nul(&coerce_text_like_value(&value)).to_string()
+                    }
                 };
                 if let Some(precision) = precision {
-                    value = truncate_sqlite_printf_text(&value, precision);
+                    value = truncate_sqlite_printf_text(&value, precision, flags);
                 }
                 push_sqlite_printf_text(
                     &mut rendered,
@@ -1828,10 +2005,12 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
             'z' => {
                 let mut value = match arg {
                     Value::Null => String::new(),
-                    value => coerce_text_like_value(&value),
+                    value => {
+                        sqlite_text_prefix_before_nul(&coerce_text_like_value(&value)).to_string()
+                    }
                 };
                 if let Some(precision) = precision {
-                    value = truncate_sqlite_printf_text(&value, precision);
+                    value = truncate_sqlite_printf_text(&value, precision, flags);
                 }
                 push_sqlite_printf_text(
                     &mut rendered,
@@ -1843,7 +2022,9 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
             'q' => {
                 let value = match arg {
                     Value::Null => "(NULL)".to_string(),
-                    value => coerce_text_like_value(&value).replace('\'', "''"),
+                    value if flags.alternate => sqlite_unistr_quote_unquoted(&value),
+                    value => sqlite_text_prefix_before_nul(&coerce_text_like_value(&value))
+                        .replace('\'', "''"),
                 };
                 push_sqlite_printf_text(
                     &mut rendered,
@@ -1855,7 +2036,12 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
             'Q' => {
                 let value = match arg {
                     Value::Null => "NULL".to_string(),
-                    value => format!("'{}'", coerce_text_like_value(&value).replace('\'', "''")),
+                    value if flags.alternate => sqlite_unistr_quote(&value),
+                    value => format!(
+                        "'{}'",
+                        sqlite_text_prefix_before_nul(&coerce_text_like_value(&value))
+                            .replace('\'', "''")
+                    ),
                 };
                 push_sqlite_printf_text(
                     &mut rendered,
@@ -1867,7 +2053,8 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
             'w' => {
                 let value = match arg {
                     Value::Null => "(NULL)".to_string(),
-                    value => coerce_text_like_value(&value).replace('"', "\"\""),
+                    value => sqlite_text_prefix_before_nul(&coerce_text_like_value(&value))
+                        .replace('"', "\"\""),
                 };
                 push_sqlite_printf_text(
                     &mut rendered,
@@ -1877,14 +2064,13 @@ fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
                 );
             }
             other => {
-                return Err(DbError::storage(format!(
-                    "PRINTF format specifier %{other} is not supported yet"
-                )));
+                let _ = other;
+                return Ok((!rendered.is_empty()).then_some(rendered));
             }
         }
     }
 
-    Ok(rendered)
+    Ok(Some(rendered))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1895,6 +2081,7 @@ struct SqlitePrintfFlags {
     zero_pad: bool,
     grouping: bool,
     alternate: bool,
+    alternate_form_2: bool,
 }
 
 fn push_sqlite_printf_text(rendered: &mut String, value: &str, width: usize, left_align: bool) {
@@ -1951,8 +2138,32 @@ fn format_sqlite_unsigned_integer(
     }
 }
 
-fn truncate_sqlite_printf_text(value: &str, precision: usize) -> String {
-    value.chars().take(precision).collect()
+fn truncate_sqlite_printf_text(value: &str, precision: usize, flags: SqlitePrintfFlags) -> String {
+    if flags.alternate_form_2 {
+        return value.chars().take(precision).collect();
+    }
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(value.len()))
+        .take_while(|index| *index <= precision)
+        .last()
+        .unwrap_or(0);
+    value[..end].to_string()
+}
+
+fn sqlite_ordinal_suffix(value: i64) -> &'static str {
+    let abs = value.unsigned_abs();
+    let last_two = abs % 100;
+    if (11..=13).contains(&last_two) {
+        return "th";
+    }
+    match abs % 10 {
+        1 => "st",
+        2 => "nd",
+        3 => "rd",
+        _ => "th",
+    }
 }
 
 fn sqlite_printf_integer_arg(value: &Value) -> i64 {
@@ -2168,6 +2379,16 @@ fn sqlite_printf_general_float(value: f64, precision: usize) -> String {
     trim_printf_general_float(rendered)
 }
 
+fn sqlite_printf_infinity_text(value: f64) -> Option<String> {
+    if value == f64::INFINITY {
+        Some("Inf".to_string())
+    } else if value == f64::NEG_INFINITY {
+        Some("-Inf".to_string())
+    } else {
+        None
+    }
+}
+
 fn trim_printf_general_float(rendered: String) -> String {
     if let Some(index) = rendered.find(['e', 'E']) {
         let mut mantissa = rendered[..index].to_string();
@@ -2226,6 +2447,7 @@ fn sqlite_unistr_quote(value: &Value) -> String {
     let Value::Text(value) = value else {
         return sqlite_quote_value(value);
     };
+    let value = sqlite_text_prefix_before_nul(value);
     if !value
         .chars()
         .any(|ch| matches!(ch, '\u{0001}'..='\u{001f}'))
@@ -2248,6 +2470,20 @@ fn sqlite_unistr_quote(value: &Value) -> String {
     quoted
 }
 
+fn sqlite_unistr_quote_unquoted(value: &Value) -> String {
+    let quoted = sqlite_unistr_quote(value);
+    quoted
+        .strip_prefix("unistr('")
+        .and_then(|value| value.strip_suffix("')"))
+        .or_else(|| {
+            quoted
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .map(str::to_string)
+        .unwrap_or(quoted)
+}
+
 fn sqlite_quote_value(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
@@ -2259,7 +2495,7 @@ fn sqlite_quote_value(value: &Value) -> String {
             }
         }
         Value::Integer(value) => value.to_string(),
-        Value::Real(value) => sqlite_real_to_text(*value),
+        Value::Real(value) => sqlite_real_to_text_for_quote(*value),
         Value::Blob(value) => format!(
             "X'{}'",
             value
@@ -2275,6 +2511,17 @@ fn sqlite_quote_text(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn sqlite_real_to_text_for_quote(value: f64) -> String {
+    if value == f64::INFINITY {
+        return "9.0e+999".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-9.0e+999".to_string();
+    }
+
+    sqlite_real_to_text(value)
+}
+
 fn json_quote_value(value: &Value) -> Result<String> {
     match value {
         Value::Null => Ok("null".to_string()),
@@ -2283,8 +2530,7 @@ fn json_quote_value(value: &Value) -> Result<String> {
         Value::Real(value) => Ok(sqlite_real_to_text(*value)),
         Value::Text(value) => serde_json::to_string(value)
             .map_err(|error| DbError::storage(format!("failed to quote JSON string: {error}"))),
-        Value::Blob(value) => serde_json::to_string(&String::from_utf8_lossy(value))
-            .map_err(|error| DbError::storage(format!("failed to quote JSON string: {error}"))),
+        Value::Blob(_) => Err(DbError::storage("JSON cannot hold BLOB values")),
     }
 }
 
@@ -2297,10 +2543,31 @@ fn sql_value_to_json(value: &Value) -> Result<serde_json::Value> {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         Value::Text(value) => serde_json::Value::String(value.clone()),
-        Value::Blob(value) => {
-            serde_json::Value::String(String::from_utf8_lossy(value).into_owned())
-        }
+        Value::Blob(_) => return Err(DbError::storage("JSON cannot hold BLOB values")),
     })
+}
+
+fn sqlite_instr_value(haystack: &Value, needle: &Value) -> Result<Value> {
+    match (haystack, needle) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Blob(haystack), Value::Blob(needle)) => {
+            Ok(Value::Integer(sqlite_instr_blob(haystack, needle)))
+        }
+        (haystack, needle) => {
+            let haystack = coerce_text_like_value(haystack);
+            let needle = coerce_text_like_value(needle);
+
+            if needle.is_empty() {
+                return Ok(Value::Integer(1));
+            }
+
+            let position = haystack
+                .find(&needle)
+                .map(|byte_index| haystack[..byte_index].chars().count() as i64 + 1)
+                .unwrap_or(0);
+            Ok(Value::Integer(position))
+        }
+    }
 }
 
 fn json_normalize_value(value: &Value) -> Result<Value> {
@@ -2353,7 +2620,7 @@ fn json_pretty_value(args: &[Value]) -> Result<Value> {
     };
     let indent = if let Some(indent) = args.get(1) {
         match indent {
-            Value::Null => return Ok(Value::Null),
+            Value::Null => "    ".to_string(),
             value => coerce_text_like_value(value),
         }
     } else {
@@ -2513,6 +2780,26 @@ fn json_extract_value(json: &str, path: &str) -> Result<Value> {
     json_value_to_sql(value)
 }
 
+fn json_extract_multi_value(json: &str, paths: &[Option<String>]) -> Result<Value> {
+    let parsed = parse_sqlite_json_value(json)
+        .map_err(|error| DbError::storage(format!("malformed JSON: {error}")))?;
+    let mut values = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Some(path) = path else {
+            values.push(serde_json::Value::Null);
+            continue;
+        };
+        let Some(value) = json_path_lookup(&parsed, path)? else {
+            values.push(serde_json::Value::Null);
+            continue;
+        };
+        values.push(value.clone());
+    }
+    serde_json::to_string(&values)
+        .map(Value::Text)
+        .map_err(|error| DbError::storage(format!("failed to render JSON value: {error}")))
+}
+
 fn json_path_lookup<'a>(
     value: &'a serde_json::Value,
     path: &str,
@@ -2523,16 +2810,12 @@ fn json_path_lookup<'a>(
         .ok_or_else(|| DbError::storage("JSON path must start with '$'"))?;
     while !remaining.is_empty() {
         if let Some(rest) = remaining.strip_prefix('.') {
-            let key_end = rest.find(['.', '[']).unwrap_or(rest.len());
-            let key = &rest[..key_end];
-            if key.is_empty() {
-                return Err(DbError::storage("invalid JSON path"));
-            }
-            let Some(next) = current.get(key) else {
+            let (key, tail) = json_path_object_key(rest)?;
+            let Some(next) = current.get(key.as_ref()) else {
                 return Ok(None);
             };
             current = next;
-            remaining = &rest[key_end..];
+            remaining = tail;
             continue;
         }
         if let Some(rest) = remaining.strip_prefix('[') {
@@ -2554,8 +2837,49 @@ fn json_path_lookup<'a>(
     Ok(Some(current))
 }
 
+fn json_path_object_key(rest: &str) -> Result<(std::borrow::Cow<'_, str>, &str)> {
+    if rest.starts_with('"') {
+        let mut escaped = false;
+        for (offset, ch) in rest[1..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => {
+                    let end = offset + 2;
+                    let key = serde_json::from_str::<String>(&rest[..end])
+                        .map_err(|_| DbError::storage("invalid JSON path"))?;
+                    return Ok((std::borrow::Cow::Owned(key), &rest[end..]));
+                }
+                _ => {}
+            }
+        }
+        return Err(DbError::storage("invalid JSON path"));
+    }
+
+    let key_end = rest.find(['.', '[']).unwrap_or(rest.len());
+    let key = &rest[..key_end];
+    if key.is_empty() {
+        return Err(DbError::storage("invalid JSON path"));
+    }
+    Ok((std::borrow::Cow::Borrowed(key), &rest[key_end..]))
+}
+
+fn json_container_for_path_tail(tail: &str) -> serde_json::Value {
+    if tail.starts_with('[') {
+        serde_json::Value::Array(Vec::new())
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
+}
+
 fn json_path_array_index(value: &serde_json::Value, index: &str) -> Result<Option<usize>> {
     if index == "#" {
+        return Ok(None);
+    }
+    if index.starts_with('"') && serde_json::from_str::<String>(index).is_ok() {
         return Ok(None);
     }
     if let Some(tail) = index.strip_prefix("#-") {
@@ -3071,19 +3395,14 @@ fn json_remove_path(value: &mut serde_json::Value, path: &str) -> Result<()> {
 
 fn json_remove_path_tail(value: &mut serde_json::Value, remaining: &str) -> Result<()> {
     if let Some(rest) = remaining.strip_prefix('.') {
-        let key_end = rest.find(['.', '[']).unwrap_or(rest.len());
-        let key = &rest[..key_end];
-        if key.is_empty() {
-            return Err(DbError::storage("invalid JSON path"));
-        }
-        let tail = &rest[key_end..];
+        let (key, tail) = json_path_object_key(rest)?;
         if tail.is_empty() {
             if let serde_json::Value::Object(object) = value {
-                object.remove(key);
+                object.remove(key.as_ref());
             }
             return Ok(());
         }
-        let Some(next) = value.get_mut(key) else {
+        let Some(next) = value.get_mut(key.as_ref()) else {
             return Ok(());
         };
         return json_remove_path_tail(next, tail);
@@ -3093,9 +3412,9 @@ fn json_remove_path_tail(value: &mut serde_json::Value, remaining: &str) -> Resu
         let Some(index_end) = rest.find(']') else {
             return Err(DbError::storage("invalid JSON path"));
         };
-        let index = rest[..index_end]
-            .parse::<usize>()
-            .map_err(|_| DbError::storage("invalid JSON array index"))?;
+        let Some(index) = json_path_array_index(value, &rest[..index_end])? else {
+            return Ok(());
+        };
         let tail = &rest[index_end + 1..];
         if tail.is_empty() {
             if let serde_json::Value::Array(values) = value {
@@ -3143,12 +3462,7 @@ fn json_write_path_tail(
     mode: JsonWriteMode,
 ) -> Result<()> {
     if let Some(rest) = remaining.strip_prefix('.') {
-        let key_end = rest.find(['.', '[']).unwrap_or(rest.len());
-        let key = &rest[..key_end];
-        if key.is_empty() {
-            return Err(DbError::storage("invalid JSON path"));
-        }
-        let tail = &rest[key_end..];
+        let (key, tail) = json_path_object_key(rest)?;
         if tail.is_empty() {
             if !value.is_object() {
                 if matches!(mode, JsonWriteMode::Replace) {
@@ -3157,7 +3471,7 @@ fn json_write_path_tail(
                 *value = serde_json::Value::Object(serde_json::Map::new());
             }
             if let serde_json::Value::Object(object) = value {
-                let exists = object.contains_key(key);
+                let exists = object.contains_key(key.as_ref());
                 if matches!(
                     (mode, exists),
                     (JsonWriteMode::Set, _)
@@ -3178,11 +3492,11 @@ fn json_write_path_tail(
         let serde_json::Value::Object(object) = value else {
             unreachable!("value was normalized to object");
         };
-        let next = match object.get_mut(key) {
+        let next = match object.get_mut(key.as_ref()) {
             Some(next) => next,
             None if matches!(mode, JsonWriteMode::Set | JsonWriteMode::Insert) => object
                 .entry(key.to_string())
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new())),
+                .or_insert_with(|| json_container_for_path_tail(tail)),
             None => return Ok(()),
         };
         return json_write_path_tail(next, tail, replacement, mode);
@@ -3192,10 +3506,30 @@ fn json_write_path_tail(
         let Some(index_end) = rest.find(']') else {
             return Err(DbError::storage("invalid JSON path"));
         };
-        let index = rest[..index_end]
-            .parse::<usize>()
-            .map_err(|_| DbError::storage("invalid JSON array index"))?;
+        let index_token = &rest[..index_end];
         let tail = &rest[index_end + 1..];
+        if index_token == "#" {
+            let serde_json::Value::Array(values) = value else {
+                return Ok(());
+            };
+            if tail.is_empty() {
+                if matches!(mode, JsonWriteMode::Set | JsonWriteMode::Insert) {
+                    values.push(replacement);
+                }
+                return Ok(());
+            }
+            if matches!(mode, JsonWriteMode::Replace) {
+                return Ok(());
+            }
+            values.push(json_container_for_path_tail(tail));
+            let next = values
+                .last_mut()
+                .expect("pushed JSON value must be addressable");
+            return json_write_path_tail(next, tail, replacement, mode);
+        }
+        let Some(index) = json_path_array_index(value, index_token)? else {
+            return Ok(());
+        };
         let serde_json::Value::Array(values) = value else {
             return Ok(());
         };
@@ -3210,6 +3544,13 @@ fn json_write_path_tail(
                 values.push(replacement);
             }
             return Ok(());
+        }
+        if index == values.len() && matches!(mode, JsonWriteMode::Set | JsonWriteMode::Insert) {
+            values.push(json_container_for_path_tail(tail));
+            let next = values
+                .last_mut()
+                .expect("pushed JSON value must be addressable");
+            return json_write_path_tail(next, tail, replacement, mode);
         }
         let Some(next) = values.get_mut(index) else {
             return Ok(());
@@ -3305,6 +3646,10 @@ fn sqlite_ascii_upper(value: &str) -> String {
         .collect()
 }
 
+fn sqlite_text_prefix_before_nul(value: &str) -> &str {
+    value.split('\0').next().unwrap_or(value)
+}
+
 fn sqlite_substr_text(value: &str, start: i64, length: Option<i64>) -> String {
     let characters = value.chars().collect::<Vec<_>>();
     let (begin, end) = sqlite_substr_bounds(characters.len(), start, length);
@@ -3314,6 +3659,17 @@ fn sqlite_substr_text(value: &str, start: i64, length: Option<i64>) -> String {
 fn sqlite_substr_blob(value: &[u8], start: i64, length: Option<i64>) -> Vec<u8> {
     let (begin, end) = sqlite_substr_bounds(value.len(), start, length);
     value[begin..end].to_vec()
+}
+
+fn sqlite_instr_blob(haystack: &[u8], needle: &[u8]) -> i64 {
+    if needle.is_empty() {
+        return 1;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|index| index as i64 + 1)
+        .unwrap_or(0)
 }
 
 fn sqlite_substr_bounds(item_count: usize, start: i64, length: Option<i64>) -> (usize, usize) {
@@ -3330,7 +3686,12 @@ fn sqlite_substr_bounds(item_count: usize, start: i64, length: Option<i64>) -> (
         None => (start_index.clamp(0, len), len),
         Some(length) if length >= 0 => {
             let begin = start_index.clamp(0, len);
-            let end = start_index.saturating_add(length).clamp(0, len);
+            let effective_length = if start == 0 {
+                length.saturating_sub(1)
+            } else {
+                length
+            };
+            let end = start_index.saturating_add(effective_length).clamp(0, len);
             (begin, end)
         }
         Some(length) => {
@@ -3363,7 +3724,13 @@ fn sqlite_text_integer_prefix(value: &str) -> i64 {
     if candidate.is_empty() || matches!(candidate, "+" | "-") {
         0
     } else {
-        candidate.parse::<i64>().unwrap_or(0)
+        candidate.parse::<i64>().unwrap_or_else(|_| {
+            if candidate.starts_with('-') {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        })
     }
 }
 
@@ -4412,42 +4779,86 @@ fn compare_min_max_scalar_values(
         (Value::Real(left), Value::Real(right)) => Some(left.total_cmp(right)),
         (Value::Blob(left), Value::Blob(right)) => Some(left.cmp(right)),
         (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
-        _ => None,
+        _ => Some(
+            sqlite_min_max_storage_class_rank(left).cmp(&sqlite_min_max_storage_class_rank(right)),
+        ),
     })
+}
+
+fn sqlite_min_max_storage_class_rank(value: &Value) -> u8 {
+    match value {
+        Value::Null => 0,
+        Value::Boolean(_) | Value::Integer(_) | Value::Real(_) => 1,
+        Value::Text(_) => 2,
+        Value::Blob(_) => 3,
+    }
 }
 
 fn evaluate_binary_scalar(op: ScalarBinaryOp, left: Value, right: Value) -> Result<Value> {
     match op {
-        ScalarBinaryOp::Add => numeric_binary_op(left, right, |l, r| l + r, |l, r| l + r),
-        ScalarBinaryOp::Subtract => numeric_binary_op(left, right, |l, r| l - r, |l, r| l - r),
-        ScalarBinaryOp::Multiply => numeric_binary_op(left, right, |l, r| l * r, |l, r| l * r),
-        ScalarBinaryOp::Divide => match (left, right) {
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (Value::Integer(_), Value::Integer(0))
-            | (Value::Real(_), Value::Real(0.0))
-            | (Value::Integer(_), Value::Real(0.0))
-            | (Value::Real(_), Value::Integer(0)) => Ok(Value::Null),
-            (Value::Integer(left), Value::Integer(right)) => Ok(Value::Integer(left / right)),
-            (left, right) => {
-                let left = coerce_numeric_value(&left)?;
-                let right = coerce_numeric_value(&right)?;
-                Ok(Value::Real(left / right))
+        ScalarBinaryOp::Add => {
+            numeric_binary_op(left, right, i64::checked_add, |left, right| left + right)
+        }
+        ScalarBinaryOp::Subtract => {
+            numeric_binary_op(left, right, i64::checked_sub, |left, right| left - right)
+        }
+        ScalarBinaryOp::Multiply => {
+            numeric_binary_op(left, right, i64::checked_mul, |left, right| left * right)
+        }
+        ScalarBinaryOp::Divide => {
+            let left = coerce_arithmetic_value(&left)?;
+            let right = coerce_arithmetic_value(&right)?;
+            match (left, right) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Integer(_), Value::Integer(0))
+                | (Value::Real(_), Value::Real(0.0))
+                | (Value::Integer(_), Value::Real(0.0))
+                | (Value::Real(_), Value::Integer(0)) => Ok(Value::Null),
+                (Value::Integer(i64::MIN), Value::Integer(-1)) => {
+                    Ok(Value::Real(i64::MIN as f64 / -1.0))
+                }
+                (Value::Integer(left), Value::Integer(right)) => Ok(Value::Integer(left / right)),
+                (left, right) => Ok(Value::Real(
+                    real_from_numeric_value(&left)? / real_from_numeric_value(&right)?,
+                )),
             }
-        },
-        ScalarBinaryOp::Modulo => match (left, right) {
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (Value::Integer(_), Value::Integer(0)) => Ok(Value::Null),
-            (Value::Integer(left), Value::Integer(right)) => Ok(Value::Integer(left % right)),
-            (left, right) => Err(DbError::storage(format!(
-                "cannot apply % to {} and {}",
-                left.type_name(),
-                right.type_name()
-            ))),
-        },
+        }
+        ScalarBinaryOp::Modulo => {
+            let left = coerce_arithmetic_value(&left)?;
+            let right = coerce_arithmetic_value(&right)?;
+            match (left, right) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Integer(_), Value::Integer(0))
+                | (Value::Integer(_), Value::Real(0.0))
+                | (Value::Real(_), Value::Integer(0))
+                | (Value::Real(_), Value::Real(0.0)) => Ok(Value::Null),
+                (Value::Integer(i64::MIN), Value::Integer(-1)) => Ok(Value::Integer(0)),
+                (Value::Integer(left), Value::Integer(right)) => Ok(Value::Integer(left % right)),
+                (left, right) => {
+                    let result_is_real =
+                        matches!(left, Value::Real(_)) || matches!(right, Value::Real(_));
+                    let left = real_from_numeric_value(&left)? as i64;
+                    let right = real_from_numeric_value(&right)? as i64;
+                    if right == 0 {
+                        return Ok(Value::Null);
+                    }
+                    let result = if left == i64::MIN && right == -1 {
+                        0
+                    } else {
+                        left % right
+                    };
+                    Ok(if result_is_real {
+                        Value::Real(result as f64)
+                    } else {
+                        Value::Integer(result)
+                    })
+                }
+            }
+        }
         ScalarBinaryOp::BitAnd => bitwise_binary_op(left, right, |left, right| left & right),
         ScalarBinaryOp::BitOr => bitwise_binary_op(left, right, |left, right| left | right),
-        ScalarBinaryOp::ShiftLeft => bitwise_binary_op(left, right, |left, right| left << right),
-        ScalarBinaryOp::ShiftRight => bitwise_binary_op(left, right, |left, right| left >> right),
+        ScalarBinaryOp::ShiftLeft => shift_op(left, right, true),
+        ScalarBinaryOp::ShiftRight => shift_op(left, right, false),
         ScalarBinaryOp::Concat => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             (left, right) => Ok(Value::Text(format!(
@@ -4484,6 +4895,7 @@ fn evaluate_json_arrow_operator(json: &Value, path: &Value, text_result: bool) -
 fn sqlite_json_arrow_path(path: &Value) -> String {
     match path {
         Value::Integer(index) if *index >= 0 => format!("$[{index}]"),
+        Value::Integer(index) => format!("$[#-{}]", index.unsigned_abs()),
         Value::Text(path) if path.starts_with('$') => path.clone(),
         value => format!("$.{}", coerce_text_like_value(value)),
     }
@@ -4499,6 +4911,29 @@ fn bitwise_binary_op(left: Value, right: Value, op: impl FnOnce(i64, i64) -> i64
     }
 }
 
+fn shift_op(left: Value, right: Value, left_shift: bool) -> Result<Value> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (left, right) => {
+            let left = sqlite_bitwise_integer_arg(&left)?;
+            let right = sqlite_bitwise_integer_arg(&right)?;
+            let shift_left = if right < 0 { !left_shift } else { left_shift };
+            let amount = right.unsigned_abs();
+
+            if amount >= 64 {
+                return Ok(Value::Integer(if shift_left || left >= 0 { 0 } else { -1 }));
+            }
+
+            let amount = u32::try_from(amount).expect("shift amount < 64 fits in u32");
+            Ok(Value::Integer(if shift_left {
+                left.wrapping_shl(amount)
+            } else {
+                left.wrapping_shr(amount)
+            }))
+        }
+    }
+}
+
 fn sqlite_bitwise_integer_arg(value: &Value) -> Result<i64> {
     match cast_value(value.clone(), ColumnType::Integer)? {
         Value::Integer(value) => Ok(value),
@@ -4510,30 +4945,67 @@ fn sqlite_bitwise_integer_arg(value: &Value) -> Result<i64> {
 fn numeric_binary_op(
     left: Value,
     right: Value,
-    int_op: impl FnOnce(i64, i64) -> i64,
+    int_op: impl FnOnce(i64, i64) -> Option<i64>,
     real_op: impl FnOnce(f64, f64) -> f64,
 ) -> Result<Value> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-        (Value::Integer(left), Value::Integer(right)) => Ok(Value::Integer(int_op(left, right))),
-        (left, right) => Ok(Value::Real(real_op(
-            coerce_numeric_value(&left)?,
-            coerce_numeric_value(&right)?,
+        (Value::Integer(left), Value::Integer(right)) => match int_op(left, right) {
+            Some(result) => Ok(Value::Integer(result)),
+            None => Ok(Value::Real(real_op(left as f64, right as f64))),
+        },
+        (left, right) => {
+            let left = coerce_arithmetic_value(&left)?;
+            let right = coerce_arithmetic_value(&right)?;
+            match (left, right) {
+                (Value::Integer(left), Value::Integer(right)) => match int_op(left, right) {
+                    Some(result) => Ok(Value::Integer(result)),
+                    None => Ok(Value::Real(real_op(left as f64, right as f64))),
+                },
+                (left, right) => Ok(Value::Real(real_op(
+                    real_from_numeric_value(&left)?,
+                    real_from_numeric_value(&right)?,
+                ))),
+            }
+        }
+    }
+}
+
+fn coerce_arithmetic_value(value: &Value) -> Result<Value> {
+    Ok(match value {
+        Value::Integer(value) => Value::Integer(*value),
+        Value::Real(value) => Value::Real(*value),
+        Value::Boolean(value) => Value::Integer(if *value { 1 } else { 0 }),
+        Value::Text(value) => sqlite_text_arithmetic_prefix(value),
+        Value::Null => Value::Null,
+        Value::Blob(value) => sqlite_text_arithmetic_prefix(&String::from_utf8_lossy(value)),
+    })
+}
+
+fn real_from_numeric_value(value: &Value) -> Result<f64> {
+    match value {
+        Value::Integer(value) => Ok(*value as f64),
+        Value::Real(value) => Ok(*value),
+        Value::Null => Ok(0.0),
+        value => Err(DbError::storage(format!(
+            "cannot coerce {} to numeric",
+            value.type_name()
         ))),
     }
 }
 
-fn coerce_numeric_value(value: &Value) -> Result<f64> {
-    match value {
-        Value::Integer(value) => Ok(*value as f64),
-        Value::Real(value) => Ok(*value),
-        Value::Boolean(value) => Ok(if *value { 1.0 } else { 0.0 }),
-        Value::Text(value) => value
-            .parse::<f64>()
-            .map_err(|_| DbError::storage(format!("cannot coerce TEXT '{value}' to numeric"))),
-        Value::Null => Ok(0.0),
-        Value::Blob(_) => Err(DbError::storage("cannot coerce BLOB to numeric")),
+fn sqlite_text_arithmetic_prefix(value: &str) -> Value {
+    let Some((candidate, has_real_syntax)) = sqlite_numeric_text_prefix(value) else {
+        return Value::Integer(0);
+    };
+    if !has_real_syntax {
+        return match candidate.parse::<i64>() {
+            Ok(value) => Value::Integer(value),
+            Err(_) => Value::Real(candidate.parse::<f64>().unwrap_or(0.0)),
+        };
     }
+
+    Value::Real(candidate.parse::<f64>().unwrap_or(0.0))
 }
 
 fn cast_value(value: Value, ty: ColumnType) -> Result<Value> {
@@ -4604,6 +5076,13 @@ fn coerce_text_like_value(value: &Value) -> String {
 }
 
 fn sqlite_real_to_text(value: f64) -> String {
+    if value == f64::INFINITY {
+        return "Inf".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-Inf".to_string();
+    }
+
     let rendered = value.to_string();
     if rendered.contains(['.', 'e', 'E']) {
         rendered
@@ -4688,17 +5167,27 @@ fn compare(left: &Value, right: &Value) -> Result<Option<std::cmp::Ordering>> {
     Ok(match (left, right) {
         (Value::Null, _) | (_, Value::Null) => None,
         (Value::Boolean(left), Value::Boolean(right)) => Some(left.cmp(right)),
+        (Value::Boolean(left), Value::Integer(right)) => {
+            Some((if *left { 1_i64 } else { 0_i64 }).cmp(right))
+        }
+        (Value::Integer(left), Value::Boolean(right)) => {
+            Some(left.cmp(&(if *right { 1_i64 } else { 0_i64 })))
+        }
+        (Value::Boolean(left), Value::Real(right)) => {
+            Some((if *left { 1.0_f64 } else { 0.0_f64 }).total_cmp(right))
+        }
+        (Value::Real(left), Value::Boolean(right)) => {
+            Some(left.total_cmp(&(if *right { 1.0_f64 } else { 0.0_f64 })))
+        }
         (Value::Integer(left), Value::Integer(right)) => Some(left.cmp(right)),
+        (Value::Integer(left), Value::Real(right)) => Some((*left as f64).total_cmp(right)),
+        (Value::Real(left), Value::Integer(right)) => Some(left.total_cmp(&(*right as f64))),
         (Value::Real(left), Value::Real(right)) => Some(left.total_cmp(right)),
         (Value::Blob(left), Value::Blob(right)) => Some(left.cmp(right)),
         (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
-        _ => {
-            return Err(DbError::storage(format!(
-                "cannot compare {} and {}",
-                left.type_name(),
-                right.type_name()
-            )));
-        }
+        (left, right) => Some(
+            sqlite_min_max_storage_class_rank(left).cmp(&sqlite_min_max_storage_class_rank(right)),
+        ),
     })
 }
 
@@ -4754,29 +5243,60 @@ enum LikeToken {
     Literal(char),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LikeEscapeValue {
+    Missing,
+    Null,
+    Text(String),
+}
+
+impl LikeEscapeValue {
+    fn as_option_string(&self) -> Option<&str> {
+        match self {
+            Self::Missing | Self::Null => None,
+            Self::Text(value) => Some(value.as_str()),
+        }
+    }
+}
+
+fn evaluate_like_escape(
+    schema: &Schema,
+    row: &Row,
+    escape: &Option<Box<ScalarExpr>>,
+    case_sensitive_like: bool,
+) -> Result<LikeEscapeValue> {
+    let Some(escape) = escape else {
+        return Ok(LikeEscapeValue::Missing);
+    };
+    match evaluate_scalar_expr_with_like_mode(schema, row, escape, case_sensitive_like)? {
+        Value::Null => Ok(LikeEscapeValue::Null),
+        value => {
+            let text = coerce_text_like_value(&value);
+            let _ = like_escape_char(Some(text.as_str()))?;
+            Ok(LikeEscapeValue::Text(text))
+        }
+    }
+}
+
+fn evaluate_like_pattern(
+    schema: &Schema,
+    row: &Row,
+    pattern: &ScalarExpr,
+    case_sensitive_like: bool,
+) -> Result<LikeEscapeValue> {
+    match evaluate_scalar_expr_with_like_mode(schema, row, pattern, case_sensitive_like)? {
+        Value::Null => Ok(LikeEscapeValue::Null),
+        value => Ok(LikeEscapeValue::Text(coerce_text_like_value(&value))),
+    }
+}
+
 fn matches_like_pattern(
     value: &str,
     pattern: &str,
-    escape: &Option<String>,
+    escape: Option<&str>,
     case_sensitive: bool,
 ) -> Result<bool> {
-    let escape = match escape {
-        Some(escape) => {
-            let mut chars = escape.chars();
-            let Some(ch) = chars.next() else {
-                return Err(DbError::storage(
-                    "ESCAPE expression must be a single character",
-                ));
-            };
-            if chars.next().is_some() {
-                return Err(DbError::storage(
-                    "ESCAPE expression must be a single character",
-                ));
-            }
-            Some(ch)
-        }
-        None => None,
-    };
+    let escape = like_escape_char(escape)?;
 
     fn inner(value: &[char], pattern: &[LikeToken], case_sensitive: bool) -> bool {
         if pattern.is_empty() {
@@ -4797,9 +5317,31 @@ fn matches_like_pattern(
         }
     }
 
-    let value_chars = value.chars().collect::<Vec<_>>();
+    let value_chars = sqlite_text_prefix_before_nul(value)
+        .chars()
+        .collect::<Vec<_>>();
     let pattern_tokens = like_tokens(pattern, escape);
     Ok(inner(&value_chars, &pattern_tokens, case_sensitive))
+}
+
+fn like_escape_char(escape: Option<&str>) -> Result<Option<char>> {
+    Ok(match escape {
+        Some(escape) => {
+            let mut chars = escape.chars();
+            let Some(ch) = chars.next() else {
+                return Err(DbError::storage(
+                    "ESCAPE expression must be a single character",
+                ));
+            };
+            if chars.next().is_some() {
+                return Err(DbError::storage(
+                    "ESCAPE expression must be a single character",
+                ));
+            }
+            Some(ch)
+        }
+        None => None,
+    })
 }
 
 fn like_tokens(pattern: &str, escape: Option<char>) -> Vec<LikeToken> {
@@ -4839,9 +5381,10 @@ fn matches_glob_pattern(value: &str, pattern: &str) -> bool {
             index += 1;
         }
         let mut matched = false;
+        let mut saw_member = false;
 
         while index < pattern.len() {
-            if pattern[index] == ']' {
+            if pattern[index] == ']' && saw_member {
                 return Some((matched ^ negated, index + 1));
             }
 
@@ -4851,11 +5394,13 @@ fn matches_glob_pattern(value: &str, pattern: &str) -> bool {
                 if range_start <= ch && ch <= range_end {
                     matched = true;
                 }
+                saw_member = true;
                 index += 3;
             } else {
                 if pattern[index] == ch {
                     matched = true;
                 }
+                saw_member = true;
                 index += 1;
             }
         }
@@ -4883,7 +5428,109 @@ fn matches_glob_pattern(value: &str, pattern: &str) -> bool {
         }
     }
 
-    let value_chars = value.chars().collect::<Vec<_>>();
+    let value_chars = sqlite_text_prefix_before_nul(value)
+        .chars()
+        .collect::<Vec<_>>();
     let pattern_chars = pattern.chars().collect::<Vec<_>>();
     inner(&value_chars, &pattern_chars)
+}
+
+fn sqlite_regexp_matches(pattern: &str, value: &str) -> Result<bool> {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let value = sqlite_text_prefix_before_nul(value)
+        .chars()
+        .collect::<Vec<_>>();
+    if matches!(pattern.first(), Some('^')) {
+        return regexp_match_here(&pattern, 1, &value, 0);
+    }
+    for index in 0..=value.len() {
+        if regexp_match_here(&pattern, 0, &value, index)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn regexp_match_here(
+    pattern: &[char],
+    p_index: usize,
+    value: &[char],
+    v_index: usize,
+) -> Result<bool> {
+    if p_index == pattern.len() {
+        return Ok(true);
+    }
+    if pattern[p_index] == '$' && p_index + 1 == pattern.len() {
+        return Ok(v_index == value.len());
+    }
+    let (_, next_index) = regexp_atom_matches(pattern, p_index, '\0')?;
+    if next_index < pattern.len() && pattern[next_index] == '*' {
+        return regexp_match_star(pattern, p_index, next_index + 1, value, v_index);
+    }
+    if v_index >= value.len() {
+        return Ok(false);
+    }
+    let (matches, next_index) = regexp_atom_matches(pattern, p_index, value[v_index])?;
+    Ok(matches && regexp_match_here(pattern, next_index, value, v_index + 1)?)
+}
+
+fn regexp_match_star(
+    pattern: &[char],
+    atom_index: usize,
+    rest_index: usize,
+    value: &[char],
+    mut v_index: usize,
+) -> Result<bool> {
+    if regexp_match_here(pattern, rest_index, value, v_index)? {
+        return Ok(true);
+    }
+    while v_index < value.len() {
+        let (matches, _) = regexp_atom_matches(pattern, atom_index, value[v_index])?;
+        if !matches {
+            break;
+        }
+        v_index += 1;
+        if regexp_match_here(pattern, rest_index, value, v_index)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn regexp_atom_matches(pattern: &[char], index: usize, value: char) -> Result<(bool, usize)> {
+    if pattern[index] == '.' {
+        return Ok((true, index + 1));
+    }
+    if pattern[index] != '[' {
+        return Ok((pattern[index] == value, index + 1));
+    }
+
+    let mut cursor = index + 1;
+    let negated = matches!(pattern.get(cursor), Some('^'));
+    if negated {
+        cursor += 1;
+    }
+    let mut matched = false;
+    let mut saw_member = false;
+    while cursor < pattern.len() {
+        if pattern[cursor] == ']' && saw_member {
+            return Ok((matched ^ negated, cursor + 1));
+        }
+        if cursor + 2 < pattern.len() && pattern[cursor + 1] == '-' && pattern[cursor + 2] != ']' {
+            let start = pattern[cursor];
+            let end = pattern[cursor + 2];
+            if start <= value && value <= end {
+                matched = true;
+            }
+            cursor += 3;
+            saw_member = true;
+            continue;
+        }
+        if pattern[cursor] == value {
+            matched = true;
+        }
+        cursor += 1;
+        saw_member = true;
+    }
+    Err(DbError::storage("unclosed '['"))
 }

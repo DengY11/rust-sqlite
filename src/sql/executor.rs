@@ -1,17 +1,20 @@
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::error::{DbError, Result};
 use crate::common::types::{
-    ColumnDef, ColumnDefault, ColumnType, IndexMeta, Row, RowId, Schema, Value,
+    ColumnDef, ColumnDefault, ColumnType, ForeignKey, IndexMeta, Row, RowId, Schema, Value,
+    sqlite_round_f64,
 };
 use crate::engine::{PlanningStorageEngine, TransactionId};
 use crate::sql::ast::{
     AggregateArg, AggregateFunc, AlterTableAction, Assignment, CompareOp, CompoundOperator, Expr,
-    JoinKind, NullOrder, OrderBy, OrderByExpr, SINGLE_ROW_SOURCE_TABLE, ScalarBinaryOp, ScalarExpr,
-    ScalarFunc, SelectItem, Statement, TableConstraint,
+    FromItem, JoinKind, NullOrder, OrderBy, OrderByExpr, SINGLE_ROW_SOURCE_TABLE, ScalarBinaryOp,
+    ScalarExpr, ScalarFunc, SelectItem, Statement, TableConstraint, WindowExclude, WindowFrame,
+    WindowFunc, WindowRangeOffset,
 };
 use crate::sql::optimizer::Optimizer;
 use crate::sql::parser::{parse_check_constraint_expression, parse_scalar_sql_expression};
@@ -24,10 +27,48 @@ const SQLITE_COMPILE_OPTIONS: &[&str] = &[
     "OMIT_LOAD_EXTENSION",
 ];
 
+fn pragma_schema_matches_storage_name(storage_name: &str, schema_filter: Option<&str>) -> bool {
+    match schema_filter {
+        Some(schema) if schema.eq_ignore_ascii_case("temp") => {
+            storage_name.starts_with("__rustsql_temp__")
+        }
+        Some(schema) if schema.eq_ignore_ascii_case("main") => {
+            !storage_name.starts_with("__rustsql_temp__")
+        }
+        _ => true,
+    }
+}
+
+fn display_catalog_name(storage_name: &str) -> String {
+    storage_name
+        .strip_prefix("__rustsql_temp__")
+        .unwrap_or(storage_name)
+        .to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InsertConflictTarget {
     PrimaryKey(Vec<String>),
     UniqueIndex(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForeignKeyDeleteAction {
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+fn foreign_key_delete_action(foreign_key: &ForeignKey) -> ForeignKeyDeleteAction {
+    match foreign_key.on_delete.as_deref() {
+        Some(action) if action.eq_ignore_ascii_case("CASCADE") => ForeignKeyDeleteAction::Cascade,
+        Some(action) if action.eq_ignore_ascii_case("SET NULL") => ForeignKeyDeleteAction::SetNull,
+        Some(action) if action.eq_ignore_ascii_case("SET DEFAULT") => {
+            ForeignKeyDeleteAction::SetDefault
+        }
+        _ => ForeignKeyDeleteAction::Restrict,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +77,7 @@ struct ColumnMeta {
     alias: Option<String>,
     name: String,
     output_name: String,
+    ctas_declared_type: Option<String>,
     collation: Option<String>,
     hidden: bool,
 }
@@ -49,23 +91,27 @@ struct RowSet {
 #[derive(Debug, Clone)]
 enum AggregateState {
     Count(i64),
-    CountDistinct(BTreeSet<Value>),
+    CountDistinct(BTreeSet<(u8, String)>),
     Sum {
         int_sum: i128,
         real_sum: f64,
         seen: bool,
         saw_real: bool,
     },
-    SumDistinct(BTreeSet<Value>),
+    SumDistinct(BTreeMap<(u8, String), Value>),
     Avg {
         int_sum: i128,
         real_sum: f64,
         count: i64,
         saw_real: bool,
     },
-    AvgDistinct(BTreeSet<Value>),
+    AvgDistinct(BTreeMap<(u8, String), Value>),
     Total(f64),
-    TotalDistinct(BTreeSet<Value>),
+    TotalDistinct(BTreeMap<(u8, String), Value>),
+    DecimalSum {
+        total: f64,
+        seen_row: bool,
+    },
     Median(Vec<f64>),
     Percentile {
         values: Vec<f64>,
@@ -79,7 +125,7 @@ enum AggregateState {
     },
     GroupConcatDistinct {
         values: Vec<String>,
-        seen: BTreeSet<Value>,
+        seen: BTreeSet<(u8, String)>,
         ordered: Vec<(Vec<Option<Value>>, String)>,
         order_by: Vec<OrderBy>,
     },
@@ -87,11 +133,13 @@ enum AggregateState {
         values: Vec<String>,
         ordered: Vec<(Vec<Option<Value>>, String)>,
         order_by: Vec<OrderBy>,
+        jsonb: bool,
     },
     JsonGroupObject {
         fields: Vec<String>,
         ordered: Vec<(Vec<Option<Value>>, String)>,
         order_by: Vec<OrderBy>,
+        jsonb: bool,
     },
     Min(Option<Value>),
     Max(Option<Value>),
@@ -111,6 +159,22 @@ enum LikeToken {
     Literal(char),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LikeEscapeValue {
+    Missing,
+    Null,
+    Text(String),
+}
+
+impl LikeEscapeValue {
+    fn as_option_string(&self) -> Option<&str> {
+        match self {
+            Self::Missing | Self::Null => None,
+            Self::Text(value) => Some(value.as_str()),
+        }
+    }
+}
+
 struct AggregateExecOptions<'a> {
     columns: &'a [SelectItem],
     group_by: &'a [ScalarExpr],
@@ -118,6 +182,11 @@ struct AggregateExecOptions<'a> {
     order_by: &'a [OrderBy],
     limit: Option<usize>,
     offset: Option<usize>,
+}
+
+struct AggregateGroup {
+    representative_row: Row,
+    states: Vec<AggregateState>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -128,23 +197,59 @@ struct SqlitePrintfFlags {
     zero_pad: bool,
     grouping: bool,
     alternate: bool,
+    alternate_form_2: bool,
 }
 
 pub struct Executor<'a, S: PlanningStorageEngine> {
     storage: &'a S,
     current_txn: &'a Cell<Option<TransactionId>>,
+    savepoint_transaction: &'a Cell<bool>,
+    savepoint_stack: &'a RefCell<Vec<String>>,
     last_insert_rowid: &'a Cell<i64>,
     changes: &'a Cell<i64>,
     total_changes: &'a Cell<i64>,
+    temp_database_used: &'a Cell<bool>,
+    deferred_foreign_keys_pending: &'a Cell<bool>,
+    defer_foreign_keys: &'a Cell<bool>,
     foreign_keys: &'a Cell<bool>,
     read_uncommitted: &'a Cell<bool>,
     query_only: &'a Cell<bool>,
+    count_changes: &'a Cell<bool>,
     recursive_triggers: &'a Cell<bool>,
     trusted_schema: &'a Cell<bool>,
     threads: &'a Cell<u32>,
+    synchronous: &'a Cell<i64>,
+    temp_synchronous: &'a Cell<i64>,
+    temp_store: &'a Cell<i64>,
+    journal_mode: &'a RefCell<String>,
+    temp_journal_mode: &'a RefCell<String>,
+    locking_mode: &'a RefCell<String>,
+    temp_locking_mode: &'a RefCell<String>,
     cache_size: &'a Cell<i64>,
+    temp_cache_size: &'a Cell<i64>,
+    cache_spill: &'a Cell<i64>,
     busy_timeout: &'a Cell<i64>,
+    secure_delete: &'a Cell<i64>,
+    temp_secure_delete: &'a Cell<i64>,
+    wal_autocheckpoint: &'a Cell<i64>,
+    auto_vacuum: &'a Cell<i64>,
+    max_page_count: &'a Cell<i64>,
+    temp_user_version: &'a Cell<u32>,
+    temp_application_id: &'a Cell<u32>,
+    temp_schema_version: &'a Cell<u32>,
+    mmap_size: &'a Cell<i64>,
+    analysis_limit: &'a Cell<u32>,
+    journal_size_limit: &'a Cell<i64>,
+    soft_heap_limit: &'a Cell<i64>,
+    automatic_index: &'a Cell<bool>,
+    cell_size_check: &'a Cell<bool>,
+    full_column_names: &'a Cell<bool>,
+    short_column_names: &'a Cell<bool>,
+    fullfsync: &'a Cell<bool>,
+    checkpoint_fullfsync: &'a Cell<bool>,
+    empty_result_callbacks: &'a Cell<bool>,
     reverse_unordered_selects: &'a Cell<bool>,
+    temp_page_size: &'a Cell<u32>,
 }
 
 impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
@@ -152,34 +257,104 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     pub fn new(
         storage: &'a S,
         current_txn: &'a Cell<Option<TransactionId>>,
+        savepoint_transaction: &'a Cell<bool>,
+        savepoint_stack: &'a RefCell<Vec<String>>,
         last_insert_rowid: &'a Cell<i64>,
         changes: &'a Cell<i64>,
         total_changes: &'a Cell<i64>,
+        temp_database_used: &'a Cell<bool>,
+        deferred_foreign_keys_pending: &'a Cell<bool>,
+        defer_foreign_keys: &'a Cell<bool>,
         foreign_keys: &'a Cell<bool>,
         read_uncommitted: &'a Cell<bool>,
         query_only: &'a Cell<bool>,
+        count_changes: &'a Cell<bool>,
         recursive_triggers: &'a Cell<bool>,
         trusted_schema: &'a Cell<bool>,
         threads: &'a Cell<u32>,
+        synchronous: &'a Cell<i64>,
+        temp_synchronous: &'a Cell<i64>,
+        temp_store: &'a Cell<i64>,
+        journal_mode: &'a RefCell<String>,
+        temp_journal_mode: &'a RefCell<String>,
+        locking_mode: &'a RefCell<String>,
+        temp_locking_mode: &'a RefCell<String>,
         cache_size: &'a Cell<i64>,
+        temp_cache_size: &'a Cell<i64>,
+        cache_spill: &'a Cell<i64>,
         busy_timeout: &'a Cell<i64>,
+        secure_delete: &'a Cell<i64>,
+        temp_secure_delete: &'a Cell<i64>,
+        wal_autocheckpoint: &'a Cell<i64>,
+        auto_vacuum: &'a Cell<i64>,
+        max_page_count: &'a Cell<i64>,
+        temp_user_version: &'a Cell<u32>,
+        temp_application_id: &'a Cell<u32>,
+        temp_schema_version: &'a Cell<u32>,
+        mmap_size: &'a Cell<i64>,
+        analysis_limit: &'a Cell<u32>,
+        journal_size_limit: &'a Cell<i64>,
+        soft_heap_limit: &'a Cell<i64>,
+        automatic_index: &'a Cell<bool>,
+        cell_size_check: &'a Cell<bool>,
+        full_column_names: &'a Cell<bool>,
+        short_column_names: &'a Cell<bool>,
+        fullfsync: &'a Cell<bool>,
+        checkpoint_fullfsync: &'a Cell<bool>,
+        empty_result_callbacks: &'a Cell<bool>,
         reverse_unordered_selects: &'a Cell<bool>,
+        temp_page_size: &'a Cell<u32>,
     ) -> Self {
         Self {
             storage,
             current_txn,
+            savepoint_transaction,
+            savepoint_stack,
             last_insert_rowid,
             changes,
             total_changes,
+            temp_database_used,
+            deferred_foreign_keys_pending,
+            defer_foreign_keys,
             foreign_keys,
             read_uncommitted,
             query_only,
+            count_changes,
             recursive_triggers,
             trusted_schema,
             threads,
+            synchronous,
+            temp_synchronous,
+            temp_store,
+            journal_mode,
+            temp_journal_mode,
+            locking_mode,
+            temp_locking_mode,
             cache_size,
+            temp_cache_size,
+            cache_spill,
             busy_timeout,
+            secure_delete,
+            temp_secure_delete,
+            wal_autocheckpoint,
+            auto_vacuum,
+            max_page_count,
+            temp_user_version,
+            temp_application_id,
+            temp_schema_version,
+            mmap_size,
+            analysis_limit,
+            journal_size_limit,
+            soft_heap_limit,
+            automatic_index,
+            cell_size_check,
+            full_column_names,
+            short_column_names,
+            fullfsync,
+            checkpoint_fullfsync,
+            empty_result_callbacks,
             reverse_unordered_selects,
+            temp_page_size,
         }
     }
 
@@ -191,6 +366,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 }
                 let transaction_id = self.storage.begin_with_isolation(isolation_level)?;
                 self.current_txn.set(Some(transaction_id));
+                self.savepoint_transaction.set(false);
+                self.savepoint_stack.borrow_mut().clear();
+                self.deferred_foreign_keys_pending.set(false);
                 Ok(Vec::new())
             }
             Plan::CommitTxn => {
@@ -198,8 +376,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     .current_txn
                     .get()
                     .ok_or_else(|| DbError::txn("no active transaction to commit"))?;
+                if self.deferred_foreign_keys_pending.get() {
+                    self.validate_deferred_foreign_keys(transaction_id)?;
+                }
                 self.storage.commit(transaction_id)?;
                 self.current_txn.set(None);
+                self.savepoint_transaction.set(false);
+                self.savepoint_stack.borrow_mut().clear();
+                self.deferred_foreign_keys_pending.set(false);
+                self.defer_foreign_keys.set(false);
                 Ok(Vec::new())
             }
             Plan::RollbackTxn => {
@@ -209,6 +394,69 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     .ok_or_else(|| DbError::txn("no active transaction to roll back"))?;
                 self.storage.rollback(transaction_id)?;
                 self.current_txn.set(None);
+                self.savepoint_transaction.set(false);
+                self.savepoint_stack.borrow_mut().clear();
+                self.deferred_foreign_keys_pending.set(false);
+                self.defer_foreign_keys.set(false);
+                Ok(Vec::new())
+            }
+            Plan::Savepoint { name } => {
+                let transaction_id = if let Some(transaction_id) = self.current_txn.get() {
+                    transaction_id
+                } else {
+                    let transaction_id = self.storage.begin()?;
+                    self.current_txn.set(Some(transaction_id));
+                    self.savepoint_transaction.set(true);
+                    self.deferred_foreign_keys_pending.set(false);
+                    transaction_id
+                };
+                self.storage.savepoint(transaction_id, &name)?;
+                self.savepoint_stack.borrow_mut().push(name);
+                Ok(Vec::new())
+            }
+            Plan::RollbackTo { name } => {
+                let transaction_id = self
+                    .current_txn
+                    .get()
+                    .ok_or_else(|| DbError::txn("no active transaction to roll back"))?;
+                self.storage.rollback_to_savepoint(transaction_id, &name)?;
+                let mut savepoints = self.savepoint_stack.borrow_mut();
+                let savepoint_index = savepoints
+                    .iter()
+                    .rposition(|savepoint| savepoint.eq_ignore_ascii_case(&name))
+                    .ok_or_else(|| DbError::txn(format!("no such savepoint: {name}")))?;
+                savepoints.truncate(savepoint_index + 1);
+                Ok(Vec::new())
+            }
+            Plan::Release { name } => {
+                let transaction_id = self
+                    .current_txn
+                    .get()
+                    .ok_or_else(|| DbError::txn("no active transaction to release"))?;
+                let (savepoint_index, is_outermost) = {
+                    let savepoints = self.savepoint_stack.borrow();
+                    let savepoint_index = savepoints
+                        .iter()
+                        .rposition(|savepoint| savepoint.eq_ignore_ascii_case(&name))
+                        .ok_or_else(|| DbError::txn(format!("no such savepoint: {name}")))?;
+                    let is_outermost = self.savepoint_transaction.get() && savepoint_index == 0;
+                    (savepoint_index, is_outermost)
+                };
+                if is_outermost {
+                    if self.deferred_foreign_keys_pending.get() {
+                        self.validate_deferred_foreign_keys(transaction_id)?;
+                    }
+                    self.storage.release_savepoint(transaction_id, &name)?;
+                    self.savepoint_stack.borrow_mut().truncate(savepoint_index);
+                    self.storage.commit(transaction_id)?;
+                    self.current_txn.set(None);
+                    self.savepoint_transaction.set(false);
+                    self.deferred_foreign_keys_pending.set(false);
+                    self.defer_foreign_keys.set(false);
+                } else {
+                    self.storage.release_savepoint(transaction_id, &name)?;
+                    self.savepoint_stack.borrow_mut().truncate(savepoint_index);
+                }
                 Ok(Vec::new())
             }
             other => match self.current_txn.get() {
@@ -248,6 +496,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 strict,
                 without_rowid,
                 if_not_exists,
+                temporary,
             } => {
                 let mut schema = Schema::new(name, columns);
                 schema.strict = strict;
@@ -317,6 +566,22 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         autoindex_ordinal += 1;
                     }
                 }
+                if temporary {
+                    for foreign_key in schema.all_foreign_keys() {
+                        let internal_ref = format!("__rustsql_temp__{}", foreign_key.ref_table);
+                        if foreign_key.ref_table == schema.name
+                            || self
+                                .storage
+                                .get_schema(transaction_id, &internal_ref)?
+                                .is_some()
+                        {
+                            schema.rename_foreign_key_ref_table(
+                                &foreign_key.ref_table,
+                                &internal_ref,
+                            );
+                        }
+                    }
+                }
                 self.validate_create_table_foreign_key_metadata(transaction_id, &schema)?;
                 let table_name = schema.name.clone();
                 if let Err(error) = self.storage.create_schema(transaction_id, schema) {
@@ -330,9 +595,17 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         .create_index(transaction_id, &table_name, index)?;
                 }
                 self.storage.increment_schema_version()?;
+                if temporary {
+                    self.temp_database_used.set(true);
+                }
                 Ok(Vec::new())
             }
-            Plan::CreateTableAs { name, source, .. } => {
+            Plan::CreateTableAs {
+                name,
+                source,
+                temporary,
+                ..
+            } => {
                 let source = self.execute_query_plan(transaction_id, *source)?;
                 let schema = Self::schema_from_ctas_rowset(&name, &source)?;
                 self.storage.create_schema(transaction_id, schema)?;
@@ -353,39 +626,104 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 }
                 self.record_changes(inserted_count);
                 self.storage.increment_schema_version()?;
+                if temporary {
+                    self.temp_database_used.set(true);
+                }
                 Ok(Vec::new())
             }
-            Plan::PragmaTableInfo { table } => {
+            Plan::CreateView {
+                name,
+                columns,
+                view_columns,
+                select,
+                create_sql,
+                temporary,
+            } => {
+                let schema = Schema::view(name, columns, view_columns, select, create_sql);
+                self.storage.create_schema(transaction_id, schema)?;
+                self.storage.increment_schema_version()?;
+                if temporary {
+                    self.temp_database_used.set(true);
+                }
+                Ok(Vec::new())
+            }
+            Plan::PragmaTableInfo { table, schema } => {
+                let table = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    format!("__rustsql_temp__{table}")
+                } else {
+                    table
+                };
                 self.execute_pragma_table_info(transaction_id, &table, false)
             }
-            Plan::PragmaTableXInfo { table } => {
+            Plan::PragmaTableXInfo { table, schema } => {
+                let table = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    format!("__rustsql_temp__{table}")
+                } else {
+                    table
+                };
                 self.execute_pragma_table_info(transaction_id, &table, true)
             }
             Plan::PragmaTableList { table, schema } => {
                 self.execute_pragma_table_list(transaction_id, table.as_deref(), schema.as_deref())
             }
-            Plan::PragmaIndexList { table } => {
+            Plan::PragmaIndexList { table, schema } => {
+                let table = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    format!("__rustsql_temp__{table}")
+                } else {
+                    table
+                };
                 self.execute_pragma_index_list(transaction_id, &table)
             }
-            Plan::PragmaIndexInfo { index } => {
-                self.execute_pragma_index_info(transaction_id, &index)
+            Plan::PragmaIndexInfo { index, schema } => {
+                self.execute_pragma_index_info(transaction_id, &index, schema.as_deref())
             }
-            Plan::PragmaIndexXInfo { index } => {
-                self.execute_pragma_index_xinfo(transaction_id, &index)
+            Plan::PragmaIndexXInfo { index, schema } => {
+                self.execute_pragma_index_xinfo(transaction_id, &index, schema.as_deref())
             }
-            Plan::PragmaForeignKeyList { table } => {
+            Plan::PragmaForeignKeyList { table, schema } => {
+                let table = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    format!("__rustsql_temp__{table}")
+                } else {
+                    table
+                };
                 self.execute_pragma_foreign_key_list(transaction_id, &table)
             }
-            Plan::PragmaForeignKeyCheck { table } => {
-                self.execute_pragma_foreign_key_check(transaction_id, table.as_deref())
-            }
+            Plan::PragmaForeignKeyCheck { table, schema } => self.execute_pragma_foreign_key_check(
+                transaction_id,
+                table.as_deref(),
+                schema.as_deref(),
+            ),
             Plan::PragmaForeignKeys => Ok(vec![vec![Value::Integer(if self.foreign_keys.get() {
                 1
             } else {
                 0
             })]]),
             Plan::SetPragmaForeignKeys { enabled } => {
-                self.foreign_keys.set(enabled);
+                if self.current_txn.get().is_none() {
+                    self.foreign_keys.set(enabled);
+                }
+                Ok(Vec::new())
+            }
+            Plan::PragmaDeferForeignKeys => Ok(vec![vec![Value::Integer(
+                if self.defer_foreign_keys.get() { 1 } else { 0 },
+            )]]),
+            Plan::SetPragmaDeferForeignKeys { enabled } => {
+                self.defer_foreign_keys.set(enabled);
+                if !enabled {
+                    self.deferred_foreign_keys_pending.set(false);
+                }
                 Ok(Vec::new())
             }
             Plan::PragmaReadUncommitted => {
@@ -406,6 +744,17 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             })]]),
             Plan::SetPragmaQueryOnly { enabled } => {
                 self.query_only.set(enabled);
+                Ok(Vec::new())
+            }
+            Plan::PragmaCountChanges => {
+                Ok(vec![vec![Value::Integer(if self.count_changes.get() {
+                    1
+                } else {
+                    0
+                })]])
+            }
+            Plan::SetPragmaCountChanges { enabled } => {
+                self.count_changes.set(enabled);
                 Ok(Vec::new())
             }
             Plan::PragmaRecursiveTriggers => Ok(vec![vec![Value::Integer(
@@ -438,6 +787,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 Ok(Vec::new())
             }
             Plan::PragmaEncoding => Ok(vec![vec![Value::from("UTF-8")]]),
+            Plan::SetPragmaEncoding => Ok(Vec::new()),
             Plan::PragmaCollationList => Ok(vec![
                 vec![Value::Integer(0), Value::from("BINARY")],
                 vec![Value::Integer(1), Value::from("NOCASE")],
@@ -452,25 +802,313 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 .iter()
                 .map(|option| vec![Value::from(*option)])
                 .collect()),
-            Plan::PragmaJournalMode => Ok(vec![vec![Value::from(self.storage.journal_mode())]]),
-            Plan::PragmaSynchronous => Ok(vec![vec![Value::Integer(2)]]),
-            Plan::PragmaCacheSize => Ok(vec![vec![Value::Integer(self.cache_size.get())]]),
-            Plan::SetPragmaCacheSize { value } => {
-                self.cache_size.set(value);
+            Plan::PragmaPragmaList => Ok(supported_pragma_list_rows()),
+            Plan::PragmaModuleList => Ok(Vec::new()),
+            Plan::PragmaStats => Ok(Vec::new()),
+            Plan::PragmaJournalMode { schema } => {
+                let journal_mode = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_journal_mode.borrow()
+                } else {
+                    self.journal_mode.borrow()
+                };
+                Ok(vec![vec![Value::from(journal_mode.as_str())]])
+            }
+            Plan::SetPragmaJournalMode { mode, schema } => {
+                let normalized = mode.to_ascii_lowercase();
+                if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    if matches!(normalized.as_str(), "delete" | "off" | "memory") {
+                        self.temp_journal_mode.replace(normalized);
+                    }
+                    return Ok(vec![vec![Value::from(
+                        self.temp_journal_mode.borrow().as_str(),
+                    )]]);
+                }
+
+                let storage_mode = self.storage.journal_mode();
+                let next_mode = match storage_mode {
+                    "memory"
+                        if matches!(normalized.as_str(), "memory" | "truncate" | "persist") =>
+                    {
+                        Some("memory")
+                    }
+                    "memory" if normalized == "off" => Some("off"),
+                    "delete"
+                        if matches!(
+                            normalized.as_str(),
+                            "delete" | "off" | "memory" | "truncate" | "persist"
+                        ) =>
+                    {
+                        Some(normalized.as_str())
+                    }
+                    _ if normalized == storage_mode => Some(storage_mode),
+                    _ => None,
+                };
+                if let Some(next_mode) = next_mode {
+                    self.journal_mode.replace(next_mode.to_string());
+                    Ok(vec![vec![Value::from(self.journal_mode.borrow().as_str())]])
+                } else {
+                    Err(DbError::sql(format!(
+                        "changing journal_mode is not supported: {mode}"
+                    )))
+                }
+            }
+            Plan::PragmaSynchronous { schema } => {
+                let synchronous = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_synchronous.get()
+                } else {
+                    self.synchronous.get()
+                };
+                Ok(vec![vec![Value::Integer(synchronous)]])
+            }
+            Plan::SetPragmaSynchronous { value, schema } => {
+                if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_synchronous.set(value);
+                } else {
+                    self.synchronous.set(value);
+                }
                 Ok(Vec::new())
             }
-            Plan::PragmaTempStore => Ok(vec![vec![Value::Integer(0)]]),
-            Plan::PragmaLockingMode => Ok(vec![vec![Value::from("normal")]]),
+            Plan::PragmaCacheSize { schema } => {
+                let cache_size = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_cache_size.get()
+                } else {
+                    self.cache_size.get()
+                };
+                Ok(vec![vec![Value::Integer(cache_size)]])
+            }
+            Plan::SetPragmaCacheSize { value, schema } => {
+                if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_cache_size.set(value);
+                } else {
+                    self.cache_size.set(value);
+                }
+                Ok(Vec::new())
+            }
+            Plan::PragmaCacheSpill => Ok(vec![vec![Value::Integer(self.cache_spill.get())]]),
+            Plan::SetPragmaCacheSpill { value } => {
+                if let Some(value) = value {
+                    self.cache_spill.set(value);
+                }
+                Ok(vec![vec![Value::Integer(self.cache_spill.get())]])
+            }
+            Plan::PragmaTempStore => Ok(vec![vec![Value::Integer(self.temp_store.get())]]),
+            Plan::SetPragmaTempStore { value } => {
+                self.temp_store.set(value);
+                Ok(Vec::new())
+            }
+            Plan::PragmaLockingMode { schema } => {
+                let locking_mode = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_locking_mode.borrow()
+                } else {
+                    self.locking_mode.borrow()
+                };
+                Ok(vec![vec![Value::from(locking_mode.as_str())]])
+            }
+            Plan::SetPragmaLockingMode { mode, schema } => {
+                let normalized = mode.to_ascii_lowercase();
+                if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    if normalized == "exclusive" {
+                        self.temp_locking_mode.replace(normalized);
+                    }
+                    return Ok(vec![vec![Value::from(
+                        self.temp_locking_mode.borrow().as_str(),
+                    )]]);
+                }
+
+                if matches!(normalized.as_str(), "normal" | "exclusive") {
+                    self.locking_mode.replace(normalized);
+                }
+                Ok(vec![vec![Value::from(self.locking_mode.borrow().as_str())]])
+            }
+            Plan::PragmaSecureDelete { schema } => {
+                let secure_delete = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_secure_delete.get()
+                } else {
+                    self.secure_delete.get()
+                };
+                Ok(vec![vec![Value::Integer(secure_delete)]])
+            }
+            Plan::SetPragmaSecureDelete { value, schema } => {
+                let secure_delete = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    if let Some(value) = value {
+                        self.temp_secure_delete.set(value);
+                    }
+                    self.temp_secure_delete.get()
+                } else {
+                    if let Some(value) = value {
+                        self.secure_delete.set(value);
+                    }
+                    self.secure_delete.get()
+                };
+                Ok(vec![vec![Value::Integer(secure_delete)]])
+            }
+            Plan::PragmaWalAutocheckpoint => {
+                Ok(vec![vec![Value::Integer(self.wal_autocheckpoint.get())]])
+            }
+            Plan::SetPragmaWalAutocheckpoint { value } => {
+                if let Some(value) = value {
+                    self.wal_autocheckpoint.set(value);
+                }
+                Ok(vec![vec![Value::Integer(self.wal_autocheckpoint.get())]])
+            }
+            Plan::PragmaWalCheckpoint => Ok(vec![vec![
+                Value::Integer(0),
+                Value::Integer(-1),
+                Value::Integer(-1),
+            ]]),
+            Plan::PragmaAutoVacuum => Ok(vec![vec![Value::Integer(self.auto_vacuum.get())]]),
+            Plan::SetPragmaAutoVacuum { value } => {
+                if let Some(value) = value {
+                    self.auto_vacuum.set(value);
+                }
+                Ok(Vec::new())
+            }
+            Plan::PragmaMmapSize => {
+                if self.storage.database_path().is_some() {
+                    Ok(vec![vec![Value::Integer(self.mmap_size.get())]])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            Plan::SetPragmaMmapSize { value } => {
+                self.mmap_size.set(value.max(0));
+                Ok(Vec::new())
+            }
             Plan::PragmaBusyTimeout => Ok(vec![vec![Value::Integer(self.busy_timeout.get())]]),
             Plan::SetPragmaBusyTimeout { value } => {
                 if value >= 0 {
                     self.busy_timeout.set(value);
                 }
-                Ok(Vec::new())
+                Ok(vec![vec![Value::Integer(self.busy_timeout.get())]])
+            }
+            Plan::PragmaAnalysisLimit => Ok(vec![vec![Value::Integer(i64::from(
+                self.analysis_limit.get(),
+            ))]]),
+            Plan::SetPragmaAnalysisLimit { value } => {
+                if let Some(value) = value {
+                    self.analysis_limit.set(value);
+                }
+                Ok(vec![vec![Value::Integer(i64::from(
+                    self.analysis_limit.get(),
+                ))]])
+            }
+            Plan::PragmaJournalSizeLimit => {
+                Ok(vec![vec![Value::Integer(self.journal_size_limit.get())]])
+            }
+            Plan::SetPragmaJournalSizeLimit { value } => {
+                self.journal_size_limit.set(value);
+                Ok(vec![vec![Value::Integer(self.journal_size_limit.get())]])
+            }
+            Plan::PragmaSoftHeapLimit => Ok(vec![vec![Value::Integer(self.soft_heap_limit.get())]]),
+            Plan::SetPragmaSoftHeapLimit { value } => {
+                self.soft_heap_limit.set(value);
+                Ok(vec![vec![Value::Integer(self.soft_heap_limit.get())]])
+            }
+            Plan::PragmaHardHeapLimit | Plan::SetPragmaHardHeapLimit { .. } => {
+                Ok(vec![vec![Value::Integer(0)]])
             }
             Plan::PragmaThreads => Ok(vec![vec![Value::Integer(i64::from(self.threads.get()))]]),
             Plan::SetPragmaThreads { value } => {
-                self.threads.set(value);
+                if let Some(value) = value {
+                    self.threads.set(value);
+                }
+                Ok(vec![vec![Value::Integer(i64::from(self.threads.get()))]])
+            }
+            Plan::PragmaAutomaticIndex => {
+                Ok(vec![vec![Value::Integer(if self.automatic_index.get() {
+                    1
+                } else {
+                    0
+                })]])
+            }
+            Plan::SetPragmaAutomaticIndex { enabled } => {
+                self.automatic_index.set(enabled);
+                Ok(Vec::new())
+            }
+            Plan::PragmaCellSizeCheck => {
+                Ok(vec![vec![Value::Integer(if self.cell_size_check.get() {
+                    1
+                } else {
+                    0
+                })]])
+            }
+            Plan::SetPragmaCellSizeCheck { enabled } => {
+                self.cell_size_check.set(enabled);
+                Ok(Vec::new())
+            }
+            Plan::PragmaFullColumnNames => Ok(vec![vec![Value::Integer(
+                if self.full_column_names.get() { 1 } else { 0 },
+            )]]),
+            Plan::SetPragmaFullColumnNames { enabled } => {
+                self.full_column_names.set(enabled);
+                Ok(Vec::new())
+            }
+            Plan::PragmaShortColumnNames => Ok(vec![vec![Value::Integer(
+                if self.short_column_names.get() { 1 } else { 0 },
+            )]]),
+            Plan::SetPragmaShortColumnNames { enabled } => {
+                self.short_column_names.set(enabled);
+                Ok(Vec::new())
+            }
+            Plan::PragmaFullFsync => Ok(vec![vec![Value::Integer(if self.fullfsync.get() {
+                1
+            } else {
+                0
+            })]]),
+            Plan::SetPragmaFullFsync { enabled } => {
+                self.fullfsync.set(enabled);
+                Ok(Vec::new())
+            }
+            Plan::PragmaCheckpointFullFsync => Ok(vec![vec![Value::Integer(
+                if self.checkpoint_fullfsync.get() {
+                    1
+                } else {
+                    0
+                },
+            )]]),
+            Plan::SetPragmaCheckpointFullFsync { enabled } => {
+                self.checkpoint_fullfsync.set(enabled);
+                Ok(Vec::new())
+            }
+            Plan::PragmaEmptyResultCallbacks => Ok(vec![vec![Value::Integer(
+                if self.empty_result_callbacks.get() {
+                    1
+                } else {
+                    0
+                },
+            )]]),
+            Plan::SetPragmaEmptyResultCallbacks { enabled } => {
+                self.empty_result_callbacks.set(enabled);
                 Ok(Vec::new())
             }
             Plan::PragmaCaseSensitiveLike => Ok(vec![vec![Value::Integer(
@@ -495,42 +1133,124 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 self.reverse_unordered_selects.set(enabled);
                 Ok(Vec::new())
             }
-            Plan::PragmaDatabaseList => Ok(vec![vec![
-                Value::Integer(0),
-                Value::from("main"),
-                self.storage
-                    .database_path()
-                    .map(|path| Value::from(path.to_string_lossy().as_ref()))
-                    .unwrap_or_else(|| Value::from("")),
-            ]]),
-            Plan::PragmaPageSize => Ok(vec![vec![Value::Integer(i64::from(
-                self.storage.database_page_size(),
-            ))]]),
-            Plan::PragmaPageCount => Ok(vec![vec![Value::Integer(i64::from(
-                self.storage.database_page_count()?,
-            ))]]),
-            Plan::PragmaFreelistCount => Ok(vec![vec![Value::Integer(i64::from(
-                self.storage.database_freelist_count()?,
-            ))]]),
-            Plan::PragmaUserVersion => Ok(vec![vec![Value::Integer(i64::from(
-                self.storage.user_version()?,
-            ))]]),
-            Plan::SetPragmaUserVersion { value } => {
-                self.storage.set_user_version(value)?;
+            Plan::PragmaDatabaseList => Ok(self.pragma_database_list_rows()),
+            Plan::PragmaPageSize { schema } => {
+                let page_size = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_page_size.get()
+                } else {
+                    self.storage.database_page_size()
+                };
+                Ok(vec![vec![Value::Integer(i64::from(page_size))]])
+            }
+            Plan::SetPragmaPageSize { value, schema } => {
+                if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_page_size.set(value);
+                    Ok(Vec::new())
+                } else if value == self.storage.database_page_size() {
+                    Ok(Vec::new())
+                } else {
+                    Err(DbError::sql("changing page_size is not supported"))
+                }
+            }
+            Plan::PragmaPageCount { schema } => {
+                let page_count = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    0
+                } else {
+                    i64::from(self.storage.database_page_count()?)
+                };
+                Ok(vec![vec![Value::Integer(page_count)]])
+            }
+            Plan::PragmaMaxPageCount => Ok(vec![vec![Value::Integer(self.max_page_count.get())]]),
+            Plan::SetPragmaMaxPageCount { value } => {
+                if let Some(value) = value {
+                    self.max_page_count.set(value);
+                }
+                Ok(vec![vec![Value::Integer(self.max_page_count.get())]])
+            }
+            Plan::PragmaFreelistCount { schema } => {
+                let freelist_count = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    0
+                } else {
+                    i64::from(self.storage.database_freelist_count()?)
+                };
+                Ok(vec![vec![Value::Integer(freelist_count)]])
+            }
+            Plan::PragmaUserVersion { schema } => {
+                let value = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_user_version.get()
+                } else {
+                    self.storage.user_version()?
+                };
+                Ok(vec![vec![Value::Integer(sqlite_header_i32_value(value))]])
+            }
+            Plan::SetPragmaUserVersion { value, schema } => {
+                if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_user_version.set(value);
+                } else {
+                    self.storage.set_user_version(value)?;
+                }
                 Ok(Vec::new())
             }
-            Plan::PragmaApplicationId => Ok(vec![vec![Value::Integer(i64::from(
-                self.storage.application_id()?,
-            ))]]),
-            Plan::SetPragmaApplicationId { value } => {
-                self.storage.set_application_id(value)?;
+            Plan::PragmaApplicationId { schema } => {
+                let value = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_application_id.get()
+                } else {
+                    self.storage.application_id()?
+                };
+                Ok(vec![vec![Value::Integer(sqlite_header_i32_value(value))]])
+            }
+            Plan::SetPragmaApplicationId { value, schema } => {
+                if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_application_id.set(value);
+                } else {
+                    self.storage.set_application_id(value)?;
+                }
                 Ok(Vec::new())
             }
-            Plan::PragmaSchemaVersion => Ok(vec![vec![Value::Integer(i64::from(
-                self.storage.schema_version()?,
-            ))]]),
-            Plan::SetPragmaSchemaVersion { value } => {
-                self.storage.set_schema_version(value)?;
+            Plan::PragmaSchemaVersion { schema } => {
+                let value = if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_schema_version.get()
+                } else {
+                    self.storage.schema_version()?
+                };
+                Ok(vec![vec![Value::Integer(sqlite_header_i32_value(value))]])
+            }
+            Plan::SetPragmaSchemaVersion { value, schema } => {
+                if schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+                {
+                    self.temp_schema_version.set(value);
+                } else {
+                    self.storage.set_schema_version(value)?;
+                }
                 Ok(Vec::new())
             }
             Plan::CreateIndex {
@@ -566,13 +1286,46 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 self.storage.increment_schema_version()?;
                 Ok(Vec::new())
             }
+            Plan::CreateTrigger {
+                name,
+                table,
+                sql,
+                if_not_exists,
+            } => {
+                if let Err(error) = self
+                    .storage
+                    .create_trigger(transaction_id, &name, &table, &sql)
+                {
+                    if if_not_exists && error.to_string().contains("trigger already exists") {
+                        return Ok(Vec::new());
+                    }
+                    return Err(error);
+                }
+                self.storage.increment_schema_version()?;
+                Ok(Vec::new())
+            }
             Plan::DropTable { name, .. } => {
+                self.storage.drop_schema(transaction_id, &name)?;
+                self.storage.increment_schema_version()?;
+                Ok(Vec::new())
+            }
+            Plan::DropView { name, .. } => {
                 self.storage.drop_schema(transaction_id, &name)?;
                 self.storage.increment_schema_version()?;
                 Ok(Vec::new())
             }
             Plan::DropIndex { table, name, .. } => {
                 self.storage.drop_index(transaction_id, &table, &name)?;
+                self.storage.increment_schema_version()?;
+                Ok(Vec::new())
+            }
+            Plan::DropTrigger { name, if_exists } => {
+                if let Err(error) = self.storage.drop_trigger(transaction_id, &name) {
+                    if if_exists && error.to_string().contains("unknown trigger") {
+                        return Ok(Vec::new());
+                    }
+                    return Err(error);
+                }
                 self.storage.increment_schema_version()?;
                 Ok(Vec::new())
             }
@@ -610,8 +1363,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     or_conflict.as_deref(),
                     vec![values],
                 )?;
-                self.record_changes(inserted);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted))
             }
             Plan::InsertReturning {
                 table,
@@ -684,8 +1436,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     or_conflict.as_deref(),
                     rows,
                 )?;
-                self.record_changes(inserted);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted))
             }
             Plan::InsertDoNothing {
                 table,
@@ -698,8 +1449,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     target.as_deref(),
                     vec![values],
                 )?;
-                self.record_changes(inserted);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted))
             }
             Plan::InsertDoNothingReturning {
                 table,
@@ -724,8 +1474,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     target.as_deref(),
                     rows,
                 )?;
-                self.record_changes(inserted);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted))
             }
             Plan::InsertManyDoNothingReturning {
                 table,
@@ -751,8 +1500,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     or_conflict.as_deref(),
                     vec![evaluated],
                 )?;
-                self.record_changes(inserted);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted))
             }
             Plan::InsertExprReturning {
                 table,
@@ -842,8 +1590,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     or_conflict.as_deref(),
                     evaluated_rows,
                 )?;
-                self.record_changes(inserted);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted))
             }
             Plan::InsertManyExprReturning {
                 table,
@@ -875,8 +1622,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     target.as_deref(),
                     vec![evaluated],
                 )?;
-                self.record_changes(inserted);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted))
             }
             Plan::InsertExprDoNothingReturning {
                 table,
@@ -908,8 +1654,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     target.as_deref(),
                     evaluated_rows,
                 )?;
-                self.record_changes(inserted);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted))
             }
             Plan::InsertManyExprDoNothingReturning {
                 table,
@@ -953,6 +1698,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     let row_id = match self.storage.insert_row(transaction_id, &table, row.clone())
                     {
                         Ok(row_id) => row_id,
+                        Err(error) if is_sqlite_trigger_raise_ignore(&error) => {
+                            continue;
+                        }
                         Err(error) if matches_ignore_conflict(or_conflict.as_deref(), &error) => {
                             continue;
                         }
@@ -963,6 +1711,17 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                                 &schema,
                                 row,
                             )?
+                        }
+                        Err(error) if matches_fail_conflict(or_conflict.as_deref(), &error) => {
+                            if let Some(rowid) = last_insert_rowid {
+                                self.last_insert_rowid.set(rowid);
+                            }
+                            self.record_changes(inserted_count);
+                            if self.current_txn.get() != Some(transaction_id) && inserted_count > 0
+                            {
+                                self.storage.commit(transaction_id)?;
+                            }
+                            return Err(error);
                         }
                         Err(error)
                             if matches_rollback_conflict(or_conflict.as_deref(), &error)
@@ -984,8 +1743,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 if let Some(rowid) = last_insert_rowid {
                     self.last_insert_rowid.set(rowid);
                 }
-                self.record_changes(inserted_count);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted_count))
             }
             Plan::InsertSelectReturning {
                 table,
@@ -1089,8 +1847,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     target.as_deref(),
                     rows,
                 )?;
-                self.record_changes(inserted);
-                Ok(Vec::new())
+                Ok(self.record_changes_rows(inserted))
             }
             Plan::InsertSelectDoNothingReturning {
                 table,
@@ -1175,11 +1932,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             ),
             Plan::Update {
                 table,
+                or_conflict,
                 assignments,
                 filter,
             } => self.execute_update(
                 transaction_id,
                 &table,
+                or_conflict.as_deref(),
                 &assignments,
                 filter.as_ref(),
                 None,
@@ -1187,8 +1946,33 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 None,
                 None,
             ),
+            Plan::UpdateFrom {
+                table,
+                table_alias,
+                source,
+                or_conflict,
+                assignments,
+                filter,
+                returning,
+                order_by,
+                limit,
+                offset,
+            } => self.execute_update_from(
+                transaction_id,
+                &table,
+                table_alias.as_deref(),
+                &source,
+                or_conflict.as_deref(),
+                &assignments,
+                filter.as_ref(),
+                returning.as_deref(),
+                &order_by,
+                limit,
+                offset,
+            ),
             Plan::UpdateLimited {
                 table,
+                or_conflict,
                 assignments,
                 filter,
                 order_by,
@@ -1197,6 +1981,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             } => self.execute_update(
                 transaction_id,
                 &table,
+                or_conflict.as_deref(),
                 &assignments,
                 filter.as_ref(),
                 None,
@@ -1206,12 +1991,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             ),
             Plan::UpdateReturning {
                 table,
+                or_conflict,
                 assignments,
                 filter,
                 returning,
             } => self.execute_update(
                 transaction_id,
                 &table,
+                or_conflict.as_deref(),
                 &assignments,
                 filter.as_ref(),
                 Some(&returning),
@@ -1221,6 +2008,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             ),
             Plan::UpdateReturningLimited {
                 table,
+                or_conflict,
                 assignments,
                 filter,
                 returning,
@@ -1230,6 +2018,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             } => self.execute_update(
                 transaction_id,
                 &table,
+                or_conflict.as_deref(),
                 &assignments,
                 filter.as_ref(),
                 Some(&returning),
@@ -1314,14 +2103,19 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
             self.storage.delete_row(transaction_id, table, row_id)?;
         }
-        self.record_changes(deleted_count);
-        Ok(returned)
+        if returning.is_some() {
+            self.record_changes(deleted_count);
+            Ok(returned)
+        } else {
+            Ok(self.record_changes_rows(deleted_count))
+        }
     }
 
     fn execute_update(
         &self,
         transaction_id: TransactionId,
         table: &str,
+        or_conflict: Option<&str>,
         assignments: &[Assignment],
         filter: Option<&Expr>,
         returning: Option<&[SelectItem]>,
@@ -1355,10 +2149,16 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                             assignment.column
                         )));
                     }
-                    updated[position] =
-                        self.evaluate_scalar_expr(&source, source_row, &assignment.value)?;
+                    updated[position] = self.evaluate_scalar_expr_in_context(
+                        Some(transaction_id),
+                        &source,
+                        source_row,
+                        None,
+                        &assignment.value,
+                    )?;
                 }
                 updated = self.populate_generated_columns(&schema, updated)?;
+                updated = Self::normalize_strict_row(&schema, updated)?;
                 candidate_updates.push((*row_id, stored_row.clone(), updated, source_row.clone()));
             }
         }
@@ -1393,39 +2193,42 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             candidate_updates = selected;
         }
 
-        let selected_row_ids = candidate_updates
-            .iter()
-            .map(|(row_id, _, _, _)| *row_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        let final_rows = rows
-            .iter()
-            .map(|(row_id, stored_row)| {
-                if selected_row_ids.contains(row_id) {
-                    candidate_updates
-                        .iter()
-                        .find(|(candidate_row_id, _, _, _)| candidate_row_id == row_id)
-                        .map(|(_, _, updated, _)| updated.clone())
-                        .unwrap_or_else(|| stored_row.clone())
-                } else {
-                    stored_row.clone()
-                }
-            })
-            .collect::<Vec<_>>();
-        let pending_updates = candidate_updates
-            .into_iter()
-            .map(|(row_id, stored_row, updated, _)| (row_id, stored_row, updated))
-            .collect::<Vec<_>>();
+        if matches_update_fail_conflict(or_conflict) && returning.is_none() {
+            return self.execute_update_or_fail(
+                transaction_id,
+                table,
+                &schema,
+                &indexes,
+                &rows,
+                assignments,
+                candidate_updates,
+            );
+        }
 
-        self.validate_update_result_constraints(transaction_id, &schema, &indexes, &final_rows)?;
+        let pending_updates = self.filter_update_conflicts(
+            transaction_id,
+            table,
+            or_conflict,
+            &schema,
+            &indexes,
+            &rows,
+            candidate_updates,
+        )?;
         self.validate_update_parent_key_changes(transaction_id, table, &schema, &pending_updates)?;
 
         let updated_count = i64::try_from(pending_updates.len())
             .map_err(|_| DbError::storage("update count exceeds i64 range"))?;
         let rowset = returning.map(|_| self.returning_rowset(&schema, table));
+        let updated_columns = update_assignment_columns(assignments);
         let mut returned = Vec::new();
         for (row_id, _, updated) in pending_updates {
-            self.storage
-                .update_row(transaction_id, table, row_id, updated.clone())?;
+            self.storage.update_row_with_columns(
+                transaction_id,
+                table,
+                row_id,
+                updated.clone(),
+                &updated_columns,
+            )?;
             if let (Some(returning), Some(rowset)) = (returning, rowset.as_ref()) {
                 let updated =
                     self.append_hidden_rowid(updated, row_id, &schema, !schema.without_rowid)?;
@@ -1437,8 +2240,398 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 )?);
             }
         }
-        self.record_changes(updated_count);
-        Ok(returned)
+        if returning.is_some() {
+            self.record_changes(updated_count);
+            Ok(returned)
+        } else {
+            Ok(self.record_changes_rows(updated_count))
+        }
+    }
+
+    fn execute_update_from(
+        &self,
+        transaction_id: TransactionId,
+        table: &str,
+        table_alias: Option<&str>,
+        source_from: &FromItem,
+        or_conflict: Option<&str>,
+        assignments: &[Assignment],
+        filter: Option<&Expr>,
+        returning: Option<&[SelectItem]>,
+        order_by: &[OrderBy],
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<Row>> {
+        let schema = self.require_schema(transaction_id, table)?;
+        let target_source =
+            self.scan_table_rowset(transaction_id, table, table_alias, None, None)?;
+        let target_rows = self.storage.scan_rows(transaction_id, table)?;
+        let source = self.update_from_source_rowset(transaction_id, source_from)?;
+        let combined_columns = target_source
+            .columns
+            .iter()
+            .cloned()
+            .chain(source.columns.iter().cloned())
+            .collect::<Vec<_>>();
+        let combined_rowset = RowSet {
+            columns: combined_columns,
+            rows: Vec::new(),
+        };
+        let indexes = self.all_indexes(transaction_id, table)?;
+        let mut candidate_updates = Vec::new();
+
+        for ((row_id, stored_row), target_row) in target_rows.iter().zip(target_source.rows.iter())
+        {
+            let mut selected_update = None;
+            for source_row in &source.rows {
+                let mut combined_row = target_row.clone();
+                combined_row.extend(source_row.iter().cloned());
+                if self.matches_filter(
+                    transaction_id,
+                    &combined_rowset,
+                    &combined_row,
+                    filter,
+                    None,
+                )? {
+                    let mut updated = stored_row.clone();
+                    for assignment in assignments {
+                        let position = schema
+                            .columns
+                            .iter()
+                            .position(|entry| entry.name == assignment.column)
+                            .ok_or_else(|| {
+                                DbError::plan(format!(
+                                    "unknown column {} on table {}",
+                                    assignment.column, schema.name
+                                ))
+                            })?;
+                        if schema.columns[position].generated_expr.is_some() {
+                            return Err(DbError::storage(format!(
+                                "cannot UPDATE generated column {}",
+                                assignment.column
+                            )));
+                        }
+                        updated[position] = self.evaluate_scalar_expr_in_context(
+                            Some(transaction_id),
+                            &combined_rowset,
+                            &combined_row,
+                            None,
+                            &assignment.value,
+                        )?;
+                    }
+                    updated = self.populate_generated_columns(&schema, updated)?;
+                    updated = Self::normalize_strict_row(&schema, updated)?;
+                    selected_update = Some(updated);
+                }
+            }
+            if let Some(updated) = selected_update {
+                candidate_updates.push((*row_id, stored_row.clone(), updated, target_row.clone()));
+            }
+        }
+
+        if !order_by.is_empty() || limit.is_some() || offset.is_some() {
+            let mut ordered = candidate_updates
+                .into_iter()
+                .map(|(row_id, stored_row, updated, target_row)| {
+                    let sort_key = self.order_sort_key(
+                        Some(transaction_id),
+                        &target_source.columns,
+                        &target_row,
+                        &target_source.columns,
+                        &target_row,
+                        order_by,
+                    )?;
+                    Ok((sort_key, row_id, stored_row, updated, target_row))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !order_by.is_empty() {
+                ordered.sort_by(|(left_key, ..), (right_key, ..)| {
+                    self.compare_order_keys(left_key, right_key, order_by)
+                });
+            }
+            let mut selected = ordered
+                .into_iter()
+                .map(|(_, row_id, stored_row, updated, target_row)| {
+                    (row_id, stored_row, updated, target_row)
+                })
+                .collect::<Vec<_>>();
+            Self::apply_limit_offset_for_update(&mut selected, limit, offset);
+            candidate_updates = selected;
+        }
+
+        let pending_updates = self.filter_update_conflicts(
+            transaction_id,
+            table,
+            or_conflict,
+            &schema,
+            &indexes,
+            &target_rows,
+            candidate_updates,
+        )?;
+        self.validate_update_parent_key_changes(transaction_id, table, &schema, &pending_updates)?;
+
+        let updated_count = i64::try_from(pending_updates.len())
+            .map_err(|_| DbError::storage("update count exceeds i64 range"))?;
+        let rowset = returning.map(|_| self.returning_rowset(&schema, table));
+        let updated_columns = update_assignment_columns(assignments);
+        let mut returned = Vec::new();
+        for (row_id, _, updated) in pending_updates {
+            self.storage.update_row_with_columns(
+                transaction_id,
+                table,
+                row_id,
+                updated.clone(),
+                &updated_columns,
+            )?;
+            if let (Some(returning), Some(rowset)) = (returning, rowset.as_ref()) {
+                let updated =
+                    self.append_hidden_rowid(updated, row_id, &schema, !schema.without_rowid)?;
+                returned.push(self.project_row(
+                    Some(transaction_id),
+                    rowset,
+                    &updated,
+                    returning,
+                )?);
+            }
+        }
+        if returning.is_some() {
+            self.record_changes(updated_count);
+            Ok(returned)
+        } else {
+            Ok(self.record_changes_rows(updated_count))
+        }
+    }
+
+    fn update_from_source_rowset(
+        &self,
+        transaction_id: TransactionId,
+        source_from: &FromItem,
+    ) -> Result<RowSet> {
+        match source_from {
+            FromItem::Table { name, alias, .. }
+            | FromItem::TableIndexed { name, alias, .. }
+            | FromItem::TableNotIndexed { name, alias, .. } => {
+                self.scan_table_rowset(transaction_id, name, alias.as_deref(), None, None)
+            }
+            FromItem::Subquery {
+                query,
+                alias,
+                columns,
+            } => {
+                let mut rowset = self.execute_subquery_rows(transaction_id, query, None)?;
+                Self::apply_update_from_source_names(&mut rowset, Some(alias.as_str()), columns)?;
+                Ok(rowset)
+            }
+            FromItem::Values {
+                rows,
+                alias,
+                columns,
+            } => {
+                let mut rowset = self.execute_values_plan(transaction_id, rows.clone())?;
+                Self::apply_update_from_source_names(&mut rowset, alias.as_deref(), columns)?;
+                Ok(rowset)
+            }
+            FromItem::PragmaTableFunction {
+                name,
+                argument,
+                alias,
+            } => {
+                let mut rowset = self.execute_pragma_table_function_rowset(
+                    transaction_id,
+                    name,
+                    argument.as_deref(),
+                )?;
+                let qualifier = alias.as_deref().or(Some(name.as_str()));
+                Self::apply_update_from_source_names(&mut rowset, qualifier, &None)?;
+                Ok(rowset)
+            }
+        }
+    }
+
+    fn apply_update_from_source_names(
+        rowset: &mut RowSet,
+        alias: Option<&str>,
+        columns: &Option<Vec<String>>,
+    ) -> Result<()> {
+        if let Some(columns) = columns {
+            if columns.len() != rowset.columns.len() {
+                return Err(DbError::plan(
+                    "UPDATE FROM source column name count mismatch",
+                ));
+            }
+            for (meta, column) in rowset.columns.iter_mut().zip(columns) {
+                meta.name = column.clone();
+                meta.output_name = column.clone();
+            }
+        }
+        for meta in &mut rowset.columns {
+            meta.table = alias.map(str::to_string);
+            meta.alias = alias.map(str::to_string);
+        }
+        Ok(())
+    }
+
+    fn execute_update_or_fail(
+        &self,
+        transaction_id: TransactionId,
+        table: &str,
+        schema: &Schema,
+        indexes: &[IndexMeta],
+        rows: &[(RowId, Row)],
+        assignments: &[Assignment],
+        candidate_updates: Vec<(RowId, Row, Row, Row)>,
+    ) -> Result<Vec<Row>> {
+        let mut accepted = Vec::new();
+        for (row_id, stored_row, updated, _) in candidate_updates {
+            accepted.push((row_id, stored_row, updated));
+            let final_rows = Self::update_final_rows(rows, &accepted);
+            match self.validate_update_result_constraints(
+                transaction_id,
+                schema,
+                indexes,
+                &final_rows,
+            ) {
+                Ok(()) => {}
+                Err(error) if matches_fail_conflict(Some("FAIL"), &error) => {
+                    accepted.pop();
+                    let updated_columns = update_assignment_columns(assignments);
+                    for (accepted_row_id, _, accepted_row) in &accepted {
+                        self.storage.update_row_with_columns(
+                            transaction_id,
+                            table,
+                            *accepted_row_id,
+                            accepted_row.clone(),
+                            &updated_columns,
+                        )?;
+                    }
+                    let changes = i64::try_from(accepted.len())
+                        .map_err(|_| DbError::storage("update count exceeds i64 range"))?;
+                    self.record_changes(changes);
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        self.validate_update_parent_key_changes(transaction_id, table, schema, &accepted)?;
+        let changes = i64::try_from(accepted.len())
+            .map_err(|_| DbError::storage("update count exceeds i64 range"))?;
+        let updated_columns = update_assignment_columns(assignments);
+        for (row_id, _, updated) in accepted {
+            self.storage.update_row_with_columns(
+                transaction_id,
+                table,
+                row_id,
+                updated.clone(),
+                &updated_columns,
+            )?;
+        }
+        Ok(self.record_changes_rows(changes))
+    }
+
+    fn filter_update_conflicts(
+        &self,
+        transaction_id: TransactionId,
+        table: &str,
+        or_conflict: Option<&str>,
+        schema: &Schema,
+        indexes: &[IndexMeta],
+        rows: &[(RowId, Row)],
+        candidate_updates: Vec<(RowId, Row, Row, Row)>,
+    ) -> Result<Vec<(RowId, Row, Row)>> {
+        let pending_updates = candidate_updates
+            .into_iter()
+            .map(|(row_id, stored_row, updated, _)| (row_id, stored_row, updated))
+            .collect::<Vec<_>>();
+        if or_conflict.is_some_and(|mode| mode.eq_ignore_ascii_case("REPLACE")) {
+            return self.prepare_update_or_replace(transaction_id, table, schema, &pending_updates);
+        }
+        if !or_conflict.is_some_and(|mode| mode.eq_ignore_ascii_case("IGNORE")) {
+            let final_rows = Self::update_final_rows(rows, &pending_updates);
+            if let Err(error) = self.validate_update_result_constraints(
+                transaction_id,
+                schema,
+                indexes,
+                &final_rows,
+            ) {
+                if matches_rollback_conflict(or_conflict, &error)
+                    && self.current_txn.get() == Some(transaction_id)
+                {
+                    self.storage.rollback(transaction_id)?;
+                    self.current_txn.set(None);
+                }
+                return Err(error);
+            }
+            return Ok(pending_updates);
+        }
+
+        let mut accepted = Vec::new();
+        for candidate in pending_updates {
+            accepted.push(candidate);
+            let final_rows = Self::update_final_rows(rows, &accepted);
+            match self.validate_update_result_constraints(
+                transaction_id,
+                schema,
+                indexes,
+                &final_rows,
+            ) {
+                Ok(()) => {}
+                Err(error) if matches_ignore_conflict(or_conflict, &error) => {
+                    accepted.pop();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let final_rows = Self::update_final_rows(rows, &accepted);
+        self.validate_update_result_constraints(transaction_id, schema, indexes, &final_rows)?;
+        Ok(accepted)
+    }
+
+    fn prepare_update_or_replace(
+        &self,
+        transaction_id: TransactionId,
+        table: &str,
+        schema: &Schema,
+        pending_updates: &[(RowId, Row, Row)],
+    ) -> Result<Vec<(RowId, Row, Row)>> {
+        let mut deleted = BTreeSet::new();
+        for (row_id, _, updated) in pending_updates {
+            let conflicts = self.find_update_replace_conflicting_rows(
+                transaction_id,
+                table,
+                schema,
+                *row_id,
+                updated,
+            )?;
+            for (conflict_row_id, conflict_row) in conflicts {
+                if deleted.insert(conflict_row_id) {
+                    self.validate_no_foreign_key_dependents(transaction_id, table, &conflict_row)?;
+                    self.storage
+                        .delete_row(transaction_id, table, conflict_row_id)?;
+                }
+            }
+        }
+        Ok(pending_updates.to_vec())
+    }
+
+    fn update_final_rows(rows: &[(RowId, Row)], pending_updates: &[(RowId, Row, Row)]) -> Vec<Row> {
+        let selected_row_ids = pending_updates
+            .iter()
+            .map(|(row_id, _, _)| *row_id)
+            .collect::<BTreeSet<_>>();
+        rows.iter()
+            .map(|(row_id, stored_row)| {
+                if selected_row_ids.contains(row_id) {
+                    pending_updates
+                        .iter()
+                        .find(|(candidate_row_id, _, _)| candidate_row_id == row_id)
+                        .map(|(_, _, updated)| updated.clone())
+                        .unwrap_or_else(|| stored_row.clone())
+                } else {
+                    stored_row.clone()
+                }
+            })
+            .collect()
     }
 
     fn validate_update_result_constraints(
@@ -1479,7 +2672,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     )));
                 }
             }
-            return Ok(values);
+            return Self::normalize_strict_row(schema, values);
         }
 
         if values.len() != writable_column_count {
@@ -1507,7 +2700,57 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 })?);
             }
         }
-        Ok(row)
+        Self::normalize_strict_row(schema, row)
+    }
+
+    fn normalize_strict_row(schema: &Schema, row: Row) -> Result<Row> {
+        if !schema.strict {
+            return Ok(row);
+        }
+
+        schema
+            .columns
+            .iter()
+            .zip(row)
+            .map(|(column, value)| Self::normalize_strict_value(schema, column, value))
+            .collect()
+    }
+
+    fn normalize_strict_value(schema: &Schema, column: &ColumnDef, value: Value) -> Result<Value> {
+        use crate::common::types::ColumnType;
+
+        if matches!(value, Value::Null) || matches!(column.column_type, ColumnType::Any) {
+            return Ok(value);
+        }
+
+        let original_type = value.type_name();
+        let normalized = match column.column_type {
+            ColumnType::Any => Some(value),
+            ColumnType::Integer => strict_integer_value(value),
+            ColumnType::Real => strict_real_value(value),
+            ColumnType::Text => strict_text_value(value),
+            ColumnType::Blob => match value {
+                Value::Blob(_) => Some(value),
+                _ => None,
+            },
+            ColumnType::Numeric | ColumnType::Boolean => {
+                if column.column_type.matches_value(&value) {
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+        };
+
+        normalized.ok_or_else(|| {
+            DbError::storage(format!(
+                "cannot store {} value in {} column {}.{}",
+                original_type.to_ascii_uppercase(),
+                column.column_type.name(),
+                schema.name,
+                column.name
+            ))
+        })
     }
 
     fn build_insert_select_row(
@@ -1586,11 +2829,24 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             self.validate_foreign_key_references(transaction_id, &schema, &row)?;
             let row_id = match self.storage.insert_row(transaction_id, table, row.clone()) {
                 Ok(row_id) => row_id,
+                Err(error) if is_sqlite_trigger_raise_ignore(&error) => {
+                    continue;
+                }
                 Err(error) if matches_ignore_conflict(or_conflict, &error) => {
                     continue;
                 }
                 Err(error) if matches_replace_conflict(or_conflict, &error) => {
                     self.replace_conflicting_rows_and_insert(transaction_id, table, &schema, row)?
+                }
+                Err(error) if matches_fail_conflict(or_conflict, &error) => {
+                    if let Some(rowid) = last_insert_rowid {
+                        self.last_insert_rowid.set(rowid);
+                    }
+                    self.record_changes(inserted_count);
+                    if self.current_txn.get() != Some(transaction_id) && inserted_count > 0 {
+                        self.storage.commit(transaction_id)?;
+                    }
+                    return Err(error);
                 }
                 Err(error)
                     if matches_rollback_conflict(or_conflict, &error)
@@ -1636,6 +2892,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             self.validate_foreign_key_references(transaction_id, &schema, &row)?;
             let row_id = match self.storage.insert_row(transaction_id, table, row.clone()) {
                 Ok(row_id) => row_id,
+                Err(error) if is_sqlite_trigger_raise_ignore(&error) => {
+                    continue;
+                }
                 Err(error) if matches_ignore_conflict(or_conflict, &error) => {
                     continue;
                 }
@@ -1710,9 +2969,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         if let Some(rowid) = last_insert_rowid {
             self.last_insert_rowid.set(rowid);
         }
-        self.record_changes(changes);
 
-        Ok(returned)
+        if returning.is_some() {
+            self.record_changes(changes);
+            Ok(returned)
+        } else {
+            Ok(self.record_changes_rows(changes))
+        }
     }
 
     fn execute_single_upsert_row(
@@ -1820,8 +3083,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     &pending_updates,
                 )?;
 
-                self.storage
-                    .update_row(transaction_id, table, row_id, updated.clone())?;
+                let updated_columns = update_assignment_columns(&upsert.assignments);
+                self.storage.update_row_with_columns(
+                    transaction_id,
+                    table,
+                    row_id,
+                    updated.clone(),
+                    &updated_columns,
+                )?;
 
                 if let (Some(returning), Some(rowset)) = (returning, rowset) {
                     let updated =
@@ -1903,6 +3172,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 alias: None,
                 name: column.name.clone(),
                 output_name: column.name.clone(),
+                ctas_declared_type: sqlite_ctas_declared_type_for_column(column),
                 collation: column.collation.clone(),
                 hidden: false,
             })
@@ -1912,6 +3182,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             alias: None,
             name: column.name.clone(),
             output_name: format!("excluded.{}", column.name),
+            ctas_declared_type: sqlite_ctas_declared_type_for_column(column),
             collation: column.collation.clone(),
             hidden: true,
         }));
@@ -1989,6 +3260,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     alias: None,
                     name: column.name.clone(),
                     output_name: column.name.clone(),
+                    ctas_declared_type: sqlite_ctas_declared_type_for_column(column),
                     collation: column.collation.clone(),
                     hidden: false,
                 })
@@ -2136,6 +3408,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         alias: None,
                         name: entry.name.clone(),
                         output_name: entry.name.clone(),
+                        ctas_declared_type: sqlite_ctas_declared_type_for_column(entry),
                         collation: entry.collation.clone(),
                         hidden: false,
                     })
@@ -2194,6 +3467,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         for (_, row) in self.storage.scan_rows(transaction_id, table)? {
             let mut candidate = row;
             candidate.push(default_value.clone());
+            let candidate = Self::normalize_strict_row(&updated_schema, candidate)?;
             updated_schema.validate_row_values(&candidate)?;
             updated_schema.validate_check_constraints_with_like_mode(
                 &candidate,
@@ -2215,44 +3489,124 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             return Ok(());
         }
         for foreign_key in schema.all_foreign_keys() {
-            let child_values = foreign_key
-                .child_columns()
+            if self.should_defer_foreign_key(&foreign_key) {
+                self.deferred_foreign_keys_pending.set(true);
+                continue;
+            }
+            self.validate_foreign_key_reference(transaction_id, schema, row, &foreign_key)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_foreign_key_reference(
+        &self,
+        transaction_id: TransactionId,
+        schema: &Schema,
+        row: &Row,
+        foreign_key: &ForeignKey,
+    ) -> Result<()> {
+        let child_values = foreign_key
+            .child_columns()
+            .iter()
+            .map(|column| schema.value_for_column(row, column).cloned())
+            .collect::<Result<Vec<_>>>()?;
+        if child_values
+            .iter()
+            .any(|value| matches!(value, Value::Null))
+        {
+            return Ok(());
+        }
+
+        let parent_schema = self.require_schema(transaction_id, &foreign_key.ref_table)?;
+        let parent_column_names =
+            self.resolve_foreign_key_parent_columns(&parent_schema, foreign_key)?;
+        let parent_columns = parent_column_names
+            .iter()
+            .map(|column| parent_schema.column_index(column))
+            .collect::<Result<Vec<_>>>()?;
+        let parent_rows = self
+            .storage
+            .scan_rows(transaction_id, &foreign_key.ref_table)?;
+        let found = parent_rows.iter().any(|(_, parent_row)| {
+            parent_columns
                 .iter()
-                .map(|column| schema.value_for_column(row, column).cloned())
-                .collect::<Result<Vec<_>>>()?;
-            if child_values
-                .iter()
-                .any(|value| matches!(value, Value::Null))
-            {
+                .zip(child_values.iter())
+                .all(|(parent_column, child_value)| {
+                    parent_row.get(*parent_column) == Some(child_value)
+                })
+        });
+
+        if !found {
+            let parent_column_display = parent_column_names.join(", ");
+            return Err(DbError::storage(format!(
+                "foreign key constraint failed: {} references {}({})",
+                foreign_key.rendered_child_columns(),
+                foreign_key.ref_table,
+                parent_column_display
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn should_defer_foreign_key(&self, foreign_key: &ForeignKey) -> bool {
+        self.current_txn.get().is_some()
+            && (self.defer_foreign_keys.get()
+                || (foreign_key.deferrable == Some(true)
+                    && foreign_key.initially_deferred == Some(true)))
+    }
+
+    fn should_defer_parent_delete_foreign_key(&self, foreign_key: &ForeignKey) -> bool {
+        self.current_txn.get().is_some()
+            && (self.defer_foreign_keys.get()
+                || (foreign_key.deferrable == Some(true)
+                    && foreign_key.initially_deferred == Some(true)
+                    && !foreign_key
+                        .on_delete
+                        .as_deref()
+                        .is_some_and(|action| action.eq_ignore_ascii_case("RESTRICT"))))
+    }
+
+    fn should_defer_parent_update_foreign_key(&self, foreign_key: &ForeignKey) -> bool {
+        self.current_txn.get().is_some()
+            && (self.defer_foreign_keys.get()
+                || (foreign_key.deferrable == Some(true)
+                    && foreign_key.initially_deferred == Some(true)
+                    && !foreign_key
+                        .on_update
+                        .as_deref()
+                        .is_some_and(|action| action.eq_ignore_ascii_case("RESTRICT"))))
+    }
+
+    fn validate_deferred_foreign_keys(&self, transaction_id: TransactionId) -> Result<()> {
+        if !self.foreign_keys.get() {
+            return Ok(());
+        }
+
+        for schema in self.storage.list_schemas(transaction_id)? {
+            let deferred_foreign_keys = schema
+                .all_foreign_keys()
+                .into_iter()
+                .filter(|foreign_key| {
+                    self.defer_foreign_keys.get()
+                        || (foreign_key.deferrable == Some(true)
+                            && foreign_key.initially_deferred == Some(true))
+                })
+                .collect::<Vec<_>>();
+            if deferred_foreign_keys.is_empty() {
                 continue;
             }
 
-            let parent_schema = self.require_schema(transaction_id, &foreign_key.ref_table)?;
-            let parent_column_names =
-                self.resolve_foreign_key_parent_columns(&parent_schema, &foreign_key)?;
-            let parent_columns = parent_column_names
-                .iter()
-                .map(|column| parent_schema.column_index(column))
-                .collect::<Result<Vec<_>>>()?;
-            let parent_rows = self
-                .storage
-                .scan_rows(transaction_id, &foreign_key.ref_table)?;
-            let found = parent_rows.iter().any(|(_, parent_row)| {
-                parent_columns.iter().zip(child_values.iter()).all(
-                    |(parent_column, child_value)| {
-                        parent_row.get(*parent_column) == Some(child_value)
-                    },
-                )
-            });
-
-            if !found {
-                let parent_column_display = parent_column_names.join(", ");
-                return Err(DbError::storage(format!(
-                    "foreign key constraint failed: {} references {}({})",
-                    foreign_key.rendered_child_columns(),
-                    foreign_key.ref_table,
-                    parent_column_display
-                )));
+            for (_, row) in self.storage.scan_rows(transaction_id, &schema.name)? {
+                for foreign_key in &deferred_foreign_keys {
+                    self.validate_foreign_key_reference(
+                        transaction_id,
+                        &schema,
+                        &row,
+                        foreign_key,
+                    )?;
+                }
             }
         }
 
@@ -2275,6 +3629,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 .into_iter()
                 .filter(|foreign_key| foreign_key.ref_table == parent_table)
             {
+                if self.should_defer_parent_delete_foreign_key(&foreign_key) {
+                    self.deferred_foreign_keys_pending.set(true);
+                    continue;
+                }
                 let parent_column_names =
                     self.resolve_foreign_key_parent_columns(&parent_schema, &foreign_key)?;
                 let parent_values = parent_column_names
@@ -2291,6 +3649,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 self.validate_no_foreign_key_dependents_for_key(
                     transaction_id,
                     &child_schema,
+                    foreign_key_delete_action(&foreign_key),
                     foreign_key.child_columns(),
                     parent_table,
                     &parent_column_names,
@@ -2306,13 +3665,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         &self,
         transaction_id: TransactionId,
         child_schema: &Schema,
+        action: ForeignKeyDeleteAction,
         child_columns: &[String],
         parent_table: &str,
         parent_columns: &[String],
         parent_values: &[Value],
     ) -> Result<()> {
         let child_rows = self.storage.scan_rows(transaction_id, &child_schema.name)?;
-        for (_, child_row) in child_rows {
+        for (child_row_id, child_row) in child_rows {
             let child_values = child_columns
                 .iter()
                 .map(|column| child_schema.value_for_column(&child_row, column).cloned())
@@ -2324,6 +3684,74 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 continue;
             }
             if child_values == parent_values {
+                match action {
+                    ForeignKeyDeleteAction::Cascade => {
+                        self.validate_no_foreign_key_dependents(
+                            transaction_id,
+                            &child_schema.name,
+                            &child_row,
+                        )?;
+                        self.storage.delete_row(
+                            transaction_id,
+                            &child_schema.name,
+                            child_row_id,
+                        )?;
+                        continue;
+                    }
+                    ForeignKeyDeleteAction::SetNull => {
+                        let mut updated_row = child_row;
+                        for column in child_columns {
+                            let index = child_schema.column_index(column)?;
+                            updated_row[index] = Value::Null;
+                        }
+                        child_schema.validate_row_values(&updated_row)?;
+                        child_schema.validate_check_constraints_with_like_mode(
+                            &updated_row,
+                            self.storage.case_sensitive_like(),
+                        )?;
+                        self.validate_foreign_key_references(
+                            transaction_id,
+                            child_schema,
+                            &updated_row,
+                        )?;
+                        self.storage.update_row(
+                            transaction_id,
+                            &child_schema.name,
+                            child_row_id,
+                            updated_row,
+                        )?;
+                        continue;
+                    }
+                    ForeignKeyDeleteAction::SetDefault => {
+                        let mut updated_row = child_row;
+                        for column in child_columns {
+                            let index = child_schema.column_index(column)?;
+                            let default_value = child_schema.columns[index]
+                                .default_value
+                                .as_ref()
+                                .map_or(Ok(Value::Null), |default| default.evaluate())?;
+                            updated_row[index] = default_value;
+                        }
+                        child_schema.validate_row_values(&updated_row)?;
+                        child_schema.validate_check_constraints_with_like_mode(
+                            &updated_row,
+                            self.storage.case_sensitive_like(),
+                        )?;
+                        self.validate_foreign_key_references(
+                            transaction_id,
+                            child_schema,
+                            &updated_row,
+                        )?;
+                        self.storage.update_row(
+                            transaction_id,
+                            &child_schema.name,
+                            child_row_id,
+                            updated_row,
+                        )?;
+                        continue;
+                    }
+                    ForeignKeyDeleteAction::Restrict => {}
+                }
                 return Err(DbError::storage(format!(
                     "foreign key constraint failed: {}.{} references {}({})",
                     child_schema.name,
@@ -2357,6 +3785,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 .into_iter()
                 .filter(|foreign_key| foreign_key.ref_table == parent_table)
             {
+                if self.should_defer_parent_update_foreign_key(&foreign_key) {
+                    self.deferred_foreign_keys_pending.set(true);
+                    continue;
+                }
                 let parent_column_names =
                     self.resolve_foreign_key_parent_columns(parent_schema, &foreign_key)?;
                 for (_, old_row, updated_row) in pending_updates {
@@ -2377,9 +3809,54 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         continue;
                     }
 
+                    if foreign_key
+                        .on_update
+                        .as_deref()
+                        .is_some_and(|action| action.eq_ignore_ascii_case("CASCADE"))
+                    {
+                        self.cascade_update_foreign_key_dependents_for_key(
+                            transaction_id,
+                            &child_schema,
+                            foreign_key.child_columns(),
+                            &old_parent_values,
+                            &updated_parent_values,
+                        )?;
+                        continue;
+                    }
+
+                    if foreign_key
+                        .on_update
+                        .as_deref()
+                        .is_some_and(|action| action.eq_ignore_ascii_case("SET NULL"))
+                    {
+                        self.set_null_update_foreign_key_dependents_for_key(
+                            transaction_id,
+                            &child_schema,
+                            foreign_key.child_columns(),
+                            &old_parent_values,
+                        )?;
+                        continue;
+                    }
+
+                    if foreign_key
+                        .on_update
+                        .as_deref()
+                        .is_some_and(|action| action.eq_ignore_ascii_case("SET DEFAULT"))
+                    {
+                        self.set_default_update_foreign_key_dependents_for_key(
+                            transaction_id,
+                            &child_schema,
+                            foreign_key.child_columns(),
+                            &old_parent_values,
+                            &updated_parent_values,
+                        )?;
+                        continue;
+                    }
+
                     self.validate_no_foreign_key_dependents_for_key(
                         transaction_id,
                         &child_schema,
+                        ForeignKeyDeleteAction::Restrict,
                         foreign_key.child_columns(),
                         parent_table,
                         &parent_column_names,
@@ -2389,6 +3866,153 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
         }
 
+        Ok(())
+    }
+
+    fn cascade_update_foreign_key_dependents_for_key(
+        &self,
+        transaction_id: TransactionId,
+        child_schema: &Schema,
+        child_columns: &[String],
+        old_parent_values: &[Value],
+        updated_parent_values: &[Value],
+    ) -> Result<()> {
+        let child_rows = self.storage.scan_rows(transaction_id, &child_schema.name)?;
+        for (child_row_id, child_row) in child_rows {
+            let child_values = child_columns
+                .iter()
+                .map(|column| child_schema.value_for_column(&child_row, column).cloned())
+                .collect::<Result<Vec<_>>>()?;
+            if child_values
+                .iter()
+                .any(|value| matches!(value, Value::Null))
+            {
+                continue;
+            }
+            if child_values == old_parent_values {
+                let old_child_row = child_row.clone();
+                let mut updated_row = child_row;
+                for (column, value) in child_columns.iter().zip(updated_parent_values.iter()) {
+                    let index = child_schema.column_index(column)?;
+                    updated_row[index] = value.clone();
+                }
+                child_schema.validate_row_values(&updated_row)?;
+                child_schema.validate_check_constraints_with_like_mode(
+                    &updated_row,
+                    self.storage.case_sensitive_like(),
+                )?;
+                self.validate_update_parent_key_changes(
+                    transaction_id,
+                    &child_schema.name,
+                    child_schema,
+                    &[(child_row_id, old_child_row, updated_row.clone())],
+                )?;
+                self.storage.update_row(
+                    transaction_id,
+                    &child_schema.name,
+                    child_row_id,
+                    updated_row,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn set_null_update_foreign_key_dependents_for_key(
+        &self,
+        transaction_id: TransactionId,
+        child_schema: &Schema,
+        child_columns: &[String],
+        old_parent_values: &[Value],
+    ) -> Result<()> {
+        let child_rows = self.storage.scan_rows(transaction_id, &child_schema.name)?;
+        for (child_row_id, child_row) in child_rows {
+            let child_values = child_columns
+                .iter()
+                .map(|column| child_schema.value_for_column(&child_row, column).cloned())
+                .collect::<Result<Vec<_>>>()?;
+            if child_values
+                .iter()
+                .any(|value| matches!(value, Value::Null))
+            {
+                continue;
+            }
+            if child_values == old_parent_values {
+                let mut updated_row = child_row;
+                for column in child_columns {
+                    let index = child_schema.column_index(column)?;
+                    updated_row[index] = Value::Null;
+                }
+                child_schema.validate_row_values(&updated_row)?;
+                child_schema.validate_check_constraints_with_like_mode(
+                    &updated_row,
+                    self.storage.case_sensitive_like(),
+                )?;
+                self.storage.update_row(
+                    transaction_id,
+                    &child_schema.name,
+                    child_row_id,
+                    updated_row,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn set_default_update_foreign_key_dependents_for_key(
+        &self,
+        transaction_id: TransactionId,
+        child_schema: &Schema,
+        child_columns: &[String],
+        old_parent_values: &[Value],
+        updated_parent_values: &[Value],
+    ) -> Result<()> {
+        let child_rows = self.storage.scan_rows(transaction_id, &child_schema.name)?;
+        for (child_row_id, child_row) in child_rows {
+            let child_values = child_columns
+                .iter()
+                .map(|column| child_schema.value_for_column(&child_row, column).cloned())
+                .collect::<Result<Vec<_>>>()?;
+            if child_values
+                .iter()
+                .any(|value| matches!(value, Value::Null))
+            {
+                continue;
+            }
+            if child_values == old_parent_values {
+                let mut updated_row = child_row;
+                for column in child_columns {
+                    let index = child_schema.column_index(column)?;
+                    let default_value = child_schema.columns[index]
+                        .default_value
+                        .as_ref()
+                        .map_or(Ok(Value::Null), |default| default.evaluate())?;
+                    updated_row[index] = default_value;
+                }
+                child_schema.validate_row_values(&updated_row)?;
+                child_schema.validate_check_constraints_with_like_mode(
+                    &updated_row,
+                    self.storage.case_sensitive_like(),
+                )?;
+                let updated_child_values = child_columns
+                    .iter()
+                    .map(|column| child_schema.value_for_column(&updated_row, column).cloned())
+                    .collect::<Result<Vec<_>>>()?;
+                if updated_child_values != updated_parent_values {
+                    self.validate_foreign_key_references(
+                        transaction_id,
+                        child_schema,
+                        &updated_row,
+                    )?;
+                }
+                self.storage.update_row(
+                    transaction_id,
+                    &child_schema.name,
+                    child_row_id,
+                    updated_row,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -2707,6 +4331,21 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         Ok(conflicts.into_iter().collect())
     }
 
+    fn find_update_replace_conflicting_rows(
+        &self,
+        transaction_id: TransactionId,
+        table: &str,
+        schema: &Schema,
+        updated_row_id: RowId,
+        updated_row: &Row,
+    ) -> Result<Vec<(RowId, Row)>> {
+        Ok(self
+            .find_insert_conflicting_rows(transaction_id, table, schema, updated_row)?
+            .into_iter()
+            .filter(|(row_id, _)| *row_id != updated_row_id)
+            .collect())
+    }
+
     fn all_indexes(&self, transaction_id: TransactionId, table: &str) -> Result<Vec<IndexMeta>> {
         self.storage.list_all_indexes(transaction_id, table)
     }
@@ -2722,8 +4361,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         "CREATE TABLE AS SELECT produced an empty column name",
                     ));
                 }
-                let column_name = Self::deduplicate_ctas_column_name(&column.output_name, &mut seen);
-                Ok(ColumnDef::new(column_name, ColumnType::Any))
+                let column_name =
+                    Self::deduplicate_ctas_column_name(&column.output_name, &mut seen);
+                let mut column_def = ColumnDef::new(column_name, ColumnType::Any);
+                if let Some(declared_type) = &column.ctas_declared_type {
+                    column_def = column_def.declared_type(declared_type.clone());
+                }
+                Ok(column_def)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Schema::new(name, columns))
@@ -2757,6 +4401,8 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     ) -> Result<RowSet> {
         match plan {
             Plan::Values { rows } => self.execute_values_plan(transaction_id, rows),
+            Plan::PragmaTableFunction { name, argument } => self
+                .execute_pragma_table_function_rowset(transaction_id, &name, argument.as_deref()),
             Plan::SeqScan {
                 table,
                 table_alias,
@@ -2892,24 +4538,32 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         if all {
                             rows
                         } else {
-                            Self::deduplicate_rows(rows)
+                            Self::deduplicate_rows_keep_last(rows)
                         }
                     }
                     CompoundOperator::Intersect => {
-                        let right_rows = right.rows.into_iter().collect::<HashSet<_>>();
+                        let right_rows = right
+                            .rows
+                            .into_iter()
+                            .map(|row| Self::row_dedup_key(&row))
+                            .collect::<HashSet<_>>();
                         Self::deduplicate_rows(
                             left.rows
                                 .into_iter()
-                                .filter(|row| right_rows.contains(row))
+                                .filter(|row| right_rows.contains(&Self::row_dedup_key(row)))
                                 .collect(),
                         )
                     }
                     CompoundOperator::Except => {
-                        let right_rows = right.rows.into_iter().collect::<HashSet<_>>();
+                        let right_rows = right
+                            .rows
+                            .into_iter()
+                            .map(|row| Self::row_dedup_key(&row))
+                            .collect::<HashSet<_>>();
                         Self::deduplicate_rows(
                             left.rows
                                 .into_iter()
-                                .filter(|row| !right_rows.contains(row))
+                                .filter(|row| !right_rows.contains(&Self::row_dedup_key(row)))
                                 .collect(),
                         )
                     }
@@ -2999,11 +4653,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 };
                 source.columns = output_columns
                     .iter()
-                    .map(|name| ColumnMeta {
+                    .zip(source.columns.iter())
+                    .map(|(name, source_column)| ColumnMeta {
                         table: source_qualifier.clone(),
                         alias: source_qualifier.clone(),
                         name: name.clone(),
                         output_name: name.clone(),
+                        ctas_declared_type: source_column.ctas_declared_type.clone(),
                         collation: None,
                         hidden: false,
                     })
@@ -3058,6 +4714,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     alias: None,
                     name: "operation".to_string(),
                     output_name: "operation".to_string(),
+                    ctas_declared_type: None,
                     collation: None,
                     hidden: false,
                 },
@@ -3066,6 +4723,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     alias: None,
                     name: "detail".to_string(),
                     output_name: "detail".to_string(),
+                    ctas_declared_type: None,
                     collation: None,
                     hidden: false,
                 },
@@ -3135,6 +4793,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 Value::from(format!("{indent}NestedLoopJoin")),
                 Value::from(format!("joins={}", joins.len())),
             ]),
+            Plan::PragmaTableFunction { name, argument } => rows.push(vec![
+                Value::from(format!("{indent}PragmaTableFunction")),
+                Value::from(
+                    argument
+                        .as_ref()
+                        .map_or_else(|| name.clone(), |argument| format!("{name}({argument})")),
+                ),
+            ]),
             Plan::Aggregate { source, .. } => {
                 rows.push(vec![
                     Value::from(format!("{indent}Aggregate")),
@@ -3169,9 +4835,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         match plan {
             Plan::CreateTable { .. } => "CreateTable",
             Plan::CreateTableAs { .. } => "CreateTableAs",
+            Plan::CreateView { .. } => "CreateView",
             Plan::CreateIndex { .. } => "CreateIndex",
             Plan::DropTable { .. } => "DropTable",
+            Plan::DropView { .. } => "DropView",
             Plan::DropIndex { .. } => "DropIndex",
+            Plan::CreateTrigger { .. } => "CreateTrigger",
+            Plan::DropTrigger { .. } => "DropTrigger",
             Plan::AlterTable { .. } => "AlterTable",
             Plan::Insert { .. } => "Insert",
             Plan::InsertReturning { .. } => "InsertReturning",
@@ -3208,6 +4878,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             Plan::DeleteReturning { .. } => "DeleteReturning",
             Plan::DeleteReturningLimited { .. } => "DeleteReturningLimited",
             Plan::Update { .. } => "Update",
+            Plan::UpdateFrom { .. } => "UpdateFrom",
             Plan::UpdateLimited { .. } => "UpdateLimited",
             Plan::UpdateReturning { .. } => "UpdateReturning",
             Plan::UpdateReturningLimited { .. } => "UpdateReturningLimited",
@@ -3219,6 +4890,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             Plan::NestedLoopJoin { .. } => "NestedLoopJoin",
             Plan::Aggregate { .. } => "Aggregate",
             Plan::Values { .. } => "Values",
+            Plan::PragmaTableFunction { .. } => "PragmaTableFunction",
             Plan::DerivedSource { .. } => "DerivedSource",
             Plan::ExplainQueryPlan { .. } => "ExplainQueryPlan",
             Plan::PragmaTableInfo { .. } => "PragmaTableInfo",
@@ -3231,10 +4903,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             Plan::PragmaForeignKeyCheck { .. } => "PragmaForeignKeyCheck",
             Plan::PragmaForeignKeys => "PragmaForeignKeys",
             Plan::SetPragmaForeignKeys { .. } => "SetPragmaForeignKeys",
+            Plan::PragmaDeferForeignKeys => "PragmaDeferForeignKeys",
+            Plan::SetPragmaDeferForeignKeys { .. } => "SetPragmaDeferForeignKeys",
             Plan::PragmaReadUncommitted => "PragmaReadUncommitted",
             Plan::SetPragmaReadUncommitted { .. } => "SetPragmaReadUncommitted",
             Plan::PragmaQueryOnly => "PragmaQueryOnly",
             Plan::SetPragmaQueryOnly { .. } => "SetPragmaQueryOnly",
+            Plan::PragmaCountChanges => "PragmaCountChanges",
+            Plan::SetPragmaCountChanges { .. } => "SetPragmaCountChanges",
             Plan::PragmaRecursiveTriggers => "PragmaRecursiveTriggers",
             Plan::SetPragmaRecursiveTriggers { .. } => "SetPragmaRecursiveTriggers",
             Plan::PragmaTrustedSchema => "PragmaTrustedSchema",
@@ -3242,40 +4918,87 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             Plan::PragmaIgnoreCheckConstraints => "PragmaIgnoreCheckConstraints",
             Plan::SetPragmaIgnoreCheckConstraints { .. } => "SetPragmaIgnoreCheckConstraints",
             Plan::PragmaEncoding => "PragmaEncoding",
+            Plan::SetPragmaEncoding => "SetPragmaEncoding",
             Plan::PragmaCollationList => "PragmaCollationList",
             Plan::PragmaDataVersion => "PragmaDataVersion",
             Plan::PragmaQuickCheck => "PragmaQuickCheck",
             Plan::PragmaIntegrityCheck => "PragmaIntegrityCheck",
             Plan::PragmaFunctionList => "PragmaFunctionList",
             Plan::PragmaCompileOptions => "PragmaCompileOptions",
-            Plan::PragmaJournalMode => "PragmaJournalMode",
-            Plan::PragmaSynchronous => "PragmaSynchronous",
-            Plan::PragmaCacheSize => "PragmaCacheSize",
+            Plan::PragmaPragmaList => "PragmaPragmaList",
+            Plan::PragmaModuleList => "PragmaModuleList",
+            Plan::PragmaStats => "PragmaStats",
+            Plan::PragmaJournalMode { .. } => "PragmaJournalMode",
+            Plan::SetPragmaJournalMode { .. } => "SetPragmaJournalMode",
+            Plan::PragmaSynchronous { .. } => "PragmaSynchronous",
+            Plan::SetPragmaSynchronous { .. } => "SetPragmaSynchronous",
+            Plan::PragmaCacheSize { .. } => "PragmaCacheSize",
             Plan::SetPragmaCacheSize { .. } => "SetPragmaCacheSize",
+            Plan::PragmaCacheSpill => "PragmaCacheSpill",
+            Plan::SetPragmaCacheSpill { .. } => "SetPragmaCacheSpill",
             Plan::PragmaTempStore => "PragmaTempStore",
-            Plan::PragmaLockingMode => "PragmaLockingMode",
+            Plan::SetPragmaTempStore { .. } => "SetPragmaTempStore",
+            Plan::PragmaLockingMode { .. } => "PragmaLockingMode",
+            Plan::SetPragmaLockingMode { .. } => "SetPragmaLockingMode",
+            Plan::PragmaMmapSize => "PragmaMmapSize",
+            Plan::SetPragmaMmapSize { .. } => "SetPragmaMmapSize",
+            Plan::PragmaAutoVacuum => "PragmaAutoVacuum",
+            Plan::SetPragmaAutoVacuum { .. } => "SetPragmaAutoVacuum",
+            Plan::PragmaSecureDelete { .. } => "PragmaSecureDelete",
+            Plan::SetPragmaSecureDelete { .. } => "SetPragmaSecureDelete",
+            Plan::PragmaWalAutocheckpoint => "PragmaWalAutocheckpoint",
+            Plan::SetPragmaWalAutocheckpoint { .. } => "SetPragmaWalAutocheckpoint",
+            Plan::PragmaWalCheckpoint => "PragmaWalCheckpoint",
             Plan::PragmaBusyTimeout => "PragmaBusyTimeout",
             Plan::SetPragmaBusyTimeout { .. } => "SetPragmaBusyTimeout",
+            Plan::PragmaAnalysisLimit => "PragmaAnalysisLimit",
+            Plan::SetPragmaAnalysisLimit { .. } => "SetPragmaAnalysisLimit",
+            Plan::PragmaJournalSizeLimit => "PragmaJournalSizeLimit",
+            Plan::SetPragmaJournalSizeLimit { .. } => "SetPragmaJournalSizeLimit",
+            Plan::PragmaSoftHeapLimit => "PragmaSoftHeapLimit",
+            Plan::SetPragmaSoftHeapLimit { .. } => "SetPragmaSoftHeapLimit",
+            Plan::PragmaHardHeapLimit => "PragmaHardHeapLimit",
+            Plan::SetPragmaHardHeapLimit { .. } => "SetPragmaHardHeapLimit",
             Plan::PragmaThreads => "PragmaThreads",
             Plan::SetPragmaThreads { .. } => "SetPragmaThreads",
+            Plan::PragmaAutomaticIndex => "PragmaAutomaticIndex",
+            Plan::SetPragmaAutomaticIndex { .. } => "SetPragmaAutomaticIndex",
+            Plan::PragmaCellSizeCheck => "PragmaCellSizeCheck",
+            Plan::SetPragmaCellSizeCheck { .. } => "SetPragmaCellSizeCheck",
+            Plan::PragmaFullColumnNames => "PragmaFullColumnNames",
+            Plan::SetPragmaFullColumnNames { .. } => "SetPragmaFullColumnNames",
+            Plan::PragmaShortColumnNames => "PragmaShortColumnNames",
+            Plan::SetPragmaShortColumnNames { .. } => "SetPragmaShortColumnNames",
+            Plan::PragmaFullFsync => "PragmaFullFsync",
+            Plan::SetPragmaFullFsync { .. } => "SetPragmaFullFsync",
+            Plan::PragmaCheckpointFullFsync => "PragmaCheckpointFullFsync",
+            Plan::SetPragmaCheckpointFullFsync { .. } => "SetPragmaCheckpointFullFsync",
+            Plan::PragmaEmptyResultCallbacks => "PragmaEmptyResultCallbacks",
+            Plan::SetPragmaEmptyResultCallbacks { .. } => "SetPragmaEmptyResultCallbacks",
             Plan::PragmaCaseSensitiveLike => "PragmaCaseSensitiveLike",
             Plan::SetPragmaCaseSensitiveLike { .. } => "SetPragmaCaseSensitiveLike",
             Plan::PragmaReverseUnorderedSelects => "PragmaReverseUnorderedSelects",
             Plan::SetPragmaReverseUnorderedSelects { .. } => "SetPragmaReverseUnorderedSelects",
             Plan::PragmaDatabaseList => "PragmaDatabaseList",
-            Plan::PragmaPageSize => "PragmaPageSize",
-            Plan::PragmaPageCount => "PragmaPageCount",
-            Plan::PragmaFreelistCount => "PragmaFreelistCount",
-            Plan::PragmaUserVersion => "PragmaUserVersion",
+            Plan::PragmaPageSize { .. } => "PragmaPageSize",
+            Plan::SetPragmaPageSize { .. } => "SetPragmaPageSize",
+            Plan::PragmaPageCount { .. } => "PragmaPageCount",
+            Plan::PragmaMaxPageCount => "PragmaMaxPageCount",
+            Plan::SetPragmaMaxPageCount { .. } => "SetPragmaMaxPageCount",
+            Plan::PragmaFreelistCount { .. } => "PragmaFreelistCount",
+            Plan::PragmaUserVersion { .. } => "PragmaUserVersion",
             Plan::SetPragmaUserVersion { .. } => "SetPragmaUserVersion",
-            Plan::PragmaApplicationId => "PragmaApplicationId",
+            Plan::PragmaApplicationId { .. } => "PragmaApplicationId",
             Plan::SetPragmaApplicationId { .. } => "SetPragmaApplicationId",
-            Plan::PragmaSchemaVersion => "PragmaSchemaVersion",
+            Plan::PragmaSchemaVersion { .. } => "PragmaSchemaVersion",
             Plan::SetPragmaSchemaVersion { .. } => "SetPragmaSchemaVersion",
             Plan::NoOp => "NoOp",
             Plan::BeginTxn { .. } => "BeginTxn",
             Plan::CommitTxn => "CommitTxn",
             Plan::RollbackTxn => "RollbackTxn",
+            Plan::Savepoint { .. } => "Savepoint",
+            Plan::RollbackTo { .. } => "RollbackTo",
+            Plan::Release { .. } => "Release",
         }
     }
 
@@ -3341,7 +5064,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 rows,
             });
         }
-        if matches!(table, "sqlite_master" | "sqlite_schema") {
+        if matches!(
+            table,
+            "sqlite_master" | "sqlite_schema" | "sqlite_temp_master" | "sqlite_temp_schema"
+        ) {
             let source = self.sqlite_catalog_rowset(transaction_id, table, table_alias)?;
             let rows = source
                 .rows
@@ -3370,6 +5096,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     alias: table_alias.map(str::to_string),
                     name: column.name.clone(),
                     output_name: column.name.clone(),
+                    ctas_declared_type: sqlite_ctas_declared_type_for_column(column),
                     collation: column.collation.clone(),
                     hidden: false,
                 })
@@ -3438,12 +5165,405 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     alias: None,
                     name: name.clone(),
                     output_name: name,
+                    ctas_declared_type: None,
                     collation: None,
                     hidden: false,
                 }
             })
             .collect();
         Ok(RowSet { columns, rows })
+    }
+
+    fn execute_pragma_table_function_rowset(
+        &self,
+        transaction_id: TransactionId,
+        name: &str,
+        argument: Option<&str>,
+    ) -> Result<RowSet> {
+        let (columns, rows): (&[&str], Vec<Row>) = if name.eq_ignore_ascii_case("pragma_table_info")
+        {
+            let argument = required_pragma_table_function_argument(name, argument)?;
+            (
+                &["cid", "name", "type", "notnull", "dflt_value", "pk"],
+                self.execute_pragma_table_info(transaction_id, argument, false)?,
+            )
+        } else if name.eq_ignore_ascii_case("pragma_table_xinfo") {
+            let argument = required_pragma_table_function_argument(name, argument)?;
+            (
+                &[
+                    "cid",
+                    "name",
+                    "type",
+                    "notnull",
+                    "dflt_value",
+                    "pk",
+                    "hidden",
+                ],
+                self.execute_pragma_table_info(transaction_id, argument, true)?,
+            )
+        } else if name.eq_ignore_ascii_case("pragma_index_list") {
+            let argument = required_pragma_table_function_argument(name, argument)?;
+            (
+                &["seq", "name", "unique", "origin", "partial"],
+                self.execute_pragma_index_list(transaction_id, argument)?,
+            )
+        } else if name.eq_ignore_ascii_case("pragma_index_info") {
+            let argument = required_pragma_table_function_argument(name, argument)?;
+            (
+                &["seqno", "cid", "name"],
+                self.execute_pragma_index_info(transaction_id, argument, None)?,
+            )
+        } else if name.eq_ignore_ascii_case("pragma_index_xinfo") {
+            let argument = required_pragma_table_function_argument(name, argument)?;
+            (
+                &["seqno", "cid", "name", "desc", "coll", "key"],
+                self.execute_pragma_index_xinfo(transaction_id, argument, None)?,
+            )
+        } else if name.eq_ignore_ascii_case("pragma_foreign_key_list") {
+            let argument = required_pragma_table_function_argument(name, argument)?;
+            (
+                &[
+                    "id",
+                    "seq",
+                    "table",
+                    "from",
+                    "to",
+                    "on_update",
+                    "on_delete",
+                    "match",
+                ],
+                self.execute_pragma_foreign_key_list(transaction_id, argument)?,
+            )
+        } else if name.eq_ignore_ascii_case("pragma_foreign_key_check") {
+            (
+                &["table", "rowid", "parent", "fkid"],
+                self.execute_pragma_foreign_key_check(transaction_id, argument, None)?,
+            )
+        } else if name.eq_ignore_ascii_case("pragma_table_list") {
+            (
+                &["schema", "name", "type", "ncol", "wr", "strict"],
+                self.execute_pragma_table_list(transaction_id, argument, None)?,
+            )
+        } else if name.eq_ignore_ascii_case("pragma_database_list") {
+            (&["seq", "name", "file"], self.pragma_database_list_rows())
+        } else if name.eq_ignore_ascii_case("pragma_pragma_list") {
+            (&["name"], supported_pragma_list_rows())
+        } else if name.eq_ignore_ascii_case("pragma_function_list") {
+            (
+                &["name", "builtin", "type", "enc", "narg", "flags"],
+                sqlite_function_list_rows(),
+            )
+        } else if name.eq_ignore_ascii_case("pragma_compile_options") {
+            (
+                &["compile_options"],
+                SQLITE_COMPILE_OPTIONS
+                    .iter()
+                    .map(|option| vec![Value::from(*option)])
+                    .collect(),
+            )
+        } else if name.eq_ignore_ascii_case("pragma_collation_list") {
+            (
+                &["seq", "name"],
+                vec![
+                    vec![Value::Integer(0), Value::from("BINARY")],
+                    vec![Value::Integer(1), Value::from("NOCASE")],
+                    vec![Value::Integer(2), Value::from("RTRIM")],
+                ],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_module_list") {
+            (&["name"], Vec::new())
+        } else if name.eq_ignore_ascii_case("pragma_optimize") {
+            (&["optimize"], Vec::new())
+        } else if name.eq_ignore_ascii_case("pragma_quick_check") {
+            (&["quick_check"], vec![vec![Value::from("ok")]])
+        } else if name.eq_ignore_ascii_case("pragma_encoding") {
+            (&["encoding"], vec![vec![Value::from("UTF-8")]])
+        } else if name.eq_ignore_ascii_case("pragma_integrity_check") {
+            (&["integrity_check"], vec![vec![Value::from("ok")]])
+        } else if name.eq_ignore_ascii_case("pragma_page_size") {
+            (
+                &["page_size"],
+                vec![vec![Value::Integer(i64::from(
+                    self.storage.database_page_size(),
+                ))]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_page_count") {
+            (
+                &["page_count"],
+                vec![vec![Value::Integer(i64::from(
+                    self.storage.database_page_count()?,
+                ))]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_max_page_count") {
+            (
+                &["max_page_count"],
+                vec![vec![Value::Integer(self.max_page_count.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_freelist_count") {
+            (
+                &["freelist_count"],
+                vec![vec![Value::Integer(i64::from(
+                    self.storage.database_freelist_count()?,
+                ))]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_user_version") {
+            (
+                &["user_version"],
+                vec![vec![Value::Integer(sqlite_header_i32_value(
+                    self.storage.user_version()?,
+                ))]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_application_id") {
+            (
+                &["application_id"],
+                vec![vec![Value::Integer(sqlite_header_i32_value(
+                    self.storage.application_id()?,
+                ))]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_schema_version") {
+            (
+                &["schema_version"],
+                vec![vec![Value::Integer(sqlite_header_i32_value(
+                    self.storage.schema_version()?,
+                ))]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_data_version") {
+            (&["data_version"], vec![vec![Value::Integer(2)]])
+        } else if name.eq_ignore_ascii_case("pragma_journal_mode") {
+            (
+                &["journal_mode"],
+                vec![vec![Value::from(self.journal_mode.borrow().as_str())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_synchronous") {
+            (
+                &["synchronous"],
+                vec![vec![Value::Integer(self.synchronous.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_cache_size") {
+            (
+                &["cache_size"],
+                vec![vec![Value::Integer(self.cache_size.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_cache_spill") {
+            (
+                &["cache_spill"],
+                vec![vec![Value::Integer(self.cache_spill.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_temp_store") {
+            (
+                &["temp_store"],
+                vec![vec![Value::Integer(self.temp_store.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_locking_mode") {
+            (
+                &["locking_mode"],
+                vec![vec![Value::from(self.locking_mode.borrow().as_str())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_busy_timeout") {
+            (
+                &["timeout"],
+                vec![vec![Value::Integer(self.busy_timeout.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_analysis_limit") {
+            (
+                &["analysis_limit"],
+                vec![vec![Value::Integer(i64::from(self.analysis_limit.get()))]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_journal_size_limit") {
+            (
+                &["journal_size_limit"],
+                vec![vec![Value::Integer(self.journal_size_limit.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_foreign_keys") {
+            (
+                &["foreign_keys"],
+                vec![vec![Value::Integer(if self.foreign_keys.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_defer_foreign_keys") {
+            (
+                &["defer_foreign_keys"],
+                vec![vec![Value::Integer(if self.defer_foreign_keys.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_read_uncommitted") {
+            (
+                &["read_uncommitted"],
+                vec![vec![Value::Integer(if self.read_uncommitted.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_query_only") {
+            (
+                &["query_only"],
+                vec![vec![Value::Integer(if self.query_only.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_count_changes") {
+            (
+                &["count_changes"],
+                vec![vec![Value::Integer(if self.count_changes.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_recursive_triggers") {
+            (
+                &["recursive_triggers"],
+                vec![vec![Value::Integer(if self.recursive_triggers.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_trusted_schema") {
+            (
+                &["trusted_schema"],
+                vec![vec![Value::Integer(if self.trusted_schema.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_ignore_check_constraints") {
+            (
+                &["ignore_check_constraints"],
+                vec![vec![Value::Integer(
+                    if self.storage.ignore_check_constraints() {
+                        1
+                    } else {
+                        0
+                    },
+                )]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_automatic_index") {
+            (
+                &["automatic_index"],
+                vec![vec![Value::Integer(if self.automatic_index.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_auto_vacuum") {
+            (
+                &["auto_vacuum"],
+                vec![vec![Value::Integer(self.auto_vacuum.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_cell_size_check") {
+            (
+                &["cell_size_check"],
+                vec![vec![Value::Integer(if self.cell_size_check.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_secure_delete") {
+            (
+                &["secure_delete"],
+                vec![vec![Value::Integer(self.secure_delete.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_threads") {
+            (
+                &["threads"],
+                vec![vec![Value::Integer(i64::from(self.threads.get()))]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_soft_heap_limit") {
+            (
+                &["soft_heap_limit"],
+                vec![vec![Value::Integer(self.soft_heap_limit.get())]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_hard_heap_limit") {
+            (&["hard_heap_limit"], vec![vec![Value::Integer(0)]])
+        } else if name.eq_ignore_ascii_case("pragma_full_column_names") {
+            (
+                &["full_column_names"],
+                vec![vec![Value::Integer(if self.full_column_names.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_short_column_names") {
+            (
+                &["short_column_names"],
+                vec![vec![Value::Integer(if self.short_column_names.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_fullfsync") {
+            (
+                &["fullfsync"],
+                vec![vec![Value::Integer(if self.fullfsync.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_checkpoint_fullfsync") {
+            (
+                &["checkpoint_fullfsync"],
+                vec![vec![Value::Integer(if self.checkpoint_fullfsync.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_empty_result_callbacks") {
+            (
+                &["empty_result_callbacks"],
+                vec![vec![Value::Integer(if self.empty_result_callbacks.get() {
+                    1
+                } else {
+                    0
+                })]],
+            )
+        } else if name.eq_ignore_ascii_case("pragma_reverse_unordered_selects") {
+            (
+                &["reverse_unordered_selects"],
+                vec![vec![Value::Integer(
+                    if self.reverse_unordered_selects.get() {
+                        1
+                    } else {
+                        0
+                    },
+                )]],
+            )
+        } else {
+            return Err(DbError::plan(format!(
+                "unsupported PRAGMA table-valued function: {name}"
+            )));
+        };
+        Ok(RowSet {
+            columns: columns
+                .iter()
+                .map(|column| ColumnMeta {
+                    table: Some(name.to_string()),
+                    alias: None,
+                    name: (*column).to_string(),
+                    output_name: (*column).to_string(),
+                    ctas_declared_type: None,
+                    collation: None,
+                    hidden: false,
+                })
+                .collect(),
+            rows,
+        })
     }
 
     fn sqlite_catalog_rowset(
@@ -3453,16 +5573,38 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         table_alias: Option<&str>,
     ) -> Result<RowSet> {
         let mut rows = Vec::new();
-        let schemas = self.storage.list_schemas(transaction_id)?;
+        let include_temp = matches!(table, "sqlite_temp_master" | "sqlite_temp_schema");
+        let schemas = self
+            .storage
+            .list_schemas(transaction_id)?
+            .into_iter()
+            .filter(|schema| {
+                pragma_schema_matches_storage_name(
+                    &schema.name,
+                    Some(if include_temp { "temp" } else { "main" }),
+                )
+            })
+            .collect::<Vec<_>>();
+
         for (offset, schema) in schemas.iter().enumerate() {
-            let rootpage = i64::try_from(offset + 2)
-                .map_err(|_| DbError::storage("sqlite catalog rootpage overflow"))?;
+            let rootpage = if schema.is_view() {
+                0
+            } else {
+                i64::try_from(offset + 2)
+                    .map_err(|_| DbError::storage("sqlite catalog rootpage overflow"))?
+            };
+            let object_type = if schema.is_view() { "view" } else { "table" };
+            let display_name = display_catalog_name(&schema.name);
+            let sql = schema
+                .create_sql
+                .clone()
+                .unwrap_or_else(|| self.render_catalog_create_table(schema, &display_name));
             rows.push(vec![
-                Value::from("table"),
-                Value::from(schema.name.clone()),
-                Value::from(schema.name.clone()),
+                Value::from(object_type),
+                Value::from(display_name.as_str()),
+                Value::from(display_name.as_str()),
                 Value::Integer(rootpage),
-                Value::from(self.render_catalog_create_table(schema)),
+                Value::from(sql),
             ]);
         }
 
@@ -3473,12 +5615,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 .storage
                 .list_all_indexes(transaction_id, &schema.name)?
             {
+                let display_table = display_catalog_name(&schema.name);
                 rows.push(vec![
                     Value::from("index"),
                     Value::from(index.name.clone()),
-                    Value::from(schema.name.clone()),
+                    Value::from(display_table.as_str()),
                     Value::Integer(index_rootpage),
-                    Value::from(self.render_catalog_create_index(&schema.name, &index)),
+                    Value::from(self.render_catalog_create_index(&display_table, &index)),
                 ]);
                 index_rootpage += 1;
             }
@@ -3492,6 +5635,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     alias: table_alias.map(str::to_string),
                     name: name.to_string(),
                     output_name: name.to_string(),
+                    ctas_declared_type: None,
                     collation: None,
                     hidden: false,
                 })
@@ -3508,6 +5652,23 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     ) -> Result<Vec<Row>> {
         let Some(schema) = self.storage.get_schema(transaction_id, table)? else {
             return Ok(Vec::new());
+        };
+        let schema = if schema.is_view() {
+            if let Some(select) = &schema.view_select {
+                let context = self
+                    .storage
+                    .planning_context_snapshot(Some(transaction_id))?;
+                let columns = Planner::new().view_output_schema(select, &context)?;
+                let columns = Planner::new()
+                    .apply_view_column_names(columns, schema.view_columns.as_ref())?;
+                let mut refreshed = schema.clone();
+                refreshed.columns = columns;
+                refreshed
+            } else {
+                schema
+            }
+        } else {
+            schema
         };
 
         schema
@@ -3534,7 +5695,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 let mut row = vec![
                     Value::Integer(cid),
                     Value::from(column.name.as_str()),
-                    Value::from(column.column_type.name()),
+                    Value::from(column.pragma_declared_type()),
                     Value::Integer(if column.nullable || column.primary_key {
                         0
                     } else {
@@ -3563,6 +5724,27 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             .collect()
     }
 
+    fn pragma_database_list_rows(&self) -> Vec<Row> {
+        let mut rows = vec![vec![
+            Value::Integer(0),
+            Value::from("main"),
+            self.storage
+                .database_path()
+                .map(|path| Value::from(path.to_string_lossy().as_ref()))
+                .unwrap_or_else(|| Value::from("")),
+        ]];
+
+        if self.temp_database_used.get() {
+            rows.push(vec![
+                Value::Integer(1),
+                Value::from("temp"),
+                Value::from(""),
+            ]);
+        }
+
+        rows
+    }
+
     fn execute_pragma_table_list(
         &self,
         transaction_id: TransactionId,
@@ -3573,22 +5755,38 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         schemas.sort_by(|left, right| left.name.cmp(&right.name));
 
         let mut rows = Vec::new();
-        if schema_filter.is_none_or(|schema| schema.eq_ignore_ascii_case("main")) {
-            for schema in schemas {
-                if table_filter.is_some_and(|filter| !schema.name.eq_ignore_ascii_case(filter)) {
-                    continue;
-                }
-                rows.push(vec![
-                    Value::from("main"),
-                    Value::from(schema.name),
-                    Value::from("table"),
-                    Value::Integer(i64::try_from(schema.columns.len()).map_err(|_| {
-                        DbError::storage("PRAGMA table_list column count overflow")
-                    })?),
-                    Value::Integer(if schema.without_rowid { 1 } else { 0 }),
-                    Value::Integer(if schema.strict { 1 } else { 0 }),
-                ]);
+        for schema in schemas {
+            let schema_name = if schema.name.starts_with("__rustsql_temp__") {
+                "temp"
+            } else {
+                "main"
+            };
+            if schema_filter.is_some_and(|filter| !schema_name.eq_ignore_ascii_case(filter)) {
+                continue;
             }
+            let display_name = display_catalog_name(&schema.name);
+            if table_filter.is_some_and(|filter| !display_name.eq_ignore_ascii_case(filter)) {
+                continue;
+            }
+            rows.push(vec![
+                Value::from(schema_name),
+                Value::from(display_name.as_str()),
+                Value::from(if schema.is_view() { "view" } else { "table" }),
+                Value::Integer(
+                    i64::try_from(schema.columns.len())
+                        .map_err(|_| DbError::storage("PRAGMA table_list column count overflow"))?,
+                ),
+                Value::Integer(if !schema.is_view() && schema.without_rowid {
+                    1
+                } else {
+                    0
+                }),
+                Value::Integer(if !schema.is_view() && schema.strict {
+                    1
+                } else {
+                    0
+                }),
+            ]);
         }
 
         for (schema_name, table_name) in [("main", "sqlite_schema"), ("temp", "sqlite_temp_schema")]
@@ -3648,8 +5846,12 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         &self,
         transaction_id: TransactionId,
         index_name: &str,
+        schema_filter: Option<&str>,
     ) -> Result<Vec<Row>> {
         for schema in self.storage.list_schemas(transaction_id)? {
+            if !pragma_schema_matches_storage_name(&schema.name, schema_filter) {
+                continue;
+            }
             for index in self
                 .storage
                 .list_all_indexes(transaction_id, &schema.name)?
@@ -3689,8 +5891,12 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         &self,
         transaction_id: TransactionId,
         index_name: &str,
+        schema_filter: Option<&str>,
     ) -> Result<Vec<Row>> {
         for schema in self.storage.list_schemas(transaction_id)? {
+            if !pragma_schema_matches_storage_name(&schema.name, schema_filter) {
+                continue;
+            }
             for index in self
                 .storage
                 .list_all_indexes(transaction_id, &schema.name)?
@@ -3801,7 +6007,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 rows.push(vec![
                     Value::Integer(id),
                     Value::Integer(seq),
-                    Value::from(foreign_key.ref_table.as_str()),
+                    Value::from(display_catalog_name(&foreign_key.ref_table).as_str()),
                     Value::from(child_column.as_str()),
                     parent_column
                         .map(|column| Value::from(column.as_str()))
@@ -3820,15 +6026,31 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         &self,
         transaction_id: TransactionId,
         table_filter: Option<&str>,
+        schema_filter: Option<&str>,
     ) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         let mut schemas = self.storage.list_schemas(transaction_id)?;
         schemas.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut matched_table = table_filter.is_none();
+        let resolved_table_filter = table_filter.map(|table| {
+            if schema_filter.is_some_and(|schema| schema.eq_ignore_ascii_case("temp")) {
+                format!("__rustsql_temp__{table}")
+            } else {
+                table.to_string()
+            }
+        });
 
         for schema in schemas {
-            if table_filter.is_some_and(|table| !schema.name.eq_ignore_ascii_case(table)) {
+            if !pragma_schema_matches_storage_name(&schema.name, schema_filter) {
                 continue;
             }
+            if resolved_table_filter
+                .as_deref()
+                .is_some_and(|table| !schema.name.eq_ignore_ascii_case(table))
+            {
+                continue;
+            }
+            matched_table = true;
             let foreign_keys = schema.all_foreign_keys();
             if foreign_keys.is_empty() {
                 continue;
@@ -3874,9 +6096,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                             DbError::storage("foreign_key_check foreign key id overflow")
                         })?;
                         rows.push(vec![
-                            Value::from(schema.name.as_str()),
+                            Value::from(display_catalog_name(&schema.name).as_str()),
                             Value::Integer(rowid),
-                            Value::from(foreign_key.ref_table.as_str()),
+                            Value::from(display_catalog_name(&foreign_key.ref_table).as_str()),
                             Value::Integer(foreign_key_id),
                         ]);
                     }
@@ -3884,20 +6106,19 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
         }
 
+        if !matched_table && let Some(table) = table_filter {
+            return Err(DbError::storage(format!("unknown table: {table}")));
+        }
+
         Ok(rows)
     }
 
-    fn render_catalog_create_table(&self, schema: &Schema) -> String {
+    fn render_catalog_create_table(&self, schema: &Schema, table_name: &str) -> String {
         let mut definitions = schema
             .columns
             .iter()
             .map(|column| {
-                let mut rendered =
-                    if matches!(column.column_type, crate::common::types::ColumnType::Any) {
-                        column.name.clone()
-                    } else {
-                        format!("{} {}", column.name, column.column_type.name())
-                    };
+                let mut rendered = render_column_name_and_declared_type(column);
                 if column.primary_key {
                     rendered.push_str(" PRIMARY KEY");
                 }
@@ -3918,7 +6139,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         };
         format!(
             "CREATE TABLE {} ({}){}{}",
-            schema.name,
+            table_name,
             definitions.join(", "),
             strict,
             without_rowid
@@ -3962,6 +6183,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     alias: table_alias.map(str::to_string),
                     name: column.name.clone(),
                     output_name: column.name.clone(),
+                    ctas_declared_type: sqlite_ctas_declared_type_for_column(column),
                     collation: column.collation.clone(),
                     hidden: false,
                 })
@@ -4149,6 +6371,36 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         }
 
         let projected_columns = self.projected_columns(&source.columns, columns)?;
+        let row_number_slots = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                SelectItem::Expr {
+                    expr:
+                        ScalarExpr::WindowFunction {
+                            func,
+                            args,
+                            partition_by,
+                            order_by,
+                            frame,
+                            exclude,
+                            filter,
+                            ..
+                        },
+                    ..
+                } => Some((
+                    index,
+                    *func,
+                    args.clone(),
+                    partition_by.clone(),
+                    order_by.clone(),
+                    *frame,
+                    *exclude,
+                    filter.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let entries = source
             .rows
             .iter()
@@ -4159,6 +6411,12 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 ))
             })
             .collect::<Result<Vec<(Row, Row)>>>()?;
+        let entries = self.populate_row_number_windows(
+            Some(transaction_id),
+            entries,
+            &source.columns,
+            &row_number_slots,
+        )?;
 
         let mut rows = entries
             .into_iter()
@@ -4197,11 +6455,1223 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         })
     }
 
+    fn populate_row_number_windows(
+        &self,
+        transaction_id: Option<TransactionId>,
+        mut entries: Vec<(Row, Row)>,
+        source_columns: &[ColumnMeta],
+        row_number_slots: &[(
+            usize,
+            WindowFunc,
+            Vec<ScalarExpr>,
+            Vec<ScalarExpr>,
+            Vec<OrderBy>,
+            WindowFrame,
+            WindowExclude,
+            Option<Box<Expr>>,
+        )],
+    ) -> Result<Vec<(Row, Row)>> {
+        for (projected_index, window_func, args, partition_by, order_by, frame, exclude, filter) in
+            row_number_slots
+        {
+            let full_source = RowSet {
+                columns: source_columns.to_vec(),
+                rows: vec![],
+            };
+            let mut partitions =
+                HashMap::<Vec<(u8, String)>, Vec<(Vec<Option<Value>>, usize)>>::new();
+            for (index, (_, full_row)) in entries.iter().enumerate() {
+                let partition_values = partition_by
+                    .iter()
+                    .map(|expr| {
+                        self.evaluate_scalar_expr_in_context(
+                            transaction_id,
+                            &full_source,
+                            full_row,
+                            None,
+                            expr,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let partition_key = Self::row_dedup_key(&partition_values);
+                let sort_key = order_by
+                    .iter()
+                    .map(|item| match &item.expr {
+                        OrderByExpr::Expr(expr) => self
+                            .evaluate_scalar_expr_in_context(
+                                transaction_id,
+                                &full_source,
+                                full_row,
+                                None,
+                                expr,
+                            )
+                            .map(Some),
+                        _ => Ok(self
+                            .resolve_order_value(
+                                source_columns,
+                                full_row,
+                                source_columns,
+                                full_row,
+                                &item.expr,
+                            )
+                            .cloned()),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                partitions
+                    .entry(partition_key)
+                    .or_default()
+                    .push((sort_key, index));
+            }
+            for ordered in partitions.values_mut() {
+                ordered.sort_by(|(left_key, _), (right_key, _)| {
+                    self.compare_order_keys(left_key, right_key, order_by)
+                });
+                let mut previous_key: Option<Vec<Option<Value>>> = None;
+                let mut current_rank = 0_i64;
+                let mut current_dense_rank = 0_i64;
+                let ordered_entry_indexes = ordered
+                    .iter()
+                    .map(|(_, entry_index)| *entry_index)
+                    .collect::<Vec<_>>();
+                for (ordinal, (sort_key, entry_index)) in ordered.iter().enumerate() {
+                    let ordinal_rank = i64::try_from(ordinal + 1)
+                        .map_err(|_| DbError::storage("window function rank overflow"))?;
+                    let is_new_peer = previous_key.as_ref() != Some(sort_key);
+                    if is_new_peer {
+                        current_rank = ordinal_rank;
+                        current_dense_rank = current_dense_rank.saturating_add(1);
+                        previous_key = Some(sort_key.clone());
+                    }
+                    let window_value = match window_func {
+                        WindowFunc::RowNumber => Value::Integer(ordinal_rank),
+                        WindowFunc::Rank => Value::Integer(current_rank),
+                        WindowFunc::DenseRank => Value::Integer(current_dense_rank),
+                        WindowFunc::PercentRank => {
+                            let partition_size = ordered.len();
+                            if partition_size <= 1 {
+                                Value::Real(0.0)
+                            } else {
+                                Value::Real((current_rank - 1) as f64 / (partition_size - 1) as f64)
+                            }
+                        }
+                        WindowFunc::CumeDist => {
+                            let peer_end = ordered
+                                .iter()
+                                .enumerate()
+                                .skip(ordinal)
+                                .take_while(|(_, (candidate_key, _))| candidate_key == sort_key)
+                                .map(|(index, _)| index)
+                                .last()
+                                .unwrap_or(ordinal);
+                            Value::Real((peer_end + 1) as f64 / ordered.len() as f64)
+                        }
+                        WindowFunc::FirstValue => {
+                            let frame_start =
+                                self.window_frame_start(ordered, ordinal, sort_key, *frame);
+                            let frame_end =
+                                self.window_frame_end(ordered, ordinal, sort_key, *frame);
+                            let peer_start =
+                                Self::window_peer_group_start(ordered, ordinal, sort_key);
+                            let peer_end = Self::window_peer_group_end(ordered, ordinal, sort_key);
+                            self.window_visible_frame_ordinals(
+                                frame_start,
+                                frame_end,
+                                ordinal,
+                                peer_start,
+                                peer_end,
+                                *exclude,
+                                ordered.len(),
+                            )
+                            .into_iter()
+                            .next()
+                            .map(|target_ordinal| {
+                                self.evaluate_value_window_value(
+                                    transaction_id,
+                                    &full_source,
+                                    &entries,
+                                    &ordered_entry_indexes,
+                                    target_ordinal,
+                                    args,
+                                )
+                            })
+                            .transpose()?
+                            .unwrap_or(Value::Null)
+                        }
+                        WindowFunc::LastValue => {
+                            let frame_start =
+                                self.window_frame_start(ordered, ordinal, sort_key, *frame);
+                            let frame_end =
+                                self.window_frame_end(ordered, ordinal, sort_key, *frame);
+                            let peer_start =
+                                Self::window_peer_group_start(ordered, ordinal, sort_key);
+                            let peer_end = Self::window_peer_group_end(ordered, ordinal, sort_key);
+                            self.window_visible_frame_ordinals(
+                                frame_start,
+                                frame_end,
+                                ordinal,
+                                peer_start,
+                                peer_end,
+                                *exclude,
+                                ordered.len(),
+                            )
+                            .into_iter()
+                            .last()
+                            .map(|target_ordinal| {
+                                self.evaluate_value_window_value(
+                                    transaction_id,
+                                    &full_source,
+                                    &entries,
+                                    &ordered_entry_indexes,
+                                    target_ordinal,
+                                    args,
+                                )
+                            })
+                            .transpose()?
+                            .unwrap_or(Value::Null)
+                        }
+                        WindowFunc::NthValue => {
+                            let frame_start =
+                                self.window_frame_start(ordered, ordinal, sort_key, *frame);
+                            let frame_end =
+                                self.window_frame_end(ordered, ordinal, sort_key, *frame);
+                            let peer_start =
+                                Self::window_peer_group_start(ordered, ordinal, sort_key);
+                            let peer_end = Self::window_peer_group_end(ordered, ordinal, sort_key);
+                            self.evaluate_nth_value_window_value(
+                                transaction_id,
+                                &full_source,
+                                &entries,
+                                &ordered_entry_indexes,
+                                ordinal,
+                                &self.window_visible_frame_ordinals(
+                                    frame_start,
+                                    frame_end,
+                                    ordinal,
+                                    peer_start,
+                                    peer_end,
+                                    *exclude,
+                                    ordered.len(),
+                                ),
+                                args,
+                            )?
+                        }
+                        WindowFunc::Ntile => self.evaluate_ntile_window_value(
+                            transaction_id,
+                            &full_source,
+                            &entries,
+                            &ordered_entry_indexes,
+                            ordinal,
+                            args,
+                        )?,
+                        WindowFunc::Lag | WindowFunc::Lead => self.evaluate_lag_lead_window_value(
+                            transaction_id,
+                            &full_source,
+                            &entries,
+                            &ordered_entry_indexes,
+                            ordinal,
+                            *window_func,
+                            args,
+                        )?,
+                        WindowFunc::Count
+                        | WindowFunc::Sum
+                        | WindowFunc::Avg
+                        | WindowFunc::Total
+                        | WindowFunc::Min
+                        | WindowFunc::Max
+                        | WindowFunc::GroupConcat
+                        | WindowFunc::JsonGroupArray
+                        | WindowFunc::JsonGroupObject => {
+                            let frame_start =
+                                self.window_frame_start(ordered, ordinal, sort_key, *frame);
+                            let frame_end =
+                                self.window_frame_end(ordered, ordinal, sort_key, *frame);
+                            let peer_start =
+                                Self::window_peer_group_start(ordered, ordinal, sort_key);
+                            let peer_end = Self::window_peer_group_end(ordered, ordinal, sort_key);
+                            self.evaluate_aggregate_window_value(
+                                transaction_id,
+                                &full_source,
+                                &entries,
+                                &ordered_entry_indexes,
+                                ordinal,
+                                peer_start,
+                                peer_end,
+                                frame_start,
+                                frame_end,
+                                *window_func,
+                                args,
+                                *exclude,
+                                filter.as_deref(),
+                            )?
+                        }
+                    };
+                    if let Some(value) = entries
+                        .get_mut(*entry_index)
+                        .and_then(|(projected, _)| projected.get_mut(*projected_index))
+                    {
+                        *value = window_value;
+                    }
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn window_frame_start(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        frame: WindowFrame,
+    ) -> usize {
+        match frame {
+            WindowFrame::RowsPrecedingToCurrentRow(preceding)
+            | WindowFrame::RowsPrecedingToFollowing { preceding, .. }
+            | WindowFrame::RowsPrecedingToUnboundedFollowing(preceding) => {
+                ordinal.saturating_sub(preceding)
+            }
+            WindowFrame::RowsPrecedingToPreceding { start, end } => {
+                if end > ordinal {
+                    ordinal.saturating_add(1)
+                } else {
+                    ordinal.saturating_sub(start)
+                }
+            }
+            WindowFrame::RowsCurrentRow
+            | WindowFrame::RowsCurrentRowToFollowing(_)
+            | WindowFrame::RowsCurrentRowToUnboundedFollowing => ordinal,
+            WindowFrame::RowsFollowingToFollowing { start, .. }
+            | WindowFrame::RowsFollowingToUnboundedFollowing(start) => {
+                ordinal.saturating_add(start)
+            }
+            WindowFrame::GroupsPrecedingToCurrentRow(preceding)
+            | WindowFrame::GroupsPrecedingToFollowing { preceding, .. }
+            | WindowFrame::GroupsPrecedingToUnboundedFollowing(preceding) => {
+                self.window_peer_group_start_preceding(ordered, ordinal, sort_key, preceding)
+            }
+            WindowFrame::GroupsPrecedingToPreceding { start, .. } => self
+                .window_peer_group_bounds_preceding(ordered, ordinal, sort_key, start)
+                .map(|(start, _)| start)
+                .unwrap_or_else(|| ordinal.saturating_add(1)),
+            WindowFrame::GroupsCurrentRow
+            | WindowFrame::GroupsCurrentRowToFollowing(_)
+            | WindowFrame::GroupsCurrentRowToUnboundedFollowing => {
+                Self::window_peer_group_start(ordered, ordinal, sort_key)
+            }
+            WindowFrame::GroupsFollowingToFollowing { start, .. }
+            | WindowFrame::GroupsFollowingToUnboundedFollowing(start) => {
+                self.window_peer_group_start_following(ordered, ordinal, sort_key, start)
+            }
+            WindowFrame::RangePrecedingToCurrentRow(preceding) => {
+                self.window_numeric_range_start_preceding(ordered, ordinal, sort_key, preceding)
+            }
+            WindowFrame::RangePrecedingToPreceding { start, end } => self
+                .window_numeric_range_start_between_preceding(
+                    ordered, ordinal, sort_key, start, end,
+                ),
+            WindowFrame::RangePrecedingToFollowing { preceding, .. } => {
+                self.window_numeric_range_start_preceding(ordered, ordinal, sort_key, preceding)
+            }
+            WindowFrame::RangePrecedingToUnboundedFollowing(preceding) => {
+                self.window_numeric_range_start_preceding(ordered, ordinal, sort_key, preceding)
+            }
+            WindowFrame::RangeUnboundedPrecedingToPreceding(end) => self
+                .window_numeric_range_start_unbounded_to_preceding(ordered, ordinal, sort_key, end),
+            WindowFrame::RangeUnboundedPrecedingToFollowing(_) => 0,
+            WindowFrame::RangeCurrentRowToFollowing(_) => {
+                Self::window_peer_group_start(ordered, ordinal, sort_key)
+            }
+            WindowFrame::RangeFollowingToFollowing { start, .. } => {
+                self.window_numeric_range_start_following(ordered, ordinal, sort_key, start)
+            }
+            WindowFrame::RangeFollowingToUnboundedFollowing(start) => {
+                self.window_numeric_range_start_following(ordered, ordinal, sort_key, start)
+            }
+            WindowFrame::Default
+            | WindowFrame::GroupsUnboundedPrecedingToCurrentRow
+            | WindowFrame::GroupsUnboundedPrecedingAndFollowing
+            | WindowFrame::RowsUnboundedPrecedingToCurrentRow
+            | WindowFrame::RowsUnboundedPrecedingAndFollowing => 0,
+        }
+    }
+
+    fn window_frame_end(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        frame: WindowFrame,
+    ) -> usize {
+        match frame {
+            WindowFrame::RowsUnboundedPrecedingAndFollowing
+            | WindowFrame::RowsPrecedingToUnboundedFollowing(_)
+            | WindowFrame::RowsCurrentRowToUnboundedFollowing
+            | WindowFrame::GroupsUnboundedPrecedingAndFollowing
+            | WindowFrame::GroupsPrecedingToUnboundedFollowing(_)
+            | WindowFrame::GroupsCurrentRowToUnboundedFollowing
+            | WindowFrame::GroupsFollowingToUnboundedFollowing(_)
+            | WindowFrame::RangePrecedingToUnboundedFollowing(_)
+            | WindowFrame::RangeFollowingToUnboundedFollowing(_) => ordered.len().saturating_sub(1),
+            WindowFrame::RowsUnboundedPrecedingToCurrentRow
+            | WindowFrame::RowsPrecedingToCurrentRow(_)
+            | WindowFrame::RowsCurrentRow => ordinal,
+            WindowFrame::RowsPrecedingToPreceding { end, .. } => {
+                ordinal.checked_sub(end).unwrap_or(0)
+            }
+            WindowFrame::RowsPrecedingToFollowing { following, .. } => ordinal
+                .saturating_add(following)
+                .min(ordered.len().saturating_sub(1)),
+            WindowFrame::RowsCurrentRowToFollowing(following) => ordinal
+                .saturating_add(following)
+                .min(ordered.len().saturating_sub(1)),
+            WindowFrame::RowsFollowingToFollowing { end, .. } => ordinal
+                .saturating_add(end)
+                .min(ordered.len().saturating_sub(1)),
+            WindowFrame::RowsFollowingToUnboundedFollowing(_) => ordered.len().saturating_sub(1),
+            WindowFrame::GroupsUnboundedPrecedingToCurrentRow
+            | WindowFrame::GroupsPrecedingToCurrentRow(_)
+            | WindowFrame::GroupsCurrentRow => {
+                Self::window_peer_group_end(ordered, ordinal, sort_key)
+            }
+            WindowFrame::GroupsPrecedingToPreceding { end, .. } => self
+                .window_peer_group_bounds_preceding(ordered, ordinal, sort_key, end)
+                .map(|(_, end)| end)
+                .unwrap_or(ordinal),
+            WindowFrame::GroupsPrecedingToFollowing { following, .. } => {
+                self.window_peer_group_end_following(ordered, ordinal, sort_key, following)
+            }
+            WindowFrame::GroupsCurrentRowToFollowing(following) => {
+                self.window_peer_group_end_following(ordered, ordinal, sort_key, following)
+            }
+            WindowFrame::GroupsFollowingToFollowing { end, .. } => {
+                self.window_peer_group_end_following(ordered, ordinal, sort_key, end)
+            }
+            WindowFrame::RangePrecedingToCurrentRow(_) => {
+                Self::window_peer_group_end(ordered, ordinal, sort_key)
+            }
+            WindowFrame::RangePrecedingToPreceding { start, end } => self
+                .window_numeric_range_end_between_preceding(ordered, ordinal, sort_key, start, end),
+            WindowFrame::RangeUnboundedPrecedingToPreceding(end) => self
+                .window_numeric_range_end_unbounded_to_preceding(ordered, ordinal, sort_key, end),
+            WindowFrame::RangePrecedingToFollowing { following, .. } => {
+                self.window_numeric_range_end_following(ordered, ordinal, sort_key, following)
+            }
+            WindowFrame::RangeUnboundedPrecedingToFollowing(following) => {
+                self.window_numeric_range_end_following(ordered, ordinal, sort_key, following)
+            }
+            WindowFrame::RangeCurrentRowToFollowing(following) => {
+                self.window_numeric_range_end_following(ordered, ordinal, sort_key, following)
+            }
+            WindowFrame::RangeFollowingToFollowing { end, .. } => {
+                self.window_numeric_range_end_following(ordered, ordinal, sort_key, end)
+            }
+            WindowFrame::Default => ordered
+                .iter()
+                .enumerate()
+                .skip(ordinal)
+                .take_while(|(_, (candidate_key, _))| candidate_key.as_slice() == sort_key)
+                .map(|(index, _)| index)
+                .last()
+                .unwrap_or(ordinal),
+        }
+    }
+
+    fn window_peer_group_start(
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+    ) -> usize {
+        ordered
+            .iter()
+            .enumerate()
+            .take(ordinal + 1)
+            .rev()
+            .take_while(|(_, (candidate_key, _))| candidate_key.as_slice() == sort_key)
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(ordinal)
+    }
+
+    fn window_peer_group_end(
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+    ) -> usize {
+        ordered
+            .iter()
+            .enumerate()
+            .skip(ordinal)
+            .take_while(|(_, (candidate_key, _))| candidate_key.as_slice() == sort_key)
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(ordinal)
+    }
+
+    fn window_peer_group_start_preceding(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        preceding: usize,
+    ) -> usize {
+        let mut start = Self::window_peer_group_start(ordered, ordinal, sort_key);
+        for _ in 0..preceding {
+            if start == 0 {
+                return 0;
+            }
+            let previous_ordinal = start - 1;
+            start = Self::window_peer_group_start(
+                ordered,
+                previous_ordinal,
+                ordered[previous_ordinal].0.as_slice(),
+            );
+        }
+        start
+    }
+
+    fn window_peer_group_bounds_preceding(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        preceding: usize,
+    ) -> Option<(usize, usize)> {
+        let mut start = Self::window_peer_group_start(ordered, ordinal, sort_key);
+        let mut end = Self::window_peer_group_end(ordered, ordinal, sort_key);
+        for _ in 0..preceding {
+            if start == 0 {
+                return None;
+            }
+            end = start - 1;
+            start = Self::window_peer_group_start(ordered, end, ordered[end].0.as_slice());
+        }
+        Some((start, end))
+    }
+
+    fn window_peer_group_start_following(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        following: usize,
+    ) -> usize {
+        let mut start = Self::window_peer_group_start(ordered, ordinal, sort_key);
+        let mut end = Self::window_peer_group_end(ordered, ordinal, sort_key);
+        for _ in 0..following {
+            if end + 1 >= ordered.len() {
+                return ordered.len();
+            }
+            start = end + 1;
+            end = Self::window_peer_group_end(ordered, start, ordered[start].0.as_slice());
+        }
+        start
+    }
+
+    fn window_peer_group_end_following(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        following: usize,
+    ) -> usize {
+        let mut end = Self::window_peer_group_end(ordered, ordinal, sort_key);
+        for _ in 0..following {
+            if end + 1 >= ordered.len() {
+                return ordered.len().saturating_sub(1);
+            }
+            let next_ordinal = end + 1;
+            end = Self::window_peer_group_end(
+                ordered,
+                next_ordinal,
+                ordered[next_ordinal].0.as_slice(),
+            );
+        }
+        end
+    }
+
+    fn window_numeric_range_start_preceding(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        preceding: WindowRangeOffset,
+    ) -> usize {
+        let Some(current) = Self::window_numeric_sort_value(sort_key) else {
+            return Self::window_peer_group_start(ordered, ordinal, sort_key);
+        };
+        let preceding = preceding.value();
+        let descending = Self::window_numeric_range_descending(ordered);
+        let boundary = if descending {
+            current + preceding
+        } else {
+            current - preceding
+        };
+        ordered
+            .iter()
+            .enumerate()
+            .take(ordinal + 1)
+            .find(|(_, (candidate_key, _))| {
+                Self::window_numeric_sort_value(candidate_key.as_slice()).is_some_and(|value| {
+                    if descending {
+                        value <= boundary
+                    } else {
+                        value >= boundary
+                    }
+                })
+            })
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| Self::window_peer_group_start(ordered, ordinal, sort_key))
+    }
+
+    fn window_numeric_range_end_following(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        following: WindowRangeOffset,
+    ) -> usize {
+        let Some(current) = Self::window_numeric_sort_value(sort_key) else {
+            return Self::window_peer_group_end(ordered, ordinal, sort_key);
+        };
+        let following = following.value();
+        let descending = Self::window_numeric_range_descending(ordered);
+        let boundary = if descending {
+            current - following
+        } else {
+            current + following
+        };
+        ordered
+            .iter()
+            .enumerate()
+            .skip(ordinal)
+            .take_while(|(_, (candidate_key, _))| {
+                Self::window_numeric_sort_value(candidate_key.as_slice()).is_some_and(|value| {
+                    if descending {
+                        value >= boundary
+                    } else {
+                        value <= boundary
+                    }
+                })
+            })
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or_else(|| Self::window_peer_group_end(ordered, ordinal, sort_key))
+    }
+
+    fn window_numeric_range_start_between_preceding(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        start: WindowRangeOffset,
+        end: WindowRangeOffset,
+    ) -> usize {
+        let Some(current) = Self::window_numeric_sort_value(sort_key) else {
+            return Self::window_peer_group_start(ordered, ordinal, sort_key);
+        };
+        let start = start.value();
+        let end = end.value();
+        let descending = Self::window_numeric_range_descending(ordered);
+        let (lower, upper) = if descending {
+            (current + end, current + start)
+        } else {
+            (current - start, current - end)
+        };
+        ordered
+            .iter()
+            .enumerate()
+            .take(ordinal + 1)
+            .find(|(_, (candidate_key, _))| {
+                Self::window_numeric_sort_value(candidate_key.as_slice())
+                    .is_some_and(|value| value >= lower && value <= upper)
+            })
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| ordinal.saturating_add(1))
+    }
+
+    fn window_numeric_range_end_between_preceding(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        start: WindowRangeOffset,
+        end: WindowRangeOffset,
+    ) -> usize {
+        let Some(current) = Self::window_numeric_sort_value(sort_key) else {
+            return Self::window_peer_group_end(ordered, ordinal, sort_key);
+        };
+        let start = start.value();
+        let end = end.value();
+        let descending = Self::window_numeric_range_descending(ordered);
+        let (lower, upper) = if descending {
+            (current + end, current + start)
+        } else {
+            (current - start, current - end)
+        };
+        ordered
+            .iter()
+            .enumerate()
+            .take(ordinal + 1)
+            .take_while(|(_, (candidate_key, _))| {
+                Self::window_numeric_sort_value(candidate_key.as_slice()).is_some_and(|value| {
+                    if descending {
+                        value >= lower
+                    } else {
+                        value <= upper
+                    }
+                })
+            })
+            .filter(|(_, (candidate_key, _))| {
+                Self::window_numeric_sort_value(candidate_key.as_slice())
+                    .is_some_and(|value| value >= lower && value <= upper)
+            })
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(ordinal)
+    }
+
+    fn window_numeric_range_end_unbounded_to_preceding(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        preceding: WindowRangeOffset,
+    ) -> usize {
+        self.window_numeric_range_last_unbounded_to_preceding(ordered, ordinal, sort_key, preceding)
+            .unwrap_or(ordinal)
+    }
+
+    fn window_numeric_range_last_unbounded_to_preceding(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        preceding: WindowRangeOffset,
+    ) -> Option<usize> {
+        let Some(current) = Self::window_numeric_sort_value(sort_key) else {
+            return Some(Self::window_peer_group_start(ordered, ordinal, sort_key));
+        };
+        let preceding = preceding.value();
+        let descending = Self::window_numeric_range_descending(ordered);
+        let boundary = if descending {
+            current + preceding
+        } else {
+            current - preceding
+        };
+        ordered
+            .iter()
+            .enumerate()
+            .take(ordinal + 1)
+            .take_while(|(_, (candidate_key, _))| {
+                Self::window_numeric_sort_value(candidate_key.as_slice()).is_some_and(|value| {
+                    if descending {
+                        value >= boundary
+                    } else {
+                        value <= boundary
+                    }
+                })
+            })
+            .map(|(index, _)| index)
+            .last()
+    }
+
+    fn window_numeric_range_start_unbounded_to_preceding(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        preceding: WindowRangeOffset,
+    ) -> usize {
+        if self
+            .window_numeric_range_last_unbounded_to_preceding(ordered, ordinal, sort_key, preceding)
+            .is_some()
+        {
+            0
+        } else {
+            ordinal.saturating_add(1)
+        }
+    }
+
+    fn window_numeric_range_start_following(
+        &self,
+        ordered: &[(Vec<Option<Value>>, usize)],
+        ordinal: usize,
+        sort_key: &[Option<Value>],
+        following: WindowRangeOffset,
+    ) -> usize {
+        let Some(current) = Self::window_numeric_sort_value(sort_key) else {
+            return Self::window_peer_group_start(ordered, ordinal, sort_key);
+        };
+        let following = following.value();
+        let descending = Self::window_numeric_range_descending(ordered);
+        let boundary = if descending {
+            current - following
+        } else {
+            current + following
+        };
+        ordered
+            .iter()
+            .enumerate()
+            .skip(ordinal)
+            .find(|(_, (candidate_key, _))| {
+                Self::window_numeric_sort_value(candidate_key.as_slice()).is_some_and(|value| {
+                    if descending {
+                        value <= boundary
+                    } else {
+                        value >= boundary
+                    }
+                })
+            })
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| ordered.len())
+    }
+
+    fn window_numeric_range_descending(ordered: &[(Vec<Option<Value>>, usize)]) -> bool {
+        let first = ordered
+            .first()
+            .and_then(|(sort_key, _)| Self::window_numeric_sort_value(sort_key));
+        let last = ordered
+            .last()
+            .and_then(|(sort_key, _)| Self::window_numeric_sort_value(sort_key));
+        matches!((first, last), (Some(first), Some(last)) if first > last)
+    }
+
+    fn window_numeric_sort_value(sort_key: &[Option<Value>]) -> Option<f64> {
+        match sort_key.first()? {
+            Some(Value::Integer(value)) => Some(*value as f64),
+            Some(Value::Real(value)) => Some(*value),
+            Some(Value::Boolean(value)) => Some(if *value { 1.0 } else { 0.0 }),
+            _ => None,
+        }
+    }
+
+    fn window_visible_frame_ordinals(
+        &self,
+        frame_start: usize,
+        frame_end: usize,
+        current_ordinal: usize,
+        peer_start: usize,
+        peer_end: usize,
+        exclude: WindowExclude,
+        partition_len: usize,
+    ) -> Vec<usize> {
+        if frame_start > frame_end || frame_start >= partition_len {
+            return Vec::new();
+        }
+        let frame_end = frame_end.min(partition_len.saturating_sub(1));
+        (frame_start..=frame_end)
+            .filter(|ordinal| match exclude {
+                WindowExclude::NoOthers => true,
+                WindowExclude::CurrentRow => *ordinal != current_ordinal,
+                WindowExclude::Group => !(peer_start..=peer_end).contains(ordinal),
+                WindowExclude::Ties => {
+                    *ordinal == current_ordinal || !(peer_start..=peer_end).contains(ordinal)
+                }
+            })
+            .collect()
+    }
+
+    fn evaluate_value_window_value(
+        &self,
+        transaction_id: Option<TransactionId>,
+        full_source: &RowSet,
+        entries: &[(Row, Row)],
+        ordered_entry_indexes: &[usize],
+        target_ordinal: usize,
+        args: &[ScalarExpr],
+    ) -> Result<Value> {
+        let Some(entry_index) = ordered_entry_indexes.get(target_ordinal) else {
+            return Ok(Value::Null);
+        };
+        let target_full_row = &entries[*entry_index].1;
+        self.evaluate_scalar_expr_in_context(
+            transaction_id,
+            full_source,
+            target_full_row,
+            None,
+            &args[0],
+        )
+    }
+
+    fn evaluate_nth_value_window_value(
+        &self,
+        transaction_id: Option<TransactionId>,
+        full_source: &RowSet,
+        entries: &[(Row, Row)],
+        ordered_entry_indexes: &[usize],
+        ordinal: usize,
+        visible_ordinals: &[usize],
+        args: &[ScalarExpr],
+    ) -> Result<Value> {
+        let current_full_row = &entries[ordered_entry_indexes[ordinal]].1;
+        let nth = match Self::cast_value(
+            self.evaluate_scalar_expr_in_context(
+                transaction_id,
+                full_source,
+                current_full_row,
+                None,
+                &args[1],
+            )?,
+            ColumnType::Integer,
+        )? {
+            Value::Integer(value) if value > 0 => {
+                usize::try_from(value).map_err(|_| DbError::storage("NTH_VALUE index overflow"))?
+            }
+            _ => {
+                return Err(DbError::storage(
+                    "second argument to nth_value must be a positive integer",
+                ));
+            }
+        };
+        let Some(target_ordinal) = visible_ordinals.get(nth - 1).copied() else {
+            return Ok(Value::Null);
+        };
+        self.evaluate_value_window_value(
+            transaction_id,
+            full_source,
+            entries,
+            ordered_entry_indexes,
+            target_ordinal,
+            args,
+        )
+    }
+
+    fn evaluate_aggregate_window_value(
+        &self,
+        transaction_id: Option<TransactionId>,
+        full_source: &RowSet,
+        entries: &[(Row, Row)],
+        ordered_entry_indexes: &[usize],
+        current_ordinal: usize,
+        peer_start: usize,
+        peer_end: usize,
+        frame_start: usize,
+        frame_end: usize,
+        window_func: WindowFunc,
+        args: &[ScalarExpr],
+        exclude: WindowExclude,
+        filter: Option<&Expr>,
+    ) -> Result<Value> {
+        if frame_start > frame_end || frame_start >= ordered_entry_indexes.len() {
+            return Ok(match window_func {
+                WindowFunc::Count => Value::Integer(0),
+                WindowFunc::Sum | WindowFunc::Avg => Value::Null,
+                WindowFunc::Total => Value::Real(0.0),
+                WindowFunc::Min | WindowFunc::Max => Value::Null,
+                WindowFunc::GroupConcat => Value::Null,
+                WindowFunc::JsonGroupArray => Value::from("[]"),
+                WindowFunc::JsonGroupObject => Value::from("{}"),
+                _ => unreachable!("non-aggregate window function"),
+            });
+        }
+
+        let mut count = 0_i64;
+        let mut int_sum = 0_i128;
+        let mut real_sum = 0.0;
+        let mut saw_real = false;
+        let mut extremum: Option<Value> = None;
+        let mut concat: Option<String> = None;
+        let mut json_array_values = Vec::new();
+        let mut json_object_fields = Vec::new();
+        let frame_end = frame_end.min(ordered_entry_indexes.len().saturating_sub(1));
+
+        for ordinal in frame_start..=frame_end {
+            let excluded = match exclude {
+                WindowExclude::NoOthers => false,
+                WindowExclude::CurrentRow => ordinal == current_ordinal,
+                WindowExclude::Group => (peer_start..=peer_end).contains(&ordinal),
+                WindowExclude::Ties => {
+                    ordinal != current_ordinal && (peer_start..=peer_end).contains(&ordinal)
+                }
+            };
+            if excluded {
+                continue;
+            }
+            let Some(entry_index) = ordered_entry_indexes.get(ordinal) else {
+                continue;
+            };
+            let full_row = &entries[*entry_index].1;
+            if let Some(filter) = filter
+                && !self.matches_filter(
+                    transaction_id.ok_or_else(|| {
+                        DbError::plan("aggregate window FILTER requires transaction context")
+                    })?,
+                    full_source,
+                    full_row,
+                    Some(filter),
+                    None,
+                )?
+            {
+                continue;
+            }
+            let value = if args.is_empty() {
+                Value::Integer(1)
+            } else {
+                self.evaluate_scalar_expr_in_context(
+                    transaction_id,
+                    full_source,
+                    full_row,
+                    None,
+                    &args[0],
+                )?
+            };
+
+            match window_func {
+                WindowFunc::Count => {
+                    if args.is_empty() || value != Value::Null {
+                        count += 1;
+                    }
+                }
+                WindowFunc::Sum | WindowFunc::Avg | WindowFunc::Total => {
+                    match Self::coerce_aggregate_numeric_value(&value) {
+                        Some(Value::Integer(value)) => {
+                            int_sum += i128::from(value);
+                            real_sum += value as f64;
+                            count += 1;
+                        }
+                        Some(Value::Real(value)) => {
+                            real_sum += value;
+                            count += 1;
+                            saw_real = true;
+                        }
+                        Some(_) => {
+                            unreachable!("aggregate numeric coercion only returns numeric values")
+                        }
+                        None => {}
+                    }
+                }
+                WindowFunc::Min => {
+                    if value != Value::Null {
+                        match extremum.as_ref() {
+                            None => extremum = Some(value),
+                            Some(existing)
+                                if self.compare(existing, &value)? == Some(Ordering::Greater) =>
+                            {
+                                extremum = Some(value);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                WindowFunc::Max => {
+                    if value != Value::Null {
+                        match extremum.as_ref() {
+                            None => extremum = Some(value),
+                            Some(existing)
+                                if self.compare(existing, &value)? == Some(Ordering::Less) =>
+                            {
+                                extremum = Some(value);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                WindowFunc::GroupConcat => {
+                    if value != Value::Null {
+                        let text = Self::coerce_text_like_value(&value);
+                        let separator = if let Some(separator_expr) = args.get(1) {
+                            let separator = self.evaluate_scalar_expr_in_context(
+                                transaction_id,
+                                full_source,
+                                full_row,
+                                None,
+                                separator_expr,
+                            )?;
+                            if separator == Value::Null {
+                                String::new()
+                            } else {
+                                Self::coerce_text_like_value(&separator)
+                            }
+                        } else {
+                            ",".to_string()
+                        };
+                        if let Some(current) = concat.as_mut() {
+                            current.push_str(&separator);
+                            current.push_str(&text);
+                        } else {
+                            concat = Some(text);
+                        }
+                    }
+                }
+                WindowFunc::JsonGroupArray => {
+                    let json_value = Self::sql_value_to_json(&value)?;
+                    let json = serde_json::to_string(&json_value).map_err(|error| {
+                        DbError::plan(format!("failed to render JSON aggregate value: {error}"))
+                    })?;
+                    json_array_values.push(json);
+                }
+                WindowFunc::JsonGroupObject => {
+                    let key = value;
+                    if key != Value::Null {
+                        let key = Self::coerce_text_like_value(&key);
+                        let key = serde_json::to_string(&key).map_err(|error| {
+                            DbError::plan(format!("failed to render JSON object key: {error}"))
+                        })?;
+                        let value_expr = args.get(1).ok_or_else(|| {
+                            DbError::plan("JSON_GROUP_OBJECT window requires value argument")
+                        })?;
+                        let value = self.evaluate_scalar_expr_in_context(
+                            transaction_id,
+                            full_source,
+                            full_row,
+                            None,
+                            value_expr,
+                        )?;
+                        let value = Self::sql_value_to_json(&value)?;
+                        let value = serde_json::to_string(&value).map_err(|error| {
+                            DbError::plan(format!("failed to render JSON aggregate value: {error}"))
+                        })?;
+                        json_object_fields.push(format!("{key}:{value}"));
+                    }
+                }
+                _ => unreachable!("non-aggregate window function"),
+            }
+        }
+
+        Ok(match window_func {
+            WindowFunc::Count => Value::Integer(count),
+            WindowFunc::Sum if count == 0 => Value::Null,
+            WindowFunc::Sum if saw_real => Value::Real(real_sum),
+            WindowFunc::Sum => Value::Integer(
+                i64::try_from(int_sum).map_err(|_| DbError::plan("SUM overflowed i64"))?,
+            ),
+            WindowFunc::Avg if count == 0 => Value::Null,
+            WindowFunc::Avg => Value::Real(real_sum / count as f64),
+            WindowFunc::Total => Value::Real(real_sum),
+            WindowFunc::Min | WindowFunc::Max => extremum.unwrap_or(Value::Null),
+            WindowFunc::GroupConcat => concat.map(Value::from).unwrap_or(Value::Null),
+            WindowFunc::JsonGroupArray => Value::from(format!("[{}]", json_array_values.join(","))),
+            WindowFunc::JsonGroupObject => {
+                Value::from(format!("{{{}}}", json_object_fields.join(",")))
+            }
+            _ => unreachable!("non-aggregate window function"),
+        })
+    }
+
+    fn evaluate_ntile_window_value(
+        &self,
+        transaction_id: Option<TransactionId>,
+        full_source: &RowSet,
+        entries: &[(Row, Row)],
+        ordered_entry_indexes: &[usize],
+        ordinal: usize,
+        args: &[ScalarExpr],
+    ) -> Result<Value> {
+        let current_full_row = &entries[ordered_entry_indexes[ordinal]].1;
+        let buckets = match Self::cast_value(
+            self.evaluate_scalar_expr_in_context(
+                transaction_id,
+                full_source,
+                current_full_row,
+                None,
+                &args[0],
+            )?,
+            ColumnType::Integer,
+        )? {
+            Value::Integer(value) if value > 0 => usize::try_from(value)
+                .map_err(|_| DbError::storage("NTILE bucket count overflow"))?,
+            _ => {
+                return Err(DbError::storage(
+                    "argument of ntile must be a positive integer",
+                ));
+            }
+        };
+        let row_count = ordered_entry_indexes.len();
+        let larger_bucket_count = row_count % buckets;
+        let base_bucket_size = row_count / buckets;
+        let first_small_bucket = (base_bucket_size + 1) * larger_bucket_count;
+        let bucket = if ordinal < first_small_bucket {
+            ordinal / (base_bucket_size + 1) + 1
+        } else if base_bucket_size == 0 {
+            ordinal + 1
+        } else {
+            (ordinal - first_small_bucket) / base_bucket_size + larger_bucket_count + 1
+        };
+        let bucket =
+            i64::try_from(bucket).map_err(|_| DbError::storage("NTILE bucket overflow"))?;
+        Ok(Value::Integer(bucket))
+    }
+
+    fn evaluate_lag_lead_window_value(
+        &self,
+        transaction_id: Option<TransactionId>,
+        full_source: &RowSet,
+        entries: &[(Row, Row)],
+        ordered_entry_indexes: &[usize],
+        ordinal: usize,
+        window_func: WindowFunc,
+        args: &[ScalarExpr],
+    ) -> Result<Value> {
+        let current_full_row = &entries[ordered_entry_indexes[ordinal]].1;
+        let offset = if let Some(offset_expr) = args.get(1) {
+            match Self::cast_value(
+                self.evaluate_scalar_expr_in_context(
+                    transaction_id,
+                    full_source,
+                    current_full_row,
+                    None,
+                    offset_expr,
+                )?,
+                ColumnType::Integer,
+            )? {
+                Value::Integer(value) if value >= 0 => usize::try_from(value)
+                    .map_err(|_| DbError::storage("window offset overflow"))?,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let target_ordinal = match window_func {
+            WindowFunc::Lag => ordinal.checked_sub(offset),
+            WindowFunc::Lead => ordinal.checked_add(offset),
+            WindowFunc::RowNumber
+            | WindowFunc::Rank
+            | WindowFunc::DenseRank
+            | WindowFunc::PercentRank
+            | WindowFunc::CumeDist
+            | WindowFunc::FirstValue
+            | WindowFunc::LastValue
+            | WindowFunc::NthValue
+            | WindowFunc::Ntile
+            | WindowFunc::Count
+            | WindowFunc::Sum
+            | WindowFunc::Avg
+            | WindowFunc::Total
+            | WindowFunc::Min
+            | WindowFunc::Max
+            | WindowFunc::GroupConcat
+            | WindowFunc::JsonGroupArray
+            | WindowFunc::JsonGroupObject => None,
+        };
+        if let Some(target_ordinal) = target_ordinal
+            && let Some(entry_index) = ordered_entry_indexes.get(target_ordinal)
+        {
+            let target_full_row = &entries[*entry_index].1;
+            return self.evaluate_scalar_expr_in_context(
+                transaction_id,
+                full_source,
+                target_full_row,
+                None,
+                &args[0],
+            );
+        }
+        if let Some(default_expr) = args.get(2) {
+            return self.evaluate_scalar_expr_in_context(
+                transaction_id,
+                full_source,
+                current_full_row,
+                None,
+                default_expr,
+            );
+        }
+        Ok(Value::Null)
+    }
+
     fn deduplicate_rows(rows: Vec<Row>) -> Vec<Row> {
         let mut seen = HashSet::new();
         let mut deduped = Vec::with_capacity(rows.len());
         for row in rows {
-            let key = row.iter().map(Self::value_dedup_key).collect::<Vec<_>>();
+            let key = Self::row_dedup_key(&row);
             if seen.insert(key) {
                 deduped.push(row);
             }
@@ -4209,12 +7679,40 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         deduped
     }
 
+    fn deduplicate_rows_keep_last(rows: Vec<Row>) -> Vec<Row> {
+        let mut indexes = HashMap::new();
+        let mut deduped = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key = Self::row_dedup_key(&row);
+            if let Some(index) = indexes.get(&key).copied() {
+                deduped[index] = row;
+            } else {
+                indexes.insert(key, deduped.len());
+                deduped.push(row);
+            }
+        }
+        deduped
+    }
+
+    fn row_dedup_key(row: &Row) -> Vec<(u8, String)> {
+        row.iter().map(Self::value_dedup_key).collect::<Vec<_>>()
+    }
+
     fn value_dedup_key(value: &Value) -> (u8, String) {
         match value {
             Value::Null => (0, String::new()),
-            Value::Boolean(b) => (1, b.to_string()),
-            Value::Integer(i) => (2, i.to_string()),
-            Value::Real(f) => (3, format!("{:016X}", f.to_bits())),
+            Value::Boolean(value) => {
+                let numeric = if *value { 1.0_f64 } else { 0.0_f64 };
+                (1, format!("{:016X}", numeric.to_bits()))
+            }
+            Value::Integer(value) => {
+                let numeric = *value as f64;
+                (1, format!("{:016X}", numeric.to_bits()))
+            }
+            Value::Real(value) => {
+                let numeric = if *value == 0.0 { 0.0 } else { *value };
+                (1, format!("{:016X}", numeric.to_bits()))
+            }
             Value::Blob(bytes) => (
                 4,
                 bytes
@@ -4240,16 +7738,31 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             limit,
             offset,
         } = options;
-        let output_columns = self.aggregate_output_columns(columns);
+        let output_columns = self.aggregate_output_columns(columns, &source.columns);
         let visible_width = output_columns.len();
         let aggregate_calls = self.collect_aggregate_calls(columns, having, order_by);
-        let (aggregate_eval_columns, hidden_group_indexes, hidden_aggregate_indexes) =
-            self.aggregate_eval_columns(&output_columns, group_by, &aggregate_calls);
+        let (
+            aggregate_eval_columns,
+            hidden_group_indexes,
+            hidden_aggregate_indexes,
+            hidden_source_indexes,
+        ) = self.aggregate_eval_columns(
+            &output_columns,
+            &source.columns,
+            group_by,
+            &aggregate_calls,
+        );
         let has_aggregates = !aggregate_calls.is_empty();
 
-        let mut groups = BTreeMap::<Vec<Value>, Vec<AggregateState>>::new();
+        let mut groups = BTreeMap::<Vec<Value>, AggregateGroup>::new();
         if source.rows.is_empty() && group_by.is_empty() {
-            groups.insert(Vec::new(), self.initial_aggregate_states(&aggregate_calls));
+            groups.insert(
+                Vec::new(),
+                AggregateGroup {
+                    representative_row: Vec::new(),
+                    states: self.initial_aggregate_states(&aggregate_calls),
+                },
+            );
         }
 
         for row in &source.rows {
@@ -4257,23 +7770,31 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 .iter()
                 .map(|expr| self.evaluate_scalar_expr(&source, row, expr))
                 .collect::<Result<Vec<_>>>()?;
-            let states = groups
-                .entry(key)
-                .or_insert_with(|| self.initial_aggregate_states(&aggregate_calls));
-            self.update_aggregate_states(transaction_id, &source, row, &aggregate_calls, states)?;
+            let group = groups.entry(key).or_insert_with(|| AggregateGroup {
+                representative_row: row.clone(),
+                states: self.initial_aggregate_states(&aggregate_calls),
+            });
+            self.update_aggregate_states(
+                transaction_id,
+                &source,
+                row,
+                &aggregate_calls,
+                &mut group.states,
+            )?;
         }
 
         let mut rows = Vec::new();
-        for (key, states) in groups {
+        for (key, group) in groups {
             if !has_aggregates && !group_by.is_empty() && key.is_empty() {
                 continue;
             }
-            let aggregate_values = self.aggregate_state_values(&states)?;
+            let aggregate_values = self.aggregate_state_values(&group.states)?;
             let aggregate_row = self.finalize_aggregate_row(
                 &source,
                 columns,
                 group_by,
                 &key,
+                &group.representative_row,
                 &aggregate_calls,
                 &aggregate_values,
             )?;
@@ -4283,6 +7804,8 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 &hidden_group_indexes,
                 &aggregate_values,
                 &hidden_aggregate_indexes,
+                &group.representative_row,
+                &hidden_source_indexes,
             );
             if let Some(having) = having {
                 let aggregate_rowset = RowSet {
@@ -4339,7 +7862,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
             (AggregateFunc::Count, _) => AggregateState::Count(0),
             (AggregateFunc::Sum, AggregateArg::Expr { distinct: true, .. }) => {
-                AggregateState::SumDistinct(BTreeSet::new())
+                AggregateState::SumDistinct(BTreeMap::new())
             }
             (AggregateFunc::Sum, _) => AggregateState::Sum {
                 int_sum: 0,
@@ -4348,7 +7871,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 saw_real: false,
             },
             (AggregateFunc::Avg, AggregateArg::Expr { distinct: true, .. }) => {
-                AggregateState::AvgDistinct(BTreeSet::new())
+                AggregateState::AvgDistinct(BTreeMap::new())
             }
             (AggregateFunc::Avg, _) => AggregateState::Avg {
                 int_sum: 0,
@@ -4357,9 +7880,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 saw_real: false,
             },
             (AggregateFunc::Total, AggregateArg::Expr { distinct: true, .. }) => {
-                AggregateState::TotalDistinct(BTreeSet::new())
+                AggregateState::TotalDistinct(BTreeMap::new())
             }
             (AggregateFunc::Total, _) => AggregateState::Total(0.0),
+            (AggregateFunc::DecimalSum, _) => AggregateState::DecimalSum {
+                total: 0.0,
+                seen_row: false,
+            },
             (AggregateFunc::Median, _) => AggregateState::Median(Vec::new()),
             (
                 AggregateFunc::Percentile
@@ -4402,30 +7929,40 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 ordered: Vec::new(),
                 order_by: Vec::new(),
             },
-            (AggregateFunc::JsonGroupArray, AggregateArg::Expr { order_by, .. }) => {
+            (
+                AggregateFunc::JsonGroupArray | AggregateFunc::JsonbGroupArray,
+                AggregateArg::Expr { order_by, .. },
+            ) => AggregateState::JsonGroupArray {
+                values: Vec::new(),
+                ordered: Vec::new(),
+                order_by: order_by.clone(),
+                jsonb: matches!(call.func, AggregateFunc::JsonbGroupArray),
+            },
+            (AggregateFunc::JsonGroupArray | AggregateFunc::JsonbGroupArray, _) => {
                 AggregateState::JsonGroupArray {
                     values: Vec::new(),
                     ordered: Vec::new(),
-                    order_by: order_by.clone(),
+                    order_by: Vec::new(),
+                    jsonb: matches!(call.func, AggregateFunc::JsonbGroupArray),
                 }
             }
-            (AggregateFunc::JsonGroupArray, _) => AggregateState::JsonGroupArray {
-                values: Vec::new(),
+            (
+                AggregateFunc::JsonGroupObject | AggregateFunc::JsonbGroupObject,
+                AggregateArg::JsonGroupObject { order_by, .. },
+            ) => AggregateState::JsonGroupObject {
+                fields: Vec::new(),
                 ordered: Vec::new(),
-                order_by: Vec::new(),
+                order_by: order_by.clone(),
+                jsonb: matches!(call.func, AggregateFunc::JsonbGroupObject),
             },
-            (AggregateFunc::JsonGroupObject, AggregateArg::JsonGroupObject { order_by, .. }) => {
+            (AggregateFunc::JsonGroupObject | AggregateFunc::JsonbGroupObject, _) => {
                 AggregateState::JsonGroupObject {
                     fields: Vec::new(),
                     ordered: Vec::new(),
-                    order_by: order_by.clone(),
+                    order_by: Vec::new(),
+                    jsonb: matches!(call.func, AggregateFunc::JsonbGroupObject),
                 }
             }
-            (AggregateFunc::JsonGroupObject, _) => AggregateState::JsonGroupObject {
-                fields: Vec::new(),
-                ordered: Vec::new(),
-                order_by: Vec::new(),
-            },
             (AggregateFunc::Min, _) => AggregateState::Min(None),
             (AggregateFunc::Max, _) => AggregateState::Max(None),
         }
@@ -4466,7 +8003,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 ) => {
                     let value = self.evaluate_scalar_expr(source, row, expr)?;
                     if value != Value::Null {
-                        values.insert(value);
+                        values.insert(Self::value_dedup_key(&value));
                     }
                 }
                 (AggregateState::Count(_), AggregateFunc::Count, AggregateArg::Expr { .. }) => {}
@@ -4505,7 +8042,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 ) => {
                     let value = self.evaluate_scalar_expr(source, row, expr)?;
                     if Self::coerce_aggregate_numeric_value(&value).is_some() {
-                        values.insert(value);
+                        values.entry(Self::value_dedup_key(&value)).or_insert(value);
                     }
                 }
                 (
@@ -4543,7 +8080,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 ) => {
                     let value = self.evaluate_scalar_expr(source, row, expr)?;
                     if Self::coerce_aggregate_numeric_value(&value).is_some() {
-                        values.insert(value);
+                        values.entry(Self::value_dedup_key(&value)).or_insert(value);
                     }
                 }
                 (
@@ -4568,7 +8105,23 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 ) => {
                     let value = self.evaluate_scalar_expr(source, row, expr)?;
                     if Self::coerce_aggregate_numeric_value(&value).is_some() {
-                        values.insert(value);
+                        values.entry(Self::value_dedup_key(&value)).or_insert(value);
+                    }
+                }
+                (
+                    AggregateState::DecimalSum { total, seen_row },
+                    AggregateFunc::DecimalSum,
+                    AggregateArg::Expr { expr, .. },
+                ) => {
+                    *seen_row = true;
+                    let value = self.evaluate_scalar_expr(source, row, expr)?;
+                    match Self::coerce_aggregate_numeric_value(&value) {
+                        Some(Value::Integer(value)) => *total += value as f64,
+                        Some(Value::Real(value)) => *total += value,
+                        Some(_) => {
+                            unreachable!("aggregate numeric coercion only returns numeric values")
+                        }
+                        None => {}
                     }
                 }
                 (
@@ -4673,7 +8226,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     let value = self.evaluate_scalar_expr(source, row, expr)?;
                     if value != Value::Null {
                         let text = Self::coerce_text_like_value(&value);
-                        if seen.insert(value) {
+                        if seen.insert(Self::value_dedup_key(&value)) {
                             if order_by.is_empty() {
                                 values.push(text);
                             } else {
@@ -4695,8 +8248,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         values,
                         ordered,
                         order_by,
+                        ..
                     },
-                    AggregateFunc::JsonGroupArray,
+                    AggregateFunc::JsonGroupArray | AggregateFunc::JsonbGroupArray,
                     AggregateArg::Expr { expr, .. },
                 ) => {
                     let value = self.evaluate_scalar_expr(source, row, expr)?;
@@ -4723,8 +8277,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         fields,
                         ordered,
                         order_by,
+                        ..
                     },
-                    AggregateFunc::JsonGroupObject,
+                    AggregateFunc::JsonGroupObject | AggregateFunc::JsonbGroupObject,
                     AggregateArg::JsonGroupObject { key, value, .. },
                 ) => {
                     let key = self.evaluate_scalar_expr(source, row, key)?;
@@ -4802,6 +8357,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         columns: &[SelectItem],
         group_by: &[ScalarExpr],
         key: &[Value],
+        representative_row: &Row,
         calls: &[AggregateCall],
         aggregate_values: &[Value],
     ) -> Result<Row> {
@@ -4809,8 +8365,24 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         for item in columns {
             match item {
                 SelectItem::Column(name) | SelectItem::AliasedColumn { name, .. } => {
-                    let key_index = self.group_key_index(source, group_by, name)?;
-                    row.push(key[key_index].clone());
+                    match self.group_key_index(source, group_by, name) {
+                        Ok(key_index) => row.push(key[key_index].clone()),
+                        Err(error) => {
+                            let column_expr = ScalarExpr::Column(name.clone());
+                            if self
+                                .resolve_column_index(&source.columns, name)
+                                .map(|_| ())
+                                .is_err()
+                            {
+                                return Err(error);
+                            }
+                            row.push(self.evaluate_scalar_expr(
+                                source,
+                                representative_row,
+                                &column_expr,
+                            )?);
+                        }
+                    }
                 }
                 SelectItem::Expr { expr, .. } => {
                     if Self::scalar_expr_has_aggregate(expr) {
@@ -4818,8 +8390,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                             self.aggregate_expr_eval_source(group_by, key, calls, aggregate_values);
                         row.push(self.evaluate_scalar_expr(&eval_source, &eval_row, expr)?);
                     } else {
-                        let key_index = self.group_expr_index(source, group_by, expr)?;
-                        row.push(key[key_index].clone());
+                        if let Some(key_index) = self.group_expr_index(source, group_by, expr)? {
+                            row.push(key[key_index].clone());
+                        } else {
+                            row.push(self.evaluate_scalar_expr(
+                                source,
+                                representative_row,
+                                expr,
+                            )?);
+                        }
                     }
                 }
                 SelectItem::Aggregate {
@@ -4842,9 +8421,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     row.push(aggregate_values[index].clone());
                 }
                 SelectItem::Wildcard => {
-                    return Err(DbError::plan(
-                        "wildcard cannot be used with GROUP BY or aggregate projections",
-                    ));
+                    row.extend(
+                        source
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, column)| !column.hidden)
+                            .filter_map(|(index, _)| representative_row.get(index).cloned()),
+                    );
                 }
             }
         }
@@ -4883,7 +8467,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     let mut int_sum = 0_i128;
                     let mut real_sum = 0.0;
                     let mut saw_real = false;
-                    for value in values {
+                    for value in values.values() {
                         match Self::coerce_aggregate_numeric_value(value) {
                             Some(Value::Integer(value)) => {
                                 int_sum += i128::from(value);
@@ -4925,7 +8509,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     Value::Null
                 } else {
                     let mut real_sum = 0.0;
-                    for value in values {
+                    for value in values.values() {
                         match Self::coerce_aggregate_numeric_value(value) {
                             Some(Value::Integer(value)) => real_sum += value as f64,
                             Some(Value::Real(value)) => real_sum += value,
@@ -4943,7 +8527,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             AggregateState::Total(total) => Value::Real(*total),
             AggregateState::TotalDistinct(values) => {
                 let mut total = 0.0;
-                for value in values {
+                for value in values.values() {
                     match Self::coerce_aggregate_numeric_value(value) {
                         Some(Value::Integer(value)) => total += value as f64,
                         Some(Value::Real(value)) => total += value,
@@ -4954,6 +8538,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     }
                 }
                 Value::Real(total)
+            }
+            AggregateState::DecimalSum { total, seen_row } => {
+                if *seen_row {
+                    Value::Text(Self::sqlite_decimal_sum_text(*total))
+                } else {
+                    Value::Null
+                }
             }
             AggregateState::Median(values) => {
                 if values.is_empty() {
@@ -5039,44 +8630,58 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 values,
                 ordered,
                 order_by,
+                jsonb,
             } => {
-                if !ordered.is_empty() {
+                let json = if !ordered.is_empty() {
                     let mut entries = ordered.clone();
                     entries.sort_by(|(left_key, _), (right_key, _)| {
                         self.compare_order_keys(left_key, right_key, order_by)
                     });
-                    Value::Text(format!(
+                    format!(
                         "[{}]",
                         entries
                             .into_iter()
                             .map(|(_key, value)| value)
                             .collect::<Vec<_>>()
                             .join(",")
-                    ))
+                    )
                 } else {
-                    Value::Text(format!("[{}]", values.join(",")))
+                    format!("[{}]", values.join(","))
+                };
+                if *jsonb {
+                    let parsed = parse_sqlite_json_value(&json)
+                        .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
+                    Value::Blob(crate::sql::jsonb::encode(&parsed)?)
+                } else {
+                    Value::Text(json)
                 }
             }
             AggregateState::JsonGroupObject {
                 fields,
                 ordered,
                 order_by,
+                jsonb,
             } => {
-                if !ordered.is_empty() {
+                let ordered_fields;
+                let field_values = if !ordered.is_empty() {
                     let mut entries = ordered.clone();
                     entries.sort_by(|(left_key, _), (right_key, _)| {
                         self.compare_order_keys(left_key, right_key, order_by)
                     });
-                    Value::Text(format!(
-                        "{{{}}}",
-                        entries
-                            .into_iter()
-                            .map(|(_key, field)| field)
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    ))
+                    ordered_fields = entries
+                        .into_iter()
+                        .map(|(_key, field)| field)
+                        .collect::<Vec<_>>();
+                    &ordered_fields
                 } else {
-                    Value::Text(format!("{{{}}}", fields.join(",")))
+                    fields
+                };
+                if *jsonb {
+                    Value::Blob(
+                        crate::sql::jsonb::encode_object_entries_from_json_fragments(field_values)?,
+                    )
+                } else {
+                    Value::Text(format!("{{{}}}", field_values.join(",")))
                 }
             }
             AggregateState::Min(value) | AggregateState::Max(value) => {
@@ -5139,10 +8744,18 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
             Expr::IsNullScalar { expr, .. }
             | Expr::IsBool { expr, .. }
-            | Expr::LikeScalar { expr, .. }
-            | Expr::GlobScalar { expr, .. }
             | Expr::InSubqueryScalar { expr, .. } => {
                 Self::collect_scalar_expr_aggregate_calls(expr, calls);
+            }
+            Expr::GlobScalar { expr, pattern, .. } => {
+                Self::collect_scalar_expr_aggregate_calls(expr, calls);
+                Self::collect_scalar_expr_aggregate_calls(pattern, calls);
+            }
+            Expr::LikeScalar { expr, escape, .. } => {
+                Self::collect_scalar_expr_aggregate_calls(expr, calls);
+                if let Some(escape) = escape {
+                    Self::collect_scalar_expr_aggregate_calls(escape, calls);
+                }
             }
             Expr::BetweenScalar {
                 expr, low, high, ..
@@ -5172,9 +8785,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             | Expr::InList { .. }
             | Expr::CompareSubquery { .. }
             | Expr::ExistsSubquery { .. }
-            | Expr::Like { .. }
-            | Expr::Glob { .. }
             | Expr::Between { .. } => {}
+            Expr::Glob { pattern, .. } => {
+                Self::collect_scalar_expr_aggregate_calls(pattern, calls);
+            }
+            Expr::Like { escape, .. } => {
+                if let Some(escape) = escape {
+                    Self::collect_scalar_expr_aggregate_calls(escape, calls);
+                }
+            }
         }
     }
 
@@ -5195,7 +8814,8 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     Self::collect_scalar_expr_aggregate_calls(value, calls);
                 }
             }
-            ScalarExpr::UnaryMinus(expr)
+            ScalarExpr::UnaryPlus(expr)
+            | ScalarExpr::UnaryMinus(expr)
             | ScalarExpr::BitNot(expr)
             | ScalarExpr::Not(expr)
             | ScalarExpr::Cast { expr, .. }
@@ -5220,8 +8840,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 Self::collect_scalar_expr_aggregate_calls(expr, calls);
             }
             ScalarExpr::Subquery { .. } => {}
-            ScalarExpr::Like { expr, .. } | ScalarExpr::Glob { expr, .. } => {
+            ScalarExpr::Glob { expr, pattern, .. } => {
                 Self::collect_scalar_expr_aggregate_calls(expr, calls);
+                Self::collect_scalar_expr_aggregate_calls(pattern, calls);
+            }
+            ScalarExpr::Like { expr, escape, .. } => {
+                Self::collect_scalar_expr_aggregate_calls(expr, calls);
+                if let Some(escape) = escape {
+                    Self::collect_scalar_expr_aggregate_calls(escape, calls);
+                }
             }
             ScalarExpr::Between {
                 expr, low, high, ..
@@ -5249,6 +8876,21 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             ScalarExpr::Function { args, .. } => {
                 for arg in args {
                     Self::collect_scalar_expr_aggregate_calls(arg, calls);
+                }
+            }
+            ScalarExpr::WindowFunction {
+                func: _,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for expr in partition_by {
+                    Self::collect_scalar_expr_aggregate_calls(expr, calls);
+                }
+                for item in order_by {
+                    if let OrderByExpr::Expr(expr) = &item.expr {
+                        Self::collect_scalar_expr_aggregate_calls(expr, calls);
+                    }
                 }
             }
             ScalarExpr::Literal(_) | ScalarExpr::Column(_) => {}
@@ -5284,6 +8926,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 alias: None,
                 name: label.clone(),
                 output_name: label,
+                ctas_declared_type: None,
                 collation: None,
                 hidden: false,
             });
@@ -5297,6 +8940,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 alias: None,
                 name: label.clone(),
                 output_name: label,
+                ctas_declared_type: None,
                 collation: None,
                 hidden: false,
             });
@@ -5312,29 +8956,45 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         )
     }
 
-    fn aggregate_output_columns(&self, columns: &[SelectItem]) -> Vec<ColumnMeta> {
-        columns
-            .iter()
-            .map(|item| ColumnMeta {
-                table: None,
-                alias: None,
-                name: self.output_name(item),
-                output_name: self.output_name(item),
-                collation: None,
-                hidden: false,
-            })
-            .collect()
+    fn aggregate_output_columns(
+        &self,
+        columns: &[SelectItem],
+        source_columns: &[ColumnMeta],
+    ) -> Vec<ColumnMeta> {
+        let mut output = Vec::new();
+        for item in columns {
+            match item {
+                SelectItem::Wildcard => output.extend(
+                    source_columns
+                        .iter()
+                        .filter(|column| !column.hidden)
+                        .cloned(),
+                ),
+                item => output.push(ColumnMeta {
+                    table: None,
+                    alias: None,
+                    name: self.output_name(item),
+                    output_name: self.output_name(item),
+                    ctas_declared_type: None,
+                    collation: None,
+                    hidden: false,
+                }),
+            }
+        }
+        output
     }
 
     fn aggregate_eval_columns(
         &self,
         output_columns: &[ColumnMeta],
+        source_columns: &[ColumnMeta],
         group_by: &[ScalarExpr],
         calls: &[AggregateCall],
-    ) -> (Vec<ColumnMeta>, Vec<usize>, Vec<usize>) {
+    ) -> (Vec<ColumnMeta>, Vec<usize>, Vec<usize>, Vec<usize>) {
         let mut columns = output_columns.to_vec();
         let mut hidden_group_indexes = Vec::new();
         let mut hidden_aggregate_indexes = Vec::new();
+        let mut hidden_source_indexes = Vec::new();
 
         for (index, expr) in group_by.iter().enumerate() {
             let label = self.scalar_expr_name(expr);
@@ -5349,6 +9009,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 alias: None,
                 name: label.clone(),
                 output_name: label,
+                ctas_declared_type: None,
                 collation: None,
                 hidden: true,
             });
@@ -5368,13 +9029,54 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 alias: None,
                 name: label.clone(),
                 output_name: label,
+                ctas_declared_type: None,
                 collation: None,
                 hidden: true,
             });
             hidden_aggregate_indexes.push(index);
         }
 
-        (columns, hidden_group_indexes, hidden_aggregate_indexes)
+        for (index, column) in source_columns.iter().enumerate() {
+            let table_qualified = column
+                .table
+                .as_deref()
+                .map(|table| format!("{table}.{}", column.name));
+            let alias_qualified = column
+                .alias
+                .as_deref()
+                .map(|alias| format!("{alias}.{}", column.name));
+            if columns.iter().any(|existing| {
+                existing.name == column.name
+                    || existing.output_name == column.output_name
+                    || existing.name == column.output_name
+                    || existing.output_name == column.name
+                    || table_qualified.as_ref().is_some_and(|qualified| {
+                        existing.name == *qualified || existing.output_name == *qualified
+                    })
+                    || alias_qualified.as_ref().is_some_and(|qualified| {
+                        existing.name == *qualified || existing.output_name == *qualified
+                    })
+                    || (column.table.is_some()
+                        && existing.table == column.table
+                        && existing.name == column.name)
+                    || (column.alias.is_some()
+                        && existing.alias == column.alias
+                        && existing.name == column.name)
+            }) {
+                continue;
+            }
+            let mut hidden = column.clone();
+            hidden.hidden = true;
+            columns.push(hidden);
+            hidden_source_indexes.push(index);
+        }
+
+        (
+            columns,
+            hidden_group_indexes,
+            hidden_aggregate_indexes,
+            hidden_source_indexes,
+        )
     }
 
     fn append_hidden_rowid(
@@ -5425,6 +9127,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 alias: table_alias.map(str::to_string),
                 name: alias_name.to_string(),
                 output_name: alias_name.to_string(),
+                ctas_declared_type: None,
                 collation: None,
                 hidden: true,
             });
@@ -5438,12 +9141,19 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         hidden_group_indexes: &[usize],
         aggregate_values: &[Value],
         hidden_aggregate_indexes: &[usize],
+        representative_row: &Row,
+        hidden_source_indexes: &[usize],
     ) -> Row {
         for index in hidden_group_indexes {
             visible_row.push(group_key[*index].clone());
         }
         for index in hidden_aggregate_indexes {
             visible_row.push(aggregate_values[*index].clone());
+        }
+        for index in hidden_source_indexes {
+            if let Some(value) = representative_row.get(*index) {
+                visible_row.push(value.clone());
+            }
         }
         visible_row
     }
@@ -5473,19 +9183,23 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         source: &RowSet,
         group_by: &[ScalarExpr],
         expr: &ScalarExpr,
-    ) -> Result<usize> {
+    ) -> Result<Option<usize>> {
         if let Some(index) = group_by.iter().position(|group_expr| group_expr == expr) {
-            return Ok(index);
+            return Ok(Some(index));
         }
 
         if let ScalarExpr::Column(name) = expr {
-            return self.group_key_index(source, group_by, name);
+            return self.group_key_index(source, group_by, name).map(Some);
         }
 
-        Err(DbError::plan(format!(
-            "non-aggregate expression {} must appear in GROUP BY",
-            self.scalar_expr_name(expr)
-        )))
+        if group_by
+            .iter()
+            .any(|group_expr| scalar_expr_contains_expr(group_expr, expr))
+        {
+            return Ok(None);
+        }
+
+        Ok(None)
     }
 
     fn sort_and_limit_rows(
@@ -5772,13 +9486,17 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     projected.push(self.lookup_value(&source.columns, row, name)?.clone());
                 }
                 SelectItem::Expr { expr, .. } => {
-                    projected.push(self.evaluate_scalar_expr_in_context(
-                        transaction_id,
-                        source,
-                        row,
-                        None,
-                        expr,
-                    )?);
+                    if matches!(expr, ScalarExpr::WindowFunction { .. }) {
+                        projected.push(Value::Null);
+                    } else {
+                        projected.push(self.evaluate_scalar_expr_in_context(
+                            transaction_id,
+                            source,
+                            row,
+                            None,
+                            expr,
+                        )?);
+                    }
                 }
                 SelectItem::Aggregate { .. } => {
                     return Err(DbError::plan(
@@ -5819,11 +9537,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 }
                 SelectItem::Expr { expr, alias } => {
                     let output_name = alias.clone().unwrap_or_else(|| self.scalar_expr_name(expr));
+                    let ctas_declared_type =
+                        self.ctas_declared_type_for_scalar_expr(source_columns, expr);
                     projected.push(ColumnMeta {
                         table: None,
                         alias: None,
                         name: output_name.clone(),
                         output_name,
+                        ctas_declared_type,
                         collation: None,
                         hidden: false,
                     });
@@ -5836,6 +9557,24 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
         }
         Ok(projected)
+    }
+
+    fn ctas_declared_type_for_scalar_expr(
+        &self,
+        source_columns: &[ColumnMeta],
+        expr: &ScalarExpr,
+    ) -> Option<String> {
+        match expr {
+            ScalarExpr::Column(name) => self
+                .resolve_column_index(source_columns, name)
+                .ok()
+                .and_then(|index| source_columns[index].ctas_declared_type.clone()),
+            ScalarExpr::Collate { expr, .. } => {
+                self.ctas_declared_type_for_scalar_expr(source_columns, expr)
+            }
+            ScalarExpr::Cast { ty, .. } => sqlite_ctas_declared_type_for_column_type(*ty),
+            _ => None,
+        }
     }
 
     fn resolve_order_value<'b>(
@@ -6059,10 +9798,20 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 escape,
                 negated,
             } => {
-                let Value::Text(value) = self.lookup_filter_value(rowset, row, outer, column)?
-                else {
+                let pattern = self.evaluate_filter_like_pattern(rowset, row, outer, pattern)?;
+                if matches!(pattern, LikeEscapeValue::Null) {
                     return Ok(false);
+                }
+                let escape = self.evaluate_filter_like_escape(rowset, row, outer, escape)?;
+                if matches!(escape, LikeEscapeValue::Null) {
+                    return Ok(false);
+                }
+                let value = match self.lookup_filter_value(rowset, row, outer, column)? {
+                    Value::Null => return Ok(false),
+                    value => Self::coerce_text_like_value(&value),
                 };
+                let pattern = pattern.as_option_string().unwrap_or_default();
+                let escape = escape.as_option_string();
                 Ok(Self::matches_like_pattern(
                     &value,
                     pattern,
@@ -6076,11 +9825,20 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 escape,
                 negated,
             } => {
-                let Value::Text(value) =
-                    self.evaluate_filter_scalar_expr(rowset, row, outer, expr)?
-                else {
+                let pattern = self.evaluate_filter_like_pattern(rowset, row, outer, pattern)?;
+                if matches!(pattern, LikeEscapeValue::Null) {
                     return Ok(false);
+                }
+                let escape = self.evaluate_filter_like_escape(rowset, row, outer, escape)?;
+                if matches!(escape, LikeEscapeValue::Null) {
+                    return Ok(false);
+                }
+                let value = match self.evaluate_filter_scalar_expr(rowset, row, outer, expr)? {
+                    Value::Null => return Ok(false),
+                    value => Self::coerce_text_like_value(&value),
                 };
+                let pattern = pattern.as_option_string().unwrap_or_default();
+                let escape = escape.as_option_string();
                 Ok(Self::matches_like_pattern(
                     &value,
                     pattern,
@@ -6093,10 +9851,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 pattern,
                 negated,
             } => {
-                let Value::Text(value) = self.lookup_filter_value(rowset, row, outer, column)?
-                else {
+                let pattern = self.evaluate_filter_glob_pattern(rowset, row, outer, pattern)?;
+                if matches!(pattern, LikeEscapeValue::Null) {
                     return Ok(false);
+                }
+                let value = match self.lookup_filter_value(rowset, row, outer, column)? {
+                    Value::Null => return Ok(false),
+                    value => Self::coerce_text_like_value(&value),
                 };
+                let pattern = pattern.as_option_string().unwrap_or_default();
                 Ok(Self::matches_glob_pattern(&value, pattern) ^ *negated)
             }
             Expr::GlobScalar {
@@ -6104,11 +9867,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 pattern,
                 negated,
             } => {
-                let Value::Text(value) =
-                    self.evaluate_filter_scalar_expr(rowset, row, outer, expr)?
-                else {
+                let pattern = self.evaluate_filter_glob_pattern(rowset, row, outer, pattern)?;
+                if matches!(pattern, LikeEscapeValue::Null) {
                     return Ok(false);
+                }
+                let value = match self.evaluate_filter_scalar_expr(rowset, row, outer, expr)? {
+                    Value::Null => return Ok(false),
+                    value => Self::coerce_text_like_value(&value),
                 };
+                let pattern = pattern.as_option_string().unwrap_or_default();
                 Ok(Self::matches_glob_pattern(&value, pattern) ^ *negated)
             }
             Expr::Between {
@@ -6266,9 +10033,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 index += 1;
             }
             let mut matched = false;
+            let mut saw_member = false;
 
             while index < pattern.len() {
-                if pattern[index] == ']' {
+                if pattern[index] == ']' && saw_member {
                     return Some((matched ^ negated, index + 1));
                 }
 
@@ -6281,11 +10049,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     if range_start <= ch && ch <= range_end {
                         matched = true;
                     }
+                    saw_member = true;
                     index += 3;
                 } else {
                     if pattern[index] == ch {
                         matched = true;
                     }
+                    saw_member = true;
                     index += 1;
                 }
             }
@@ -6319,9 +10089,114 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
         }
 
-        let value = value.chars().collect::<Vec<_>>();
+        let value = sqlite_text_prefix_before_nul(value)
+            .chars()
+            .collect::<Vec<_>>();
         let pattern = pattern.chars().collect::<Vec<_>>();
         matches(&value, &pattern)
+    }
+
+    fn sqlite_regexp_matches(pattern: &str, value: &str) -> Result<bool> {
+        let pattern = pattern.chars().collect::<Vec<_>>();
+        let value = sqlite_text_prefix_before_nul(value)
+            .chars()
+            .collect::<Vec<_>>();
+        if matches!(pattern.first(), Some('^')) {
+            return Self::regexp_match_here(&pattern, 1, &value, 0);
+        }
+        for index in 0..=value.len() {
+            if Self::regexp_match_here(&pattern, 0, &value, index)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn regexp_match_here(
+        pattern: &[char],
+        p_index: usize,
+        value: &[char],
+        v_index: usize,
+    ) -> Result<bool> {
+        if p_index == pattern.len() {
+            return Ok(true);
+        }
+        if pattern[p_index] == '$' && p_index + 1 == pattern.len() {
+            return Ok(v_index == value.len());
+        }
+        let (_, next_index) = Self::regexp_atom_matches(pattern, p_index, '\0')?;
+        if next_index < pattern.len() && pattern[next_index] == '*' {
+            return Self::regexp_match_star(pattern, p_index, next_index + 1, value, v_index);
+        }
+        if v_index >= value.len() {
+            return Ok(false);
+        }
+        let (matches, next_index) = Self::regexp_atom_matches(pattern, p_index, value[v_index])?;
+        Ok(matches && Self::regexp_match_here(pattern, next_index, value, v_index + 1)?)
+    }
+
+    fn regexp_match_star(
+        pattern: &[char],
+        atom_index: usize,
+        rest_index: usize,
+        value: &[char],
+        mut v_index: usize,
+    ) -> Result<bool> {
+        if Self::regexp_match_here(pattern, rest_index, value, v_index)? {
+            return Ok(true);
+        }
+        while v_index < value.len() {
+            let (matches, _) = Self::regexp_atom_matches(pattern, atom_index, value[v_index])?;
+            if !matches {
+                break;
+            }
+            v_index += 1;
+            if Self::regexp_match_here(pattern, rest_index, value, v_index)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn regexp_atom_matches(pattern: &[char], index: usize, value: char) -> Result<(bool, usize)> {
+        if pattern[index] == '.' {
+            return Ok((true, index + 1));
+        }
+        if pattern[index] != '[' {
+            return Ok((pattern[index] == value, index + 1));
+        }
+
+        let mut cursor = index + 1;
+        let negated = matches!(pattern.get(cursor), Some('^'));
+        if negated {
+            cursor += 1;
+        }
+        let mut matched = false;
+        let mut saw_member = false;
+        while cursor < pattern.len() {
+            if pattern[cursor] == ']' && saw_member {
+                return Ok((matched ^ negated, cursor + 1));
+            }
+            if cursor + 2 < pattern.len()
+                && pattern[cursor + 1] == '-'
+                && pattern[cursor + 2] != ']'
+            {
+                let start = pattern[cursor];
+                let end = pattern[cursor + 2];
+                if start <= value && value <= end {
+                    matched = true;
+                }
+                cursor += 3;
+                saw_member = true;
+                continue;
+            }
+            if pattern[cursor] == value {
+                matched = true;
+            }
+            cursor += 1;
+            saw_member = true;
+        }
+        Err(DbError::plan("unclosed '['"))
     }
 
     fn lookup_value<'b>(
@@ -6503,6 +10378,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         Ok(match expr {
             ScalarExpr::Literal(value) => value.clone(),
             ScalarExpr::Column(name) => self.lookup_value(&source.columns, row, name)?.clone(),
+            ScalarExpr::UnaryPlus(expr) => self.evaluate_scalar_expr(source, row, expr)?,
             ScalarExpr::BitNot(expr) => match self.evaluate_scalar_expr(source, row, expr)? {
                 Value::Null => Value::Null,
                 value => Value::Integer(!Self::sqlite_bitwise_integer_arg(&value)?),
@@ -6592,29 +10468,47 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 pattern,
                 escape,
                 negated,
-            } => match self.evaluate_scalar_expr(source, row, expr)? {
-                Value::Text(value) => Value::Boolean(
-                    Self::matches_like_pattern(
-                        &value,
-                        pattern,
-                        escape,
-                        self.storage.case_sensitive_like(),
-                    )? ^ *negated,
-                ),
-                Value::Null => Value::Null,
-                _ => Value::Null,
-            },
+            } => {
+                let pattern = self.evaluate_like_pattern(source, row, pattern)?;
+                if matches!(pattern, LikeEscapeValue::Null) {
+                    return Ok(Value::Null);
+                }
+                let escape = self.evaluate_like_escape(source, row, escape)?;
+                if matches!(escape, LikeEscapeValue::Null) {
+                    return Ok(Value::Null);
+                }
+                let pattern = pattern.as_option_string().unwrap_or_default();
+                let escape = escape.as_option_string();
+                match self.evaluate_scalar_expr(source, row, expr)? {
+                    Value::Null => Value::Null,
+                    value => Value::Boolean(
+                        Self::matches_like_pattern(
+                            &Self::coerce_text_like_value(&value),
+                            pattern,
+                            escape,
+                            self.storage.case_sensitive_like(),
+                        )? ^ *negated,
+                    ),
+                }
+            }
             ScalarExpr::Glob {
                 expr,
                 pattern,
                 negated,
-            } => match self.evaluate_scalar_expr(source, row, expr)? {
-                Value::Text(value) => {
-                    Value::Boolean(Self::matches_glob_pattern(&value, pattern) ^ *negated)
+            } => {
+                let pattern = self.evaluate_glob_pattern(source, row, pattern)?;
+                if matches!(pattern, LikeEscapeValue::Null) {
+                    return Ok(Value::Null);
                 }
-                Value::Null => Value::Null,
-                _ => Value::Null,
-            },
+                let pattern = pattern.as_option_string().unwrap_or_default();
+                match self.evaluate_scalar_expr(source, row, expr)? {
+                    Value::Null => Value::Null,
+                    value => Value::Boolean(
+                        Self::matches_glob_pattern(&Self::coerce_text_like_value(&value), pattern)
+                            ^ *negated,
+                    ),
+                }
+            }
             ScalarExpr::Between {
                 expr,
                 low,
@@ -6693,6 +10587,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
             ScalarExpr::Tuple(_) => {
                 return Err(DbError::plan("row value misused"));
+            }
+            ScalarExpr::WindowFunction { .. } => {
+                return Err(DbError::plan("window function requires projection context"));
             }
             ScalarExpr::Aggregate { func, arg, filter } => {
                 let call = AggregateCall {
@@ -6778,14 +10675,23 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             ScalarExpr::Tuple(values) | ScalarExpr::Function { args: values, .. } => {
                 values.iter().any(Self::scalar_expr_contains_subquery)
             }
-            ScalarExpr::UnaryMinus(expr)
+            ScalarExpr::UnaryPlus(expr)
+            | ScalarExpr::UnaryMinus(expr)
             | ScalarExpr::BitNot(expr)
             | ScalarExpr::Not(expr)
             | ScalarExpr::Cast { expr, .. }
             | ScalarExpr::Collate { expr, .. }
-            | ScalarExpr::IsBool { expr, .. }
-            | ScalarExpr::Like { expr, .. }
-            | ScalarExpr::Glob { expr, .. } => Self::scalar_expr_contains_subquery(expr),
+            | ScalarExpr::IsBool { expr, .. } => Self::scalar_expr_contains_subquery(expr),
+            ScalarExpr::Glob { expr, pattern, .. } => {
+                Self::scalar_expr_contains_subquery(expr)
+                    || Self::scalar_expr_contains_subquery(pattern)
+            }
+            ScalarExpr::Like { expr, escape, .. } => {
+                Self::scalar_expr_contains_subquery(expr)
+                    || escape
+                        .as_deref()
+                        .is_some_and(Self::scalar_expr_contains_subquery)
+            }
             ScalarExpr::Is { left, right, .. }
             | ScalarExpr::Compare { left, right, .. }
             | ScalarExpr::Binary { left, right, .. } => {
@@ -6823,6 +10729,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     || filter
                         .as_deref()
                         .is_some_and(Self::filter_expr_contains_subquery)
+            }
+            ScalarExpr::WindowFunction {
+                func: _,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                partition_by.iter().any(Self::scalar_expr_contains_subquery)
+                    || order_by.iter().any(Self::order_by_contains_subquery)
             }
             ScalarExpr::Literal(_) | ScalarExpr::Column(_) => false,
         }
@@ -6886,10 +10801,19 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 Self::scalar_expr_contains_subquery(left)
                     || Self::scalar_expr_contains_subquery(right)
             }
-            Expr::IsNullScalar { expr, .. }
-            | Expr::IsBool { expr, .. }
-            | Expr::LikeScalar { expr, .. }
-            | Expr::GlobScalar { expr, .. } => Self::scalar_expr_contains_subquery(expr),
+            Expr::IsNullScalar { expr, .. } | Expr::IsBool { expr, .. } => {
+                Self::scalar_expr_contains_subquery(expr)
+            }
+            Expr::GlobScalar { expr, pattern, .. } => {
+                Self::scalar_expr_contains_subquery(expr)
+                    || Self::scalar_expr_contains_subquery(pattern)
+            }
+            Expr::LikeScalar { expr, escape, .. } => {
+                Self::scalar_expr_contains_subquery(expr)
+                    || escape
+                        .as_deref()
+                        .is_some_and(Self::scalar_expr_contains_subquery)
+            }
             Expr::InListScalar { expr, values, .. } => {
                 Self::scalar_expr_contains_subquery(expr)
                     || values.iter().any(Self::scalar_expr_contains_subquery)
@@ -6910,9 +10834,11 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             | Expr::CompareColumns { .. }
             | Expr::IsNull { .. }
             | Expr::InList { .. }
-            | Expr::Like { .. }
-            | Expr::Glob { .. }
             | Expr::Between { .. } => false,
+            Expr::Glob { pattern, .. } => Self::scalar_expr_contains_subquery(pattern),
+            Expr::Like { escape, .. } => escape
+                .as_deref()
+                .is_some_and(Self::scalar_expr_contains_subquery),
         }
     }
 
@@ -6928,6 +10854,89 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             .collect()
     }
 
+    fn evaluate_like_escape(
+        &self,
+        source: &RowSet,
+        row: &Row,
+        escape: &Option<Box<ScalarExpr>>,
+    ) -> Result<LikeEscapeValue> {
+        let Some(escape) = escape else {
+            return Ok(LikeEscapeValue::Missing);
+        };
+        match self.evaluate_scalar_expr(source, row, escape)? {
+            Value::Null => Ok(LikeEscapeValue::Null),
+            value => {
+                let text = Self::coerce_text_like_value(&value);
+                let _ = Self::like_escape_char(Some(text.as_str()))?;
+                Ok(LikeEscapeValue::Text(text))
+            }
+        }
+    }
+
+    fn evaluate_like_pattern(
+        &self,
+        source: &RowSet,
+        row: &Row,
+        pattern: &ScalarExpr,
+    ) -> Result<LikeEscapeValue> {
+        match self.evaluate_scalar_expr(source, row, pattern)? {
+            Value::Null => Ok(LikeEscapeValue::Null),
+            value => Ok(LikeEscapeValue::Text(Self::coerce_text_like_value(&value))),
+        }
+    }
+
+    fn evaluate_filter_like_escape(
+        &self,
+        source: &RowSet,
+        row: &Row,
+        outer: Option<(&RowSet, &Row)>,
+        escape: &Option<Box<ScalarExpr>>,
+    ) -> Result<LikeEscapeValue> {
+        let Some(escape) = escape else {
+            return Ok(LikeEscapeValue::Missing);
+        };
+        match self.evaluate_filter_scalar_expr(source, row, outer, escape)? {
+            Value::Null => Ok(LikeEscapeValue::Null),
+            value => {
+                let text = Self::coerce_text_like_value(&value);
+                let _ = Self::like_escape_char(Some(text.as_str()))?;
+                Ok(LikeEscapeValue::Text(text))
+            }
+        }
+    }
+
+    fn evaluate_filter_like_pattern(
+        &self,
+        source: &RowSet,
+        row: &Row,
+        outer: Option<(&RowSet, &Row)>,
+        pattern: &ScalarExpr,
+    ) -> Result<LikeEscapeValue> {
+        match self.evaluate_filter_scalar_expr(source, row, outer, pattern)? {
+            Value::Null => Ok(LikeEscapeValue::Null),
+            value => Ok(LikeEscapeValue::Text(Self::coerce_text_like_value(&value))),
+        }
+    }
+
+    fn evaluate_glob_pattern(
+        &self,
+        source: &RowSet,
+        row: &Row,
+        pattern: &ScalarExpr,
+    ) -> Result<LikeEscapeValue> {
+        self.evaluate_like_pattern(source, row, pattern)
+    }
+
+    fn evaluate_filter_glob_pattern(
+        &self,
+        source: &RowSet,
+        row: &Row,
+        outer: Option<(&RowSet, &Row)>,
+        pattern: &ScalarExpr,
+    ) -> Result<LikeEscapeValue> {
+        self.evaluate_filter_like_pattern(source, row, outer, pattern)
+    }
+
     fn evaluate_filter_scalar_expr(
         &self,
         source: &RowSet,
@@ -6938,6 +10947,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         Ok(match expr {
             ScalarExpr::Literal(value) => value.clone(),
             ScalarExpr::Column(name) => self.lookup_filter_value(source, row, outer, name)?,
+            ScalarExpr::UnaryPlus(expr) => {
+                self.evaluate_filter_scalar_expr(source, row, outer, expr)?
+            }
             ScalarExpr::BitNot(expr) => {
                 match self.evaluate_filter_scalar_expr(source, row, outer, expr)? {
                     Value::Null => Value::Null,
@@ -7063,29 +11075,47 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 pattern,
                 escape,
                 negated,
-            } => match self.evaluate_filter_scalar_expr(source, row, outer, expr)? {
-                Value::Text(value) => Value::Boolean(
-                    Self::matches_like_pattern(
-                        &value,
-                        pattern,
-                        escape,
-                        self.storage.case_sensitive_like(),
-                    )? ^ *negated,
-                ),
-                Value::Null => Value::Null,
-                _ => Value::Null,
-            },
+            } => {
+                let pattern = self.evaluate_filter_like_pattern(source, row, outer, pattern)?;
+                if matches!(pattern, LikeEscapeValue::Null) {
+                    return Ok(Value::Null);
+                }
+                let escape = self.evaluate_filter_like_escape(source, row, outer, escape)?;
+                if matches!(escape, LikeEscapeValue::Null) {
+                    return Ok(Value::Null);
+                }
+                let pattern = pattern.as_option_string().unwrap_or_default();
+                let escape = escape.as_option_string();
+                match self.evaluate_filter_scalar_expr(source, row, outer, expr)? {
+                    Value::Null => Value::Null,
+                    value => Value::Boolean(
+                        Self::matches_like_pattern(
+                            &Self::coerce_text_like_value(&value),
+                            pattern,
+                            escape,
+                            self.storage.case_sensitive_like(),
+                        )? ^ *negated,
+                    ),
+                }
+            }
             ScalarExpr::Glob {
                 expr,
                 pattern,
                 negated,
-            } => match self.evaluate_filter_scalar_expr(source, row, outer, expr)? {
-                Value::Text(value) => {
-                    Value::Boolean(Self::matches_glob_pattern(&value, pattern) ^ *negated)
+            } => {
+                let pattern = self.evaluate_filter_glob_pattern(source, row, outer, pattern)?;
+                if matches!(pattern, LikeEscapeValue::Null) {
+                    return Ok(Value::Null);
                 }
-                Value::Null => Value::Null,
-                _ => Value::Null,
-            },
+                let pattern = pattern.as_option_string().unwrap_or_default();
+                match self.evaluate_filter_scalar_expr(source, row, outer, expr)? {
+                    Value::Null => Value::Null,
+                    value => Value::Boolean(
+                        Self::matches_glob_pattern(&Self::coerce_text_like_value(&value), pattern)
+                            ^ *negated,
+                    ),
+                }
+            }
             ScalarExpr::Between {
                 expr,
                 low,
@@ -7172,6 +11202,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
             ScalarExpr::Tuple(_) => {
                 return Err(DbError::plan("row value misused"));
+            }
+            ScalarExpr::WindowFunction { .. } => {
+                return Err(DbError::plan("window function requires projection context"));
             }
             ScalarExpr::Aggregate { func, arg, filter } => {
                 let call = AggregateCall {
@@ -7420,10 +11453,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 Self::expect_arity("LENGTH", &args, 1)?;
                 match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    Value::Text(value) => Ok(Value::Integer(value.chars().count() as i64)),
+                    Value::Text(value) => Ok(Value::Integer(
+                        sqlite_text_prefix_before_nul(value).chars().count() as i64,
+                    )),
                     Value::Blob(value) => Ok(Value::Integer(value.len() as i64)),
                     value => Ok(Value::Integer(
-                        Self::coerce_text_like_value(value).chars().count() as i64,
+                        sqlite_text_prefix_before_nul(&Self::coerce_text_like_value(value))
+                            .chars()
+                            .count() as i64,
                     )),
                 }
             }
@@ -7494,9 +11531,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     value => Self::coerce_text_like_value(value),
                 };
 
-                Ok(Value::Text(Self::sqlite_printf(&format, &args[1..])?))
+                Ok(Self::sqlite_printf(&format, &args[1..])?
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null))
             }
             ScalarFunc::Concat => {
+                if args.is_empty() {
+                    return Err(DbError::plan("CONCAT expects at least 1 argument"));
+                }
                 let mut result = String::new();
                 for arg in args {
                     match arg {
@@ -7507,8 +11549,8 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 Ok(Value::Text(result))
             }
             ScalarFunc::ConcatWs => {
-                if args.is_empty() {
-                    return Err(DbError::plan("CONCAT_WS expects at least 1 argument"));
+                if args.len() < 2 {
+                    return Err(DbError::plan("CONCAT_WS expects at least 2 arguments"));
                 }
 
                 let separator = match &args[0] {
@@ -7540,6 +11582,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         0
                     })),
                     Value::Text(value) => {
+                        let value = value.trim();
                         if let Ok(value) = value.parse::<i64>() {
                             Ok(Value::Integer(value.signum()))
                         } else if let Ok(value) = value.parse::<f64>() {
@@ -7585,7 +11628,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
 
                 let mut filtered = String::with_capacity(value.len());
                 for ch in value.chars() {
-                    if ignore.as_ref().is_some_and(|ignore| ignore.contains(ch)) {
+                    if ignore
+                        .as_ref()
+                        .is_some_and(|ignore| ignore.contains(ch) && !ch.is_ascii_hexdigit())
+                    {
                         continue;
                     }
                     filtered.push(ch);
@@ -7625,7 +11671,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     args[0].clone(),
                     crate::common::types::ColumnType::Integer,
                 )? {
-                    Value::Null => return Ok(Value::Null),
+                    Value::Null => 1,
                     Value::Integer(value) => value,
                     _ => unreachable!("integer cast must yield INTEGER or NULL"),
                 };
@@ -7668,6 +11714,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     .ok()
                     .and_then(|index| SQLITE_COMPILE_OPTIONS.get(index));
                 Ok(option.map_or(Value::Null, |option| Value::from(*option)))
+            }
+            ScalarFunc::SqliteLog => {
+                Self::expect_arity("SQLITE_LOG", &args, 2)?;
+                Ok(Value::Null)
             }
             ScalarFunc::Likely => {
                 Self::expect_arity("LIKELY", &args, 1)?;
@@ -7874,19 +11924,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 for arg in args {
                     let code_point =
                         match Self::cast_value(arg, crate::common::types::ColumnType::Integer)? {
-                            Value::Null => 0,
+                            Value::Null => continue,
                             Value::Integer(value) => value,
                             _ => unreachable!("integer cast must yield INTEGER or NULL"),
                         };
 
-                    let normalized = if code_point < 0 {
-                        0
-                    } else {
-                        u32::try_from(code_point)
-                            .map_err(|_| DbError::plan("CHAR code point out of range"))?
-                    };
-                    let ch = char::from_u32(normalized)
-                        .ok_or_else(|| DbError::plan("CHAR received invalid code point"))?;
+                    let ch = u32::try_from(code_point)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or(char::REPLACEMENT_CHARACTER);
                     result.push(ch);
                 }
                 Ok(Value::Text(result))
@@ -7897,13 +11943,11 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     args[0].clone(),
                     crate::common::types::ColumnType::Integer,
                 )? {
-                    Value::Null => return Ok(Value::Null),
+                    Value::Null => 0,
                     Value::Integer(value) => value,
                     _ => unreachable!("integer cast must yield INTEGER or NULL"),
                 };
-                if length < 0 {
-                    return Err(DbError::plan("ZEROBLOB length must be non-negative"));
-                }
+                let length = length.max(0);
                 let length = usize::try_from(length)
                     .map_err(|_| DbError::plan("ZEROBLOB length is too large"))?;
                 Ok(Value::Blob(vec![0; length]))
@@ -7926,7 +11970,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             ScalarFunc::Hex => {
                 Self::expect_arity("HEX", &args, 1)?;
                 match &args[0] {
-                    Value::Null => Ok(Value::Null),
+                    Value::Null => Ok(Value::Text(String::new())),
                     Value::Blob(value) => Ok(Value::Text(
                         value
                             .iter()
@@ -8002,7 +12046,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 match value {
                     Value::Blob(value) => Ok(Value::Blob(sqlite_substr_blob(value, start, length))),
                     value => Ok(Value::Text(sqlite_substr_text(
-                        &Self::coerce_text_like_value(value),
+                        sqlite_text_prefix_before_nul(&Self::coerce_text_like_value(value)),
                         start,
                         length,
                     ))),
@@ -8010,33 +12054,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
             ScalarFunc::Instr => {
                 Self::expect_arity("INSTR", &args, 2)?;
-
-                let haystack = match &args[0] {
-                    Value::Null => return Ok(Value::Null),
-                    value => Self::coerce_text_like_value(value),
-                };
-
-                let needle = match &args[1] {
-                    Value::Null => return Ok(Value::Null),
-                    value => Self::coerce_text_like_value(value),
-                };
-
-                if needle.is_empty() {
-                    return Ok(Value::Integer(1));
-                }
-
-                let position = haystack
-                    .find(&needle)
-                    .map(|byte_index| haystack[..byte_index].chars().count() as i64 + 1)
-                    .unwrap_or(0);
-                Ok(Value::Integer(position))
+                Self::sqlite_instr_value(&args[0], &args[1])
             }
             ScalarFunc::Replace => {
                 Self::expect_arity("REPLACE", &args, 3)?;
 
                 let value = match &args[0] {
                     Value::Null => return Ok(Value::Null),
-                    value => Self::coerce_text_like_value(value),
+                    value => sqlite_text_prefix_before_nul(&Self::coerce_text_like_value(value))
+                        .to_string(),
                 };
 
                 let pattern = match &args[1] {
@@ -8062,6 +12088,18 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         args.len()
                     )));
                 }
+                let escape = if let Some(escape) = args.get(2) {
+                    match escape {
+                        Value::Null => return Ok(Value::Null),
+                        value => {
+                            let text = Self::coerce_text_like_value(value);
+                            let _ = Self::like_escape_char(Some(text.as_str()))?;
+                            Some(text)
+                        }
+                    }
+                } else {
+                    None
+                };
                 let pattern = match &args[0] {
                     Value::Null => return Ok(Value::Null),
                     value => Self::coerce_text_like_value(value),
@@ -8070,18 +12108,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     Value::Null => return Ok(Value::Null),
                     value => Self::coerce_text_like_value(value),
                 };
-                let escape = if let Some(escape) = args.get(2) {
-                    match escape {
-                        Value::Null => return Ok(Value::Null),
-                        value => Some(Self::coerce_text_like_value(value)),
-                    }
-                } else {
-                    None
-                };
                 Ok(Value::Boolean(Self::matches_like_pattern(
                     &value,
                     &pattern,
-                    &escape,
+                    escape.as_deref(),
                     self.storage.case_sensitive_like(),
                 )?))
             }
@@ -8097,6 +12127,26 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 };
                 Ok(Value::Boolean(Self::matches_glob_pattern(&value, &pattern)))
             }
+            ScalarFunc::RegexpFunc => {
+                Self::expect_arity("REGEXP", &args, 2)?;
+                let pattern = match &args[0] {
+                    Value::Null => return Ok(Value::Null),
+                    value => Self::coerce_text_like_value(value),
+                };
+                let value = match &args[1] {
+                    Value::Null => return Ok(Value::Null),
+                    value => Self::coerce_text_like_value(value),
+                };
+                Ok(Value::Boolean(Self::sqlite_regexp_matches(
+                    &pattern, &value,
+                )?))
+            }
+            ScalarFunc::MatchFunc => {
+                Self::expect_arity("MATCH", &args, 2)?;
+                Err(DbError::plan(
+                    "unable to use function MATCH in the requested context",
+                ))
+            }
             ScalarFunc::Quote => {
                 Self::expect_arity("QUOTE", &args, 1)?;
                 let quoted = match &args[0] {
@@ -8109,7 +12159,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         }
                     }
                     Value::Integer(value) => value.to_string(),
-                    Value::Real(value) => Self::sqlite_real_to_text(*value),
+                    Value::Real(value) => sqlite_real_to_text_for_quote(*value),
                     Value::Blob(value) => format!(
                         "X'{}'",
                         value
@@ -8117,7 +12167,12 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                             .map(|byte| format!("{byte:02X}"))
                             .collect::<String>()
                     ),
-                    Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
+                    Value::Text(value) => {
+                        format!(
+                            "'{}'",
+                            sqlite_text_prefix_before_nul(value).replace('\'', "''")
+                        )
+                    }
                 };
                 Ok(Value::Text(quoted))
             }
@@ -8125,11 +12180,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 Self::expect_arity("UNICODE", &args, 1)?;
                 match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    value => Ok(Self::coerce_text_like_value(value)
-                        .chars()
-                        .next()
-                        .map(|ch| Value::Integer(i64::from(u32::from(ch))))
-                        .unwrap_or(Value::Null)),
+                    value => Ok(sqlite_text_prefix_before_nul(&Self::coerce_text_like_value(
+                        value,
+                    ))
+                    .chars()
+                    .next()
+                    .map(|ch| Value::Integer(i64::from(u32::from(ch))))
+                    .unwrap_or(Value::Null)),
                 }
             }
             ScalarFunc::Trim => {
@@ -8213,8 +12270,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 } else {
                     0
                 };
-                let factor = 10_f64.powi(precision);
-                Ok(Value::Real((value * factor).round() / factor))
+                Ok(Value::Real(sqlite_round_f64(value, precision)))
             }
             ScalarFunc::LastInsertRowId => {
                 Self::expect_arity("LAST_INSERT_ROWID", &args, 0)?;
@@ -8224,6 +12280,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 Self::expect_arity("JSON", &args, 1)?;
                 Self::json_normalize_value(&args[0])
             }
+            ScalarFunc::Jsonb => {
+                Self::expect_arity("JSONB", &args, 1)?;
+                Self::jsonb_value(&args[0])
+            }
             ScalarFunc::JsonValid => {
                 if !matches!(args.len(), 1 | 2) {
                     return Err(DbError::plan(format!(
@@ -8231,19 +12291,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         args.len()
                     )));
                 }
-                let json = match &args[0] {
-                    Value::Null => return Ok(Value::Null),
-                    value => Self::coerce_text_like_value(value),
-                };
+                if matches!(args[0], Value::Null) {
+                    return Ok(Value::Null);
+                }
                 let valid = if let Some(flags) = args.get(1) {
                     let flags = Self::json_valid_flags(flags)?;
-                    if flags & 0x02 != 0 {
-                        parse_sqlite_json_value(&json).is_ok()
-                    } else {
-                        serde_json::from_str::<serde_json::Value>(&json).is_ok()
-                    }
+                    Self::json_value_valid(&args[0], flags)?
                 } else {
-                    serde_json::from_str::<serde_json::Value>(&json).is_ok()
+                    Self::json_value_valid(&args[0], 0x01)?
                 };
                 Ok(Value::Integer(i64::from(valid)))
             }
@@ -8263,16 +12318,31 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         args.len()
                     )));
                 }
-                let json = match &args[0] {
+                let parsed = match &args[0] {
                     Value::Null => return Ok(Value::Null),
-                    value => Self::coerce_text_like_value(value),
+                    value => Self::parse_json_input_value(value)?,
                 };
-                let path = match &args[1] {
-                    Value::Null => return Ok(Value::Null),
-                    value => Self::coerce_text_like_value(value),
-                };
-                Self::json_extract_value(&json, &path)
+                if args.len() == 2 {
+                    let path = match &args[1] {
+                        Value::Null => return Ok(Value::Null),
+                        value => Self::coerce_text_like_value(value),
+                    };
+                    Self::json_extract_value(&parsed, &path)
+                } else {
+                    let paths = args[1..]
+                        .iter()
+                        .map(|value| match value {
+                            Value::Null => None,
+                            value => Some(Self::coerce_text_like_value(value)),
+                        })
+                        .collect::<Vec<_>>();
+                    if paths.iter().any(Option::is_none) {
+                        return Ok(Value::Null);
+                    }
+                    Self::json_extract_multi_value(&parsed, &paths)
+                }
             }
+            ScalarFunc::JsonbExtract => Self::jsonb_extract_value(&args),
             ScalarFunc::JsonType => {
                 if !matches!(args.len(), 1 | 2) {
                     return Err(DbError::plan(format!(
@@ -8280,12 +12350,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         args.len()
                     )));
                 }
-                let json = match &args[0] {
+                let parsed = match &args[0] {
                     Value::Null => return Ok(Value::Null),
-                    value => Self::coerce_text_like_value(value),
+                    value => Self::parse_json_input_value(value)?,
                 };
-                let parsed = parse_sqlite_json_value(&json)
-                    .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
                 let value = if let Some(path) = args.get(1) {
                     let path = match path {
                         Value::Null => return Ok(Value::Null),
@@ -8309,17 +12377,34 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     .map(Value::Text)
                     .map_err(|error| DbError::plan(format!("failed to render JSON array: {error}")))
             }
+            ScalarFunc::JsonbArray => {
+                let values = args
+                    .iter()
+                    .map(Self::sql_value_to_json)
+                    .collect::<Result<Vec<_>>>()?;
+                crate::sql::jsonb::encode(&serde_json::Value::Array(values)).map(Value::Blob)
+            }
             ScalarFunc::JsonObject => Self::json_object_value(&args),
+            ScalarFunc::JsonbObject => Self::jsonb_object_value(&args),
             ScalarFunc::JsonArrayLength => Self::json_array_length_value(&args),
             ScalarFunc::JsonRemove => Self::json_remove_value(&args),
+            ScalarFunc::JsonbRemove => Self::jsonb_remove_value(&args),
             ScalarFunc::JsonSet => Self::json_set_value(&args),
+            ScalarFunc::JsonbSet => Self::jsonb_write_value("jsonb_set", &args, JsonWriteMode::Set),
             ScalarFunc::JsonInsert => {
                 Self::json_write_value("json_insert", &args, JsonWriteMode::Insert)
+            }
+            ScalarFunc::JsonbInsert => {
+                Self::jsonb_write_value("jsonb_insert", &args, JsonWriteMode::Insert)
             }
             ScalarFunc::JsonReplace => {
                 Self::json_write_value("json_replace", &args, JsonWriteMode::Replace)
             }
+            ScalarFunc::JsonbReplace => {
+                Self::jsonb_write_value("jsonb_replace", &args, JsonWriteMode::Replace)
+            }
             ScalarFunc::JsonPatch => Self::json_patch_value(&args),
+            ScalarFunc::JsonbPatch => Self::jsonb_patch_value(&args),
             ScalarFunc::Coalesce => {
                 if args.len() < 2 {
                     return Err(DbError::plan("COALESCE expects at least 2 arguments"));
@@ -8348,6 +12433,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     Ok(args[0].clone())
                 }
             }
+            ScalarFunc::Unknown => Ok(Value::Null),
         }
     }
 
@@ -8359,8 +12445,30 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             Value::Real(value) => Ok(Self::sqlite_real_to_text(*value)),
             Value::Text(value) => serde_json::to_string(value)
                 .map_err(|error| DbError::plan(format!("failed to quote JSON string: {error}"))),
-            Value::Blob(value) => serde_json::to_string(&String::from_utf8_lossy(value))
-                .map_err(|error| DbError::plan(format!("failed to quote JSON string: {error}"))),
+            Value::Blob(_) => Err(DbError::plan("JSON cannot hold BLOB values")),
+        }
+    }
+
+    fn sqlite_instr_value(haystack: &Value, needle: &Value) -> Result<Value> {
+        match (haystack, needle) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Blob(haystack), Value::Blob(needle)) => {
+                Ok(Value::Integer(sqlite_instr_blob(haystack, needle)))
+            }
+            (haystack, needle) => {
+                let haystack = Self::coerce_text_like_value(haystack);
+                let needle = Self::coerce_text_like_value(needle);
+
+                if needle.is_empty() {
+                    return Ok(Value::Integer(1));
+                }
+
+                let position = haystack
+                    .find(&needle)
+                    .map(|byte_index| haystack[..byte_index].chars().count() as i64 + 1)
+                    .unwrap_or(0);
+                Ok(Value::Integer(position))
+            }
         }
     }
 
@@ -8373,22 +12481,75 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null),
             Value::Text(value) => serde_json::Value::String(value.clone()),
-            Value::Blob(value) => {
-                serde_json::Value::String(String::from_utf8_lossy(value).into_owned())
-            }
+            Value::Blob(value) => match crate::sql::jsonb::decode(value) {
+                Ok(value) => value,
+                Err(_) => return Err(DbError::plan("JSON cannot hold BLOB values")),
+            },
         })
     }
 
     fn json_normalize_value(value: &Value) -> Result<Value> {
-        let json = match value {
+        if let Value::Blob(value) = value
+            && let Ok(rendered) = crate::sql::jsonb::to_json_text(value)
+        {
+            return Ok(Value::Text(rendered));
+        }
+        let parsed = match value {
             Value::Null => return Ok(Value::Null),
-            value => Self::coerce_text_like_value(value),
+            value => Self::parse_json_input_value(value)?,
         };
-        let parsed = parse_sqlite_json_value(&json)
-            .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
         serde_json::to_string(&parsed)
             .map(Value::Text)
             .map_err(|error| DbError::plan(format!("failed to render JSON value: {error}")))
+    }
+
+    fn jsonb_value(value: &Value) -> Result<Value> {
+        let parsed = match value {
+            Value::Null => return Ok(Value::Null),
+            value => Self::parse_json_input_value(value)?,
+        };
+        crate::sql::jsonb::encode(&parsed).map(Value::Blob)
+    }
+
+    fn parse_json_input_value(value: &Value) -> Result<serde_json::Value> {
+        match value {
+            Value::Blob(value) => match crate::sql::jsonb::decode(value) {
+                Ok(value) => Ok(value),
+                Err(_) => {
+                    let text = String::from_utf8_lossy(value);
+                    parse_sqlite_json_value(&text)
+                        .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))
+                }
+            },
+            value => {
+                let json = Self::coerce_text_like_value(value);
+                parse_sqlite_json_value(&json)
+                    .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))
+            }
+        }
+    }
+
+    fn json_value_valid(value: &Value, flags: i64) -> Result<bool> {
+        Ok(match value {
+            Value::Null => false,
+            Value::Blob(value) if flags & 0x0c != 0 => crate::sql::jsonb::decode(value).is_ok(),
+            Value::Blob(value) => {
+                let json = String::from_utf8_lossy(value);
+                if flags & 0x02 != 0 {
+                    parse_sqlite_json_value(&json).is_ok()
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&json).is_ok()
+                }
+            }
+            value => {
+                let json = Self::coerce_text_like_value(value);
+                if flags & 0x02 != 0 {
+                    parse_sqlite_json_value(&json).is_ok()
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&json).is_ok()
+                }
+            }
+        })
     }
 
     fn json_valid_flags(value: &Value) -> Result<i64> {
@@ -8408,13 +12569,16 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     }
 
     fn json_error_position_value(value: &Value) -> Result<Value> {
-        let json = match value {
-            Value::Null => return Ok(Value::Null),
-            value => Self::coerce_text_like_value(value),
-        };
-        match parse_sqlite_json_value(&json) {
-            Ok(_) => Ok(Value::Integer(0)),
-            Err(error) => Ok(Value::Integer(json_error_position(&json, &error))),
+        match value {
+            Value::Null => Ok(Value::Null),
+            Value::Blob(value) if crate::sql::jsonb::decode(value).is_ok() => Ok(Value::Integer(0)),
+            value => {
+                let json = Self::coerce_text_like_value(value);
+                match parse_sqlite_json_value(&json) {
+                    Ok(_) => Ok(Value::Integer(0)),
+                    Err(error) => Ok(Value::Integer(json_error_position(&json, &error))),
+                }
+            }
         }
     }
 
@@ -8425,20 +12589,18 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 args.len()
             )));
         }
-        let json = match &args[0] {
+        let parsed = match &args[0] {
             Value::Null => return Ok(Value::Null),
-            value => Self::coerce_text_like_value(value),
+            value => Self::parse_json_input_value(value)?,
         };
         let indent = if let Some(indent) = args.get(1) {
             match indent {
-                Value::Null => return Ok(Value::Null),
+                Value::Null => "    ".to_string(),
                 value => Self::coerce_text_like_value(value),
             }
         } else {
             "    ".to_string()
         };
-        let parsed = parse_sqlite_json_value(&json)
-            .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
         Ok(Value::Text(json_pretty_render(&parsed, &indent)))
     }
 
@@ -8466,6 +12628,24 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         Ok(Value::Text(format!("{{{}}}", fields.join(","))))
     }
 
+    fn jsonb_object_value(args: &[Value]) -> Result<Value> {
+        if args.len() % 2 != 0 {
+            return Err(DbError::plan(
+                "json_object() requires an even number of arguments",
+            ));
+        }
+
+        let mut object = serde_json::Map::new();
+        for pair in args.chunks_exact(2) {
+            let Value::Text(label) = &pair[0] else {
+                return Err(DbError::plan("json_object() labels must be TEXT"));
+            };
+            object.insert(label.clone(), Self::sql_value_to_json(&pair[1])?);
+        }
+
+        crate::sql::jsonb::encode(&serde_json::Value::Object(object)).map(Value::Blob)
+    }
+
     fn json_array_length_value(args: &[Value]) -> Result<Value> {
         if !matches!(args.len(), 1 | 2) {
             return Err(DbError::plan(format!(
@@ -8474,12 +12654,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             )));
         }
 
-        let json = match &args[0] {
+        let parsed = match &args[0] {
             Value::Null => return Ok(Value::Null),
-            value => Self::coerce_text_like_value(value),
+            value => Self::parse_json_input_value(value)?,
         };
-        let parsed = parse_sqlite_json_value(&json)
-            .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
         let value = if let Some(path) = args.get(1) {
             let path = match path {
                 Value::Null => return Ok(Value::Null),
@@ -8503,12 +12681,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         if args.is_empty() {
             return Err(DbError::plan("JSON_REMOVE expects at least 1 argument"));
         }
-        let json = match &args[0] {
+        let mut parsed = match &args[0] {
             Value::Null => return Ok(Value::Null),
-            value => Self::coerce_text_like_value(value),
+            value => Self::parse_json_input_value(value)?,
         };
-        let mut parsed = parse_sqlite_json_value(&json)
-            .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
         for path in &args[1..] {
             let path = match path {
                 Value::Null => return Ok(Value::Null),
@@ -8525,6 +12701,28 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             .map_err(|error| DbError::plan(format!("failed to render JSON value: {error}")))
     }
 
+    fn jsonb_remove_value(args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Err(DbError::plan("JSONB_REMOVE expects at least 1 argument"));
+        }
+        let mut parsed = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            value => Self::parse_json_input_value(value)?,
+        };
+        for path in &args[1..] {
+            let path = match path {
+                Value::Null => return Ok(Value::Null),
+                value => Self::coerce_text_like_value(value),
+            };
+            if path == "$" {
+                return Ok(Value::Null);
+            }
+            json_remove_path(&mut parsed, &path)
+                .map_err(|_| DbError::plan(format!("bad JSON path: '{path}'")))?;
+        }
+        crate::sql::jsonb::encode(&parsed).map(Value::Blob)
+    }
+
     fn json_set_value(args: &[Value]) -> Result<Value> {
         Self::json_write_value("json_set", args, JsonWriteMode::Set)
     }
@@ -8535,12 +12733,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 "{function_name}() needs an odd number of arguments"
             )));
         }
-        let json = match &args[0] {
+        let mut parsed = match &args[0] {
             Value::Null => return Ok(Value::Null),
-            value => Self::coerce_text_like_value(value),
+            value => Self::parse_json_input_value(value)?,
         };
-        let mut parsed = parse_sqlite_json_value(&json)
-            .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
         for pair in args[1..].chunks_exact(2) {
             let path = match &pair[0] {
                 Value::Null => continue,
@@ -8562,33 +12758,150 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             .map_err(|error| DbError::plan(format!("failed to render JSON value: {error}")))
     }
 
+    fn jsonb_write_value(
+        function_name: &str,
+        args: &[Value],
+        mode: JsonWriteMode,
+    ) -> Result<Value> {
+        if args.len() % 2 == 0 {
+            return Err(DbError::plan(format!(
+                "{function_name}() needs an odd number of arguments"
+            )));
+        }
+        let mut parsed = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            value => Self::parse_json_input_value(value)?,
+        };
+        let mut raw_object_keys = HashSet::new();
+        for pair in args[1..].chunks_exact(2) {
+            let path = match &pair[0] {
+                Value::Null => continue,
+                value => Self::coerce_text_like_value(value),
+            };
+            let replacement = Self::sql_value_to_json(&pair[1])?;
+            if path == "$" {
+                match mode {
+                    JsonWriteMode::Set | JsonWriteMode::Replace => parsed = replacement,
+                    JsonWriteMode::Insert => {}
+                }
+                continue;
+            }
+            json_write_path_with_created_keys(
+                &mut parsed,
+                &path,
+                replacement,
+                mode,
+                Some(&mut raw_object_keys),
+            )
+            .map_err(|_| DbError::plan(format!("bad JSON path: '{path}'")))?;
+        }
+        crate::sql::jsonb::encode_with_raw_object_keys(&parsed, &raw_object_keys).map(Value::Blob)
+    }
+
     fn json_patch_value(args: &[Value]) -> Result<Value> {
         Self::expect_arity("JSON_PATCH", args, 2)?;
-        let target = match &args[0] {
+        let mut target = match &args[0] {
             Value::Null => return Ok(Value::Null),
-            value => Self::coerce_text_like_value(value),
+            value => Self::parse_json_input_value(value)?,
         };
         let patch = match &args[1] {
             Value::Null => return Ok(Value::Null),
-            value => Self::coerce_text_like_value(value),
+            value => Self::parse_json_input_value(value)?,
         };
-        let mut target = parse_sqlite_json_value(&target)
-            .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
-        let patch = parse_sqlite_json_value(&patch)
-            .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
         json_merge_patch(&mut target, patch);
         serde_json::to_string(&target)
             .map(Value::Text)
             .map_err(|error| DbError::plan(format!("failed to render JSON value: {error}")))
     }
 
-    fn json_extract_value(json: &str, path: &str) -> Result<Value> {
-        let parsed = parse_sqlite_json_value(json)
-            .map_err(|error| DbError::plan(format!("malformed JSON: {error}")))?;
+    fn jsonb_patch_value(args: &[Value]) -> Result<Value> {
+        Self::expect_arity("JSONB_PATCH", args, 2)?;
+        let mut target = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            value => Self::parse_json_input_value(value)?,
+        };
+        let patch = match &args[1] {
+            Value::Null => return Ok(Value::Null),
+            value => Self::parse_json_input_value(value)?,
+        };
+        json_merge_patch(&mut target, patch);
+        crate::sql::jsonb::encode(&target).map(Value::Blob)
+    }
+
+    fn json_extract_value(parsed: &serde_json::Value, path: &str) -> Result<Value> {
         let Some(value) = json_path_lookup(&parsed, path)? else {
             return Ok(Value::Null);
         };
         json_value_to_sql(value)
+    }
+
+    fn json_extract_multi_value(
+        parsed: &serde_json::Value,
+        paths: &[Option<String>],
+    ) -> Result<Value> {
+        let mut values = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Some(path) = path else {
+                values.push(serde_json::Value::Null);
+                continue;
+            };
+            let Some(value) = json_path_lookup(&parsed, path)? else {
+                values.push(serde_json::Value::Null);
+                continue;
+            };
+            values.push(value.clone());
+        }
+        serde_json::to_string(&values)
+            .map(Value::Text)
+            .map_err(|error| DbError::plan(format!("failed to render JSON value: {error}")))
+    }
+
+    fn jsonb_extract_value(args: &[Value]) -> Result<Value> {
+        if args.len() < 2 {
+            return Err(DbError::plan(format!(
+                "JSONB_EXTRACT expects at least 2 arguments but got {}",
+                args.len()
+            )));
+        }
+        let parsed = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            value => Self::parse_json_input_value(value)?,
+        };
+        let paths = args[1..]
+            .iter()
+            .map(|value| match value {
+                Value::Null => None,
+                value => Some(Self::coerce_text_like_value(value)),
+            })
+            .collect::<Vec<_>>();
+        if paths.iter().any(Option::is_none) {
+            return Ok(Value::Null);
+        }
+        if paths.len() == 1 {
+            let Some(value) = json_path_lookup(&parsed, paths[0].as_deref().unwrap())? else {
+                return Ok(Value::Null);
+            };
+            return match value {
+                serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                    crate::sql::jsonb::encode(value).map(Value::Blob)
+                }
+                value => json_value_to_sql(value),
+            };
+        }
+
+        let mut values = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Some(path) = path else {
+                values.push(serde_json::Value::Null);
+                continue;
+            };
+            let Some(value) = json_path_lookup(&parsed, &path)? else {
+                values.push(serde_json::Value::Null);
+                continue;
+            };
+            values.push(value.clone());
+        }
+        crate::sql::jsonb::encode(&serde_json::Value::Array(values)).map(Value::Blob)
     }
 
     fn evaluate_trim_family_function<F>(
@@ -8816,13 +13129,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             .cloned()
             .ok_or_else(|| DbError::plan(format!("{function_name} expects at least 1 argument")))?;
         for candidate in args.iter().skip(1) {
-            let ordering = self.compare(candidate, &best)?.ok_or_else(|| {
-                DbError::plan(format!(
-                    "{function_name} cannot compare {} and {}",
-                    candidate.type_name(),
-                    best.type_name()
-                ))
-            })?;
+            let ordering = Self::compare_min_max_scalar_values(candidate, &best);
             let replace = if want_min {
                 matches!(ordering, Ordering::Less | Ordering::Equal)
             } else {
@@ -8834,6 +13141,39 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         }
 
         Ok(Self::canonicalize_scalar_min_max_result(best))
+    }
+
+    fn compare_min_max_scalar_values(left: &Value, right: &Value) -> Ordering {
+        if let Some(ordering) = Self::compare_same_storage_class(left, right) {
+            return ordering;
+        }
+        sqlite_min_max_storage_class_rank(left).cmp(&sqlite_min_max_storage_class_rank(right))
+    }
+
+    fn compare_same_storage_class(left: &Value, right: &Value) -> Option<Ordering> {
+        match (left, right) {
+            (Value::Null, Value::Null) => Some(Ordering::Equal),
+            (Value::Boolean(left), Value::Boolean(right)) => Some(left.cmp(right)),
+            (Value::Boolean(left), Value::Integer(right)) => {
+                Some((if *left { 1_i64 } else { 0_i64 }).cmp(right))
+            }
+            (Value::Integer(left), Value::Boolean(right)) => {
+                Some(left.cmp(&(if *right { 1_i64 } else { 0_i64 })))
+            }
+            (Value::Boolean(left), Value::Real(right)) => {
+                Some((if *left { 1.0_f64 } else { 0.0_f64 }).total_cmp(right))
+            }
+            (Value::Real(left), Value::Boolean(right)) => {
+                Some(left.total_cmp(&(if *right { 1.0_f64 } else { 0.0_f64 })))
+            }
+            (Value::Integer(left), Value::Integer(right)) => Some(left.cmp(right)),
+            (Value::Integer(left), Value::Real(right)) => Some((*left as f64).total_cmp(right)),
+            (Value::Real(left), Value::Integer(right)) => Some(left.total_cmp(&(*right as f64))),
+            (Value::Real(left), Value::Real(right)) => Some(left.total_cmp(right)),
+            (Value::Blob(left), Value::Blob(right)) => Some(left.cmp(right)),
+            (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
+            _ => None,
+        }
     }
 
     fn expect_arity(function_name: &str, args: &[Value], expected: usize) -> Result<()> {
@@ -8864,17 +13204,27 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             return Ok(Value::Null);
         }
         match op {
-            ScalarBinaryOp::Add => Self::sqlite_numeric_binary_op(left, right, |l, r| l + r),
-            ScalarBinaryOp::Subtract => Self::sqlite_numeric_binary_op(left, right, |l, r| l - r),
-            ScalarBinaryOp::Multiply => Self::sqlite_numeric_binary_op(left, right, |l, r| l * r),
+            ScalarBinaryOp::Add => {
+                Self::sqlite_numeric_binary_op(left, right, i64::checked_add, |left, right| {
+                    left + right
+                })
+            }
+            ScalarBinaryOp::Subtract => {
+                Self::sqlite_numeric_binary_op(left, right, i64::checked_sub, |left, right| {
+                    left - right
+                })
+            }
+            ScalarBinaryOp::Multiply => {
+                Self::sqlite_numeric_binary_op(left, right, i64::checked_mul, |left, right| {
+                    left * right
+                })
+            }
             ScalarBinaryOp::Divide => Self::sqlite_divide_op(left, right),
             ScalarBinaryOp::Modulo => Self::sqlite_modulo_op(left, right),
             ScalarBinaryOp::BitAnd => Self::sqlite_bitwise_binary_op(left, right, |l, r| l & r),
             ScalarBinaryOp::BitOr => Self::sqlite_bitwise_binary_op(left, right, |l, r| l | r),
-            ScalarBinaryOp::ShiftLeft => Self::sqlite_bitwise_binary_op(left, right, |l, r| l << r),
-            ScalarBinaryOp::ShiftRight => {
-                Self::sqlite_bitwise_binary_op(left, right, |l, r| l >> r)
-            }
+            ScalarBinaryOp::ShiftLeft => Self::sqlite_shift_op(left, right, true),
+            ScalarBinaryOp::ShiftRight => Self::sqlite_shift_op(left, right, false),
             ScalarBinaryOp::Concat => match (left, right) {
                 (left, right) => Ok(Value::Text(format!(
                     "{}{}",
@@ -8913,6 +13263,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     fn sqlite_json_arrow_path(path: &Value) -> String {
         match path {
             Value::Integer(index) if *index >= 0 => format!("$[{index}]"),
+            Value::Integer(index) => format!("$[#-{}]", index.unsigned_abs()),
             Value::Text(path) if path.starts_with('$') => path.clone(),
             value => format!("$.{}", Self::coerce_text_like_value(value)),
         }
@@ -8936,6 +13287,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     }
 
     fn sqlite_real_to_text(value: f64) -> String {
+        if value == f64::INFINITY {
+            return "Inf".to_string();
+        }
+        if value == f64::NEG_INFINITY {
+            return "-Inf".to_string();
+        }
+
         let rendered = value.to_string();
         if rendered.contains(['.', 'e', 'E']) {
             rendered
@@ -8944,7 +13302,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         }
     }
 
-    fn sqlite_printf(format: &str, args: &[Value]) -> Result<String> {
+    fn sqlite_printf(format: &str, args: &[Value]) -> Result<Option<String>> {
         let mut rendered = String::new();
         let mut chars = format.chars().peekable();
         let mut arg_index = 0usize;
@@ -8971,6 +13329,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     ',' => flags.grouping = true,
                     '0' => flags.zero_pad = true,
                     '#' => flags.alternate = true,
+                    '!' => flags.alternate_form_2 = true,
                     _ => break,
                 }
                 chars.next();
@@ -9030,11 +13389,17 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 chars.next();
             }
 
-            let spec = chars
-                .next()
-                .ok_or_else(|| DbError::plan("PRINTF format string ended after %"))?;
-            let arg = args.get(arg_index).cloned().unwrap_or(Value::Null);
-            arg_index += 1;
+            let Some(spec) = chars.next() else {
+                rendered.push('%');
+                break;
+            };
+            let arg = if spec == 'n' {
+                Value::Null
+            } else {
+                let arg = args.get(arg_index).cloned().unwrap_or(Value::Null);
+                arg_index += 1;
+                arg
+            };
 
             match spec {
                 'd' | 'i' => {
@@ -9049,13 +13414,23 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         Self::format_sqlite_unsigned_integer(value, flags, precision);
                     Self::push_sqlite_printf_numeric(&mut rendered, &rendered_value, width, flags);
                 }
+                'r' => {
+                    let value = Self::sqlite_printf_integer_arg(&arg);
+                    let mut rendered_value =
+                        Self::format_sqlite_signed_integer(value, flags, precision);
+                    rendered_value.push_str(Self::sqlite_ordinal_suffix(value));
+                    Self::push_sqlite_printf_numeric(&mut rendered, &rendered_value, width, flags);
+                }
                 'f' => {
                     let value = Self::sqlite_printf_real_arg(&arg);
-                    let mut rendered_value = if let Some(precision) = precision {
-                        format!("{value:.precision$}")
-                    } else {
-                        format!("{value:.6}")
-                    };
+                    let mut rendered_value =
+                        if let Some(infinity) = Self::sqlite_printf_infinity_text(value) {
+                            infinity
+                        } else if let Some(precision) = precision {
+                            format!("{value:.precision$}")
+                        } else {
+                            format!("{value:.6}")
+                        };
                     if flags.alternate && !rendered_value.contains('.') {
                         rendered_value.push('.');
                     }
@@ -9065,8 +13440,12 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 'e' | 'E' => {
                     let value = Self::sqlite_printf_real_arg(&arg);
                     let precision = precision.unwrap_or(6);
-                    let mut rendered_value = format!("{value:.precision$e}");
-                    rendered_value = Self::normalize_sqlite_exponent(rendered_value, spec);
+                    let mut rendered_value =
+                        if let Some(infinity) = Self::sqlite_printf_infinity_text(value) {
+                            infinity
+                        } else {
+                            Self::normalize_sqlite_exponent(format!("{value:.precision$e}"), spec)
+                        };
                     if flags.alternate {
                         rendered_value = Self::ensure_sqlite_exponent_decimal_point(rendered_value);
                     }
@@ -9076,7 +13455,8 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 'g' | 'G' => {
                     let value = Self::sqlite_printf_real_arg(&arg);
                     let precision = precision.unwrap_or(6);
-                    let mut rendered_value = Self::sqlite_printf_general_float(value, precision);
+                    let mut rendered_value = Self::sqlite_printf_infinity_text(value)
+                        .unwrap_or_else(|| Self::sqlite_printf_general_float(value, precision));
                     if spec == 'G' {
                         rendered_value = rendered_value.replace('e', "E");
                     }
@@ -9130,11 +13510,14 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 'c' => {
                     let rendered_value = match arg {
                         Value::Null => String::new(),
-                        value => Self::coerce_text_like_value(&value)
-                            .chars()
-                            .next()
-                            .map(|ch| ch.to_string())
-                            .unwrap_or_default(),
+                        value => {
+                            let repeat = precision.unwrap_or(1).max(1);
+                            Self::coerce_text_like_value(&value)
+                                .chars()
+                                .next()
+                                .map(|ch| ch.to_string().repeat(repeat))
+                                .unwrap_or_default()
+                        }
                     };
                     Self::push_sqlite_printf_text(
                         &mut rendered,
@@ -9146,10 +13529,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 's' => {
                     let mut value = match arg {
                         Value::Null => String::new(),
-                        value => Self::coerce_text_like_value(&value),
+                        value => {
+                            sqlite_text_prefix_before_nul(&Self::coerce_text_like_value(&value))
+                                .to_string()
+                        }
                     };
                     if let Some(precision) = precision {
-                        value = Self::truncate_sqlite_printf_text(&value, precision);
+                        value = Self::truncate_sqlite_printf_text(&value, precision, flags);
                     }
                     Self::push_sqlite_printf_text(
                         &mut rendered,
@@ -9161,10 +13547,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 'z' => {
                     let mut value = match arg {
                         Value::Null => String::new(),
-                        value => Self::coerce_text_like_value(&value),
+                        value => {
+                            sqlite_text_prefix_before_nul(&Self::coerce_text_like_value(&value))
+                                .to_string()
+                        }
                     };
                     if let Some(precision) = precision {
-                        value = Self::truncate_sqlite_printf_text(&value, precision);
+                        value = Self::truncate_sqlite_printf_text(&value, precision, flags);
                     }
                     Self::push_sqlite_printf_text(
                         &mut rendered,
@@ -9176,7 +13565,11 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 'q' => {
                     let value = match arg {
                         Value::Null => "(NULL)".to_string(),
-                        value => Self::coerce_text_like_value(&value).replace('\'', "''"),
+                        value if flags.alternate => sqlite_unistr_quote_unquoted(&value),
+                        value => {
+                            sqlite_text_prefix_before_nul(&Self::coerce_text_like_value(&value))
+                                .replace('\'', "''")
+                        }
                     };
                     Self::push_sqlite_printf_text(
                         &mut rendered,
@@ -9188,9 +13581,11 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 'Q' => {
                     let value = match arg {
                         Value::Null => "NULL".to_string(),
+                        value if flags.alternate => sqlite_unistr_quote(&value),
                         value => format!(
                             "'{}'",
-                            Self::coerce_text_like_value(&value).replace('\'', "''")
+                            sqlite_text_prefix_before_nul(&Self::coerce_text_like_value(&value))
+                                .replace('\'', "''")
                         ),
                     };
                     Self::push_sqlite_printf_text(
@@ -9203,7 +13598,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 'w' => {
                     let value = match arg {
                         Value::Null => "(NULL)".to_string(),
-                        value => Self::coerce_text_like_value(&value).replace('"', "\"\""),
+                        value => {
+                            sqlite_text_prefix_before_nul(&Self::coerce_text_like_value(&value))
+                                .replace('"', "\"\"")
+                        }
                     };
                     Self::push_sqlite_printf_text(
                         &mut rendered,
@@ -9213,14 +13611,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     );
                 }
                 other => {
-                    return Err(DbError::plan(format!(
-                        "PRINTF format specifier %{other} is not supported yet"
-                    )));
+                    let _ = other;
+                    return Ok((!rendered.is_empty()).then_some(rendered));
                 }
             }
         }
 
-        Ok(rendered)
+        Ok(Some(rendered))
     }
 
     fn push_sqlite_printf_text(rendered: &mut String, value: &str, width: usize, left_align: bool) {
@@ -9341,8 +13738,22 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         }
     }
 
-    fn truncate_sqlite_printf_text(value: &str, precision: usize) -> String {
-        value.chars().take(precision).collect()
+    fn truncate_sqlite_printf_text(
+        value: &str,
+        precision: usize,
+        flags: SqlitePrintfFlags,
+    ) -> String {
+        if flags.alternate_form_2 {
+            return value.chars().take(precision).collect();
+        }
+        let end = value
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(value.len()))
+            .take_while(|index| *index <= precision)
+            .last()
+            .unwrap_or(0);
+        value[..end].to_string()
     }
 
     fn apply_sqlite_numeric_flags(rendered: String, flags: SqlitePrintfFlags) -> String {
@@ -9454,6 +13865,16 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         Self::trim_printf_general_float(rendered)
     }
 
+    fn sqlite_printf_infinity_text(value: f64) -> Option<String> {
+        if value == f64::INFINITY {
+            Some("Inf".to_string())
+        } else if value == f64::NEG_INFINITY {
+            Some("-Inf".to_string())
+        } else {
+            None
+        }
+    }
+
     fn trim_printf_general_float(rendered: String) -> String {
         if let Some(index) = rendered.find(['e', 'E']) {
             let mut mantissa = rendered[..index].to_string();
@@ -9473,6 +13894,20 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 value.pop();
             }
             value
+        }
+    }
+
+    fn sqlite_ordinal_suffix(value: i64) -> &'static str {
+        let abs = value.unsigned_abs();
+        let last_two = abs % 100;
+        if (11..=13).contains(&last_two) {
+            return "th";
+        }
+        match abs % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
         }
     }
 
@@ -9588,9 +14023,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             Value::Real(value) => Some(Value::Real(*value)),
             Value::Boolean(value) => Some(Value::Integer(if *value { 1 } else { 0 })),
             Value::Text(value) => Some(Self::parse_sqlite_aggregate_numeric_text(value)),
-            Value::Blob(value) => Some(Self::parse_sqlite_aggregate_numeric_text(
-                &String::from_utf8_lossy(value),
-            )),
+            Value::Blob(value) => Some(Self::parse_sqlite_aggregate_numeric_blob(value)),
         }
     }
 
@@ -9600,8 +14033,17 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             Value::Integer(integer)
         } else if let Ok(real) = trimmed.parse::<f64>() {
             Value::Real(real)
+        } else if let Some((candidate, _)) = sqlite_numeric_text_prefix(value) {
+            Value::Real(candidate.parse::<f64>().unwrap_or(0.0))
         } else {
             Value::Real(0.0)
+        }
+    }
+
+    fn parse_sqlite_aggregate_numeric_blob(value: &[u8]) -> Value {
+        match Self::parse_sqlite_aggregate_numeric_text(&String::from_utf8_lossy(value)) {
+            Value::Integer(value) => Value::Real(value as f64),
+            value => value,
         }
     }
 
@@ -9651,10 +14093,26 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             .map_err(|_| DbError::plan(format!("input to {function_name}() is not numeric")))
     }
 
+    fn sqlite_decimal_sum_text(value: f64) -> String {
+        if value.fract() == 0.0 {
+            format!("{value:.0}")
+        } else {
+            let mut rendered = value.to_string();
+            while rendered.contains('.') && rendered.ends_with('0') {
+                rendered.pop();
+            }
+            if rendered.ends_with('.') {
+                rendered.pop();
+            }
+            rendered
+        }
+    }
+
     fn aggregate_function_name(func: AggregateFunc) -> &'static str {
         match func {
             AggregateFunc::Count => "count",
             AggregateFunc::Sum => "sum",
+            AggregateFunc::DecimalSum => "decimal_sum",
             AggregateFunc::Avg => "avg",
             AggregateFunc::Total => "total",
             AggregateFunc::Median => "median",
@@ -9663,7 +14121,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             AggregateFunc::PercentileDisc => "percentile_disc",
             AggregateFunc::GroupConcat => "group_concat",
             AggregateFunc::JsonGroupArray => "json_group_array",
+            AggregateFunc::JsonbGroupArray => "jsonb_group_array",
             AggregateFunc::JsonGroupObject => "json_group_object",
+            AggregateFunc::JsonbGroupObject => "jsonb_group_object",
             AggregateFunc::Min => "min",
             AggregateFunc::Max => "max",
         }
@@ -9710,35 +14170,39 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     }
 
     fn coerce_sqlite_arithmetic_text(value: &str) -> Value {
-        let trimmed = value.trim();
-        if let Ok(integer) = trimmed.parse::<i64>() {
-            Value::Integer(integer)
-        } else if let Ok(real) = trimmed.parse::<f64>() {
-            Value::Real(real)
-        } else {
-            Value::Integer(0)
+        let Some((candidate, has_real_syntax)) = sqlite_numeric_text_prefix(value) else {
+            return Value::Integer(0);
+        };
+        if !has_real_syntax {
+            return match candidate.parse::<i64>() {
+                Ok(value) => Value::Integer(value),
+                Err(_) => Value::Real(candidate.parse::<f64>().unwrap_or(0.0)),
+            };
         }
+
+        Value::Real(candidate.parse::<f64>().unwrap_or(0.0))
     }
 
     fn sqlite_numeric_binary_op(
         left: Value,
         right: Value,
-        f: impl FnOnce(f64, f64) -> f64,
+        int_op: impl FnOnce(i64, i64) -> Option<i64>,
+        real_op: impl FnOnce(f64, f64) -> f64,
     ) -> Result<Value> {
         let left = Self::coerce_sqlite_numeric_value(&left);
         let right = Self::coerce_sqlite_numeric_value(&right);
         match (left, right) {
-            (Value::Integer(left), Value::Integer(right)) => {
-                let result = f(left as f64, right as f64);
-                if result.fract() == 0.0 {
-                    Ok(Value::Integer(result as i64))
-                } else {
-                    Ok(Value::Real(result))
-                }
+            (Value::Integer(left), Value::Integer(right)) => match int_op(left, right) {
+                Some(result) => Ok(Value::Integer(result)),
+                None => Ok(Value::Real(real_op(left as f64, right as f64))),
+            },
+            (Value::Integer(left), Value::Real(right)) => {
+                Ok(Value::Real(real_op(left as f64, right)))
             }
-            (Value::Integer(left), Value::Real(right)) => Ok(Value::Real(f(left as f64, right))),
-            (Value::Real(left), Value::Integer(right)) => Ok(Value::Real(f(left, right as f64))),
-            (Value::Real(left), Value::Real(right)) => Ok(Value::Real(f(left, right))),
+            (Value::Real(left), Value::Integer(right)) => {
+                Ok(Value::Real(real_op(left, right as f64)))
+            }
+            (Value::Real(left), Value::Real(right)) => Ok(Value::Real(real_op(left, right))),
             _ => unreachable!("sqlite numeric coercion only returns numeric values"),
         }
     }
@@ -9751,6 +14215,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             | (Value::Integer(_), Value::Real(0.0))
             | (Value::Real(_), Value::Integer(0))
             | (Value::Real(_), Value::Real(0.0)) => Ok(Value::Null),
+            (Value::Integer(i64::MIN), Value::Integer(-1)) => {
+                Ok(Value::Real(i64::MIN as f64 / -1.0))
+            }
             (Value::Integer(left), Value::Integer(right)) => Ok(Value::Integer(left / right)),
             (Value::Integer(left), Value::Real(right)) => Ok(Value::Real(left as f64 / right)),
             (Value::Real(left), Value::Integer(right)) => Ok(Value::Real(left / right as f64)),
@@ -9765,39 +14232,40 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         if matches!(left, Value::Null) || matches!(right, Value::Null) {
             return Ok(Value::Null);
         }
+        let result_is_real = matches!(left, Value::Real(_)) || matches!(right, Value::Real(_));
         let left = match left {
-            Value::Integer(value) => value as f64,
-            Value::Real(value) => value,
+            Value::Integer(value) => value,
+            Value::Real(value) => value as i64,
             _ => unreachable!("sqlite numeric coercion only returns numeric values"),
         };
         let right = match right {
-            Value::Integer(value) => value as f64,
-            Value::Real(value) => value,
+            Value::Integer(value) => value,
+            Value::Real(value) => value as i64,
             _ => unreachable!("sqlite numeric coercion only returns numeric values"),
         };
-        if right == 0.0 {
+        if right == 0 {
             return Ok(Value::Null);
         }
-        let result = left % right;
-        if result.fract() == 0.0 {
-            Ok(Value::Integer(result as i64))
+        let result = if left == i64::MIN && right == -1 {
+            0
         } else {
-            Ok(Value::Real(result))
-        }
+            left % right
+        };
+        Ok(if result_is_real {
+            Value::Real(result as f64)
+        } else {
+            Value::Integer(result)
+        })
     }
 
     fn sqlite_mod_function(left: Value, right: Value) -> Result<Value> {
-        let left = match Self::coerce_sqlite_numeric_value(&left) {
-            Value::Null => return Ok(Value::Null),
-            Value::Integer(value) => value as f64,
-            Value::Real(value) => value,
-            _ => unreachable!("sqlite numeric coercion only returns numeric values"),
+        let left = match Self::sqlite_math_arg(&left, "MOD")? {
+            Some(value) => value,
+            None => return Ok(Value::Null),
         };
-        let right = match Self::coerce_sqlite_numeric_value(&right) {
-            Value::Null => return Ok(Value::Null),
-            Value::Integer(value) => value as f64,
-            Value::Real(value) => value,
-            _ => unreachable!("sqlite numeric coercion only returns numeric values"),
+        let right = match Self::sqlite_math_arg(&right, "MOD")? {
+            Some(value) => value,
+            None => return Ok(Value::Null),
         };
         if right == 0.0 {
             return Ok(Value::Null);
@@ -9813,6 +14281,24 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         let left = Self::sqlite_bitwise_integer_arg(&left)?;
         let right = Self::sqlite_bitwise_integer_arg(&right)?;
         Ok(Value::Integer(op(left, right)))
+    }
+
+    fn sqlite_shift_op(left: Value, right: Value, left_shift: bool) -> Result<Value> {
+        let left = Self::sqlite_bitwise_integer_arg(&left)?;
+        let right = Self::sqlite_bitwise_integer_arg(&right)?;
+        let shift_left = if right < 0 { !left_shift } else { left_shift };
+        let amount = right.unsigned_abs();
+
+        if amount >= 64 {
+            return Ok(Value::Integer(if shift_left || left >= 0 { 0 } else { -1 }));
+        }
+
+        let amount = u32::try_from(amount).expect("shift amount < 64 fits in u32");
+        Ok(Value::Integer(if shift_left {
+            left.wrapping_shl(amount)
+        } else {
+            left.wrapping_shr(amount)
+        }))
     }
 
     fn sqlite_bitwise_integer_arg(value: &Value) -> Result<i64> {
@@ -9917,6 +14403,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     fn compare(&self, left: &Value, right: &Value) -> Result<Option<Ordering>> {
         let ordering = match (left, right) {
             (Value::Null, Value::Null) => Some(Ordering::Equal),
+            (Value::Null, _) | (_, Value::Null) => None,
             (Value::Boolean(left), Value::Boolean(right)) => Some(left.cmp(right)),
             (Value::Boolean(left), Value::Integer(right)) => {
                 Some((if *left { 1_i64 } else { 0_i64 }).cmp(right))
@@ -9936,10 +14423,21 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             (Value::Real(left), Value::Real(right)) => Some(left.total_cmp(right)),
             (Value::Blob(left), Value::Blob(right)) => Some(left.cmp(right)),
             (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
-            _ => None,
+            (left, right) => Some(
+                Self::sqlite_storage_class_rank(left).cmp(&Self::sqlite_storage_class_rank(right)),
+            ),
         };
 
         Ok(ordering)
+    }
+
+    fn sqlite_storage_class_rank(value: &Value) -> u8 {
+        match value {
+            Value::Null => 0,
+            Value::Boolean(_) | Value::Integer(_) | Value::Real(_) => 1,
+            Value::Text(_) => 2,
+            Value::Blob(_) => 3,
+        }
     }
 
     fn is_with_negation(&self, left: &Value, right: &Value, negated: bool) -> bool {
@@ -10170,27 +14668,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     fn matches_like_pattern(
         value: &str,
         pattern: &str,
-        escape: &Option<String>,
+        escape: Option<&str>,
         case_sensitive: bool,
     ) -> Result<bool> {
-        let escape = match escape {
-            Some(escape) => {
-                let mut chars = escape.chars();
-                let Some(ch) = chars.next() else {
-                    return Err(DbError::plan(
-                        "ESCAPE expression must be a single character",
-                    ));
-                };
-                if chars.next().is_some() {
-                    return Err(DbError::plan(
-                        "ESCAPE expression must be a single character",
-                    ));
-                }
-                Some(ch)
-            }
-            None => None,
-        };
-        let value = value.chars().collect::<Vec<_>>();
+        let escape = Self::like_escape_char(escape)?;
+        let value = sqlite_text_prefix_before_nul(value)
+            .chars()
+            .collect::<Vec<_>>();
         let pattern = Self::like_tokens(pattern, escape);
         let mut dp = vec![vec![false; pattern.len() + 1]; value.len() + 1];
         dp[0][0] = true;
@@ -10218,6 +14702,26 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             }
         }
         Ok(dp[value.len()][pattern.len()])
+    }
+
+    fn like_escape_char(escape: Option<&str>) -> Result<Option<char>> {
+        Ok(match escape {
+            Some(escape) => {
+                let mut chars = escape.chars();
+                let Some(ch) = chars.next() else {
+                    return Err(DbError::plan(
+                        "ESCAPE expression must be a single character",
+                    ));
+                };
+                if chars.next().is_some() {
+                    return Err(DbError::plan(
+                        "ESCAPE expression must be a single character",
+                    ));
+                }
+                Some(ch)
+            }
+            None => None,
+        })
     }
 
     fn like_tokens(pattern: &str, escape: Option<char>) -> Vec<LikeToken> {
@@ -10265,6 +14769,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     match func {
                         AggregateFunc::Count => "COUNT",
                         AggregateFunc::Sum => "SUM",
+                        AggregateFunc::DecimalSum => "DECIMAL_SUM",
                         AggregateFunc::Avg => "AVG",
                         AggregateFunc::Total => "TOTAL",
                         AggregateFunc::Median => "MEDIAN",
@@ -10273,7 +14778,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                         AggregateFunc::PercentileDisc => "PERCENTILE_DISC",
                         AggregateFunc::GroupConcat => "GROUP_CONCAT",
                         AggregateFunc::JsonGroupArray => "JSON_GROUP_ARRAY",
+                        AggregateFunc::JsonbGroupArray => "JSONB_GROUP_ARRAY",
                         AggregateFunc::JsonGroupObject => "JSON_GROUP_OBJECT",
+                        AggregateFunc::JsonbGroupObject => "JSONB_GROUP_OBJECT",
                         AggregateFunc::Min => "MIN",
                         AggregateFunc::Max => "MAX",
                     },
@@ -10327,6 +14834,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         match expr {
             ScalarExpr::Literal(value) => value.to_string(),
             ScalarExpr::Column(name) => name.clone(),
+            ScalarExpr::UnaryPlus(expr) => format!("+{}", self.scalar_expr_name(expr)),
             ScalarExpr::UnaryMinus(expr) => format!("-{}", self.scalar_expr_name(expr)),
             ScalarExpr::BitNot(expr) => format!("~{}", self.scalar_expr_name(expr)),
             ScalarExpr::Not(expr) => format!("NOT {}", self.scalar_expr_name(expr)),
@@ -10385,13 +14893,13 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 escape,
                 negated,
             } => format!(
-                "{} {}LIKE '{}'{}",
+                "{} {}LIKE {}{}",
                 self.scalar_expr_name(expr),
                 if *negated { "NOT " } else { "" },
-                pattern,
+                self.scalar_expr_name(pattern),
                 escape
                     .as_ref()
-                    .map(|escape| format!(" ESCAPE '{}'", escape.replace('\'', "''")))
+                    .map(|escape| format!(" ESCAPE {}", self.scalar_expr_name(escape)))
                     .unwrap_or_default()
             ),
             ScalarExpr::Glob {
@@ -10399,10 +14907,10 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 pattern,
                 negated,
             } => format!(
-                "{} {}GLOB '{}'",
+                "{} {}GLOB {}",
                 self.scalar_expr_name(expr),
                 if *negated { "NOT " } else { "" },
-                pattern
+                self.scalar_expr_name(pattern)
             ),
             ScalarExpr::Between {
                 expr,
@@ -10491,6 +14999,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            ScalarExpr::WindowFunction { func, .. } => {
+                Self::window_function_name(*func).to_string()
+            }
             ScalarExpr::Aggregate { func, arg, .. } => {
                 self.aggregate_output_name(*func, arg.as_ref())
             }
@@ -10506,7 +15017,124 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
     }
 
     fn aggregate_call_name(&self, call: &AggregateCall) -> String {
-        self.aggregate_output_name(call.func, &call.arg)
+        let mut name = self.aggregate_output_name(call.func, &call.arg);
+        if let Some(order_by) = self.aggregate_call_order_by(&call.arg)
+            && !order_by.is_empty()
+        {
+            name.push_str(" ORDER BY ");
+            name.push_str(
+                &order_by
+                    .iter()
+                    .map(|item| self.order_by_name(item))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        if let Some(filter) = &call.filter {
+            name.push_str(" FILTER (WHERE ");
+            name.push_str(&self.expr_name(filter));
+            name.push(')');
+        }
+        name
+    }
+
+    fn aggregate_call_order_by<'b>(&self, arg: &'b AggregateArg) -> Option<&'b [OrderBy]> {
+        match arg {
+            AggregateArg::Expr { order_by, .. }
+            | AggregateArg::GroupConcat { order_by, .. }
+            | AggregateArg::JsonGroupObject { order_by, .. }
+            | AggregateArg::Percentile { order_by, .. } => Some(order_by),
+            AggregateArg::Wildcard => None,
+        }
+    }
+
+    fn order_by_name(&self, item: &OrderBy) -> String {
+        let mut name = match &item.expr {
+            OrderByExpr::Column(column) => column.clone(),
+            OrderByExpr::Position(position) => position.to_string(),
+            OrderByExpr::Expr(expr) => self.scalar_expr_name(expr),
+        };
+        if let Some(collation) = &item.collation {
+            name.push_str(" COLLATE ");
+            name.push_str(collation);
+        }
+        if item.descending {
+            name.push_str(" DESC");
+        } else {
+            name.push_str(" ASC");
+        }
+        if let Some(nulls) = item.nulls {
+            name.push_str(match nulls {
+                NullOrder::First => " NULLS FIRST",
+                NullOrder::Last => " NULLS LAST",
+            });
+        }
+        name
+    }
+
+    fn expr_name(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Compare { column, op, value } => {
+                format!("{column} {} {value}", self.compare_op_name(*op))
+            }
+            Expr::CompareColumns { left, op, right } => {
+                format!("{left} {} {right}", self.compare_op_name(*op))
+            }
+            Expr::CompareScalar { left, op, right } => format!(
+                "{} {} {}",
+                self.scalar_expr_name(left),
+                self.compare_op_name(*op),
+                self.scalar_expr_name(right)
+            ),
+            Expr::IsNull { column, negated } => {
+                format!("{column} IS {}NULL", if *negated { "NOT " } else { "" })
+            }
+            Expr::IsNullScalar { expr, negated } => format!(
+                "{} IS {}NULL",
+                self.scalar_expr_name(expr),
+                if *negated { "NOT " } else { "" }
+            ),
+            Expr::Is {
+                left,
+                right,
+                negated,
+            } => format!(
+                "{} IS {}{}",
+                self.scalar_expr_name(left),
+                if *negated { "NOT " } else { "" },
+                self.scalar_expr_name(right)
+            ),
+            Expr::IsBool {
+                expr,
+                value,
+                negated,
+                ..
+            } => format!(
+                "{} IS {}{}",
+                self.scalar_expr_name(expr),
+                if *negated { "NOT " } else { "" },
+                if *value { "TRUE" } else { "FALSE" }
+            ),
+            Expr::And(left, right) => {
+                format!("{} AND {}", self.expr_name(left), self.expr_name(right))
+            }
+            Expr::Or(left, right) => {
+                format!("{} OR {}", self.expr_name(left), self.expr_name(right))
+            }
+            Expr::Not(expr) => format!("NOT {}", self.expr_name(expr)),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn compare_op_name(&self, op: CompareOp) -> &'static str {
+        match op {
+            CompareOp::Eq => "=",
+            CompareOp::Ne => "!=",
+            CompareOp::Gt => ">",
+            CompareOp::Gte => ">=",
+            CompareOp::Lt => "<",
+            CompareOp::Lte => "<=",
+        }
     }
 
     fn aggregate_output_name(&self, func: AggregateFunc, arg: &AggregateArg) -> String {
@@ -10515,6 +15143,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             match func {
                 AggregateFunc::Count => "COUNT",
                 AggregateFunc::Sum => "SUM",
+                AggregateFunc::DecimalSum => "DECIMAL_SUM",
                 AggregateFunc::Avg => "AVG",
                 AggregateFunc::Total => "TOTAL",
                 AggregateFunc::Median => "MEDIAN",
@@ -10523,7 +15152,9 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
                 AggregateFunc::PercentileDisc => "PERCENTILE_DISC",
                 AggregateFunc::GroupConcat => "GROUP_CONCAT",
                 AggregateFunc::JsonGroupArray => "JSON_GROUP_ARRAY",
+                AggregateFunc::JsonbGroupArray => "JSONB_GROUP_ARRAY",
                 AggregateFunc::JsonGroupObject => "JSON_GROUP_OBJECT",
+                AggregateFunc::JsonbGroupObject => "JSONB_GROUP_OBJECT",
                 AggregateFunc::Min => "MIN",
                 AggregateFunc::Max => "MAX",
             },
@@ -10571,6 +15202,31 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         )
     }
 
+    fn window_function_name(func: WindowFunc) -> &'static str {
+        match func {
+            WindowFunc::RowNumber => "ROW_NUMBER",
+            WindowFunc::Rank => "RANK",
+            WindowFunc::DenseRank => "DENSE_RANK",
+            WindowFunc::Lag => "LAG",
+            WindowFunc::Lead => "LEAD",
+            WindowFunc::Ntile => "NTILE",
+            WindowFunc::PercentRank => "PERCENT_RANK",
+            WindowFunc::CumeDist => "CUME_DIST",
+            WindowFunc::FirstValue => "FIRST_VALUE",
+            WindowFunc::LastValue => "LAST_VALUE",
+            WindowFunc::NthValue => "NTH_VALUE",
+            WindowFunc::Count => "COUNT",
+            WindowFunc::Sum => "SUM",
+            WindowFunc::Avg => "AVG",
+            WindowFunc::Total => "TOTAL",
+            WindowFunc::Min => "MIN",
+            WindowFunc::Max => "MAX",
+            WindowFunc::GroupConcat => "GROUP_CONCAT",
+            WindowFunc::JsonGroupArray => "JSON_GROUP_ARRAY",
+            WindowFunc::JsonGroupObject => "JSON_GROUP_OBJECT",
+        }
+    }
+
     fn scalar_function_name(func: ScalarFunc) -> &'static str {
         match func {
             ScalarFunc::Length => "LENGTH",
@@ -10601,6 +15257,7 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             ScalarFunc::SqliteVersion => "SQLITE_VERSION",
             ScalarFunc::SqliteCompileOptionUsed => "SQLITE_COMPILEOPTION_USED",
             ScalarFunc::SqliteCompileOptionGet => "SQLITE_COMPILEOPTION_GET",
+            ScalarFunc::SqliteLog => "SQLITE_LOG",
             ScalarFunc::Likely => "LIKELY",
             ScalarFunc::Unlikely => "UNLIKELY",
             ScalarFunc::Likelihood => "LIKELIHOOD",
@@ -10642,6 +15299,8 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             ScalarFunc::Replace => "REPLACE",
             ScalarFunc::LikeFunc => "LIKE",
             ScalarFunc::GlobFunc => "GLOB",
+            ScalarFunc::RegexpFunc => "REGEXP",
+            ScalarFunc::MatchFunc => "MATCH",
             ScalarFunc::Quote => "QUOTE",
             ScalarFunc::Unicode => "UNICODE",
             ScalarFunc::Trim => "TRIM",
@@ -10655,21 +15314,31 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
             ScalarFunc::Coalesce => "COALESCE",
             ScalarFunc::IfNull => "IFNULL",
             ScalarFunc::NullIf => "NULLIF",
+            ScalarFunc::Unknown => "UNKNOWN",
             ScalarFunc::Json => "JSON",
+            ScalarFunc::Jsonb => "JSONB",
             ScalarFunc::JsonValid => "JSON_VALID",
             ScalarFunc::JsonErrorPosition => "JSON_ERROR_POSITION",
             ScalarFunc::JsonPretty => "JSON_PRETTY",
             ScalarFunc::JsonQuote => "JSON_QUOTE",
             ScalarFunc::JsonExtract => "JSON_EXTRACT",
+            ScalarFunc::JsonbExtract => "JSONB_EXTRACT",
             ScalarFunc::JsonType => "JSON_TYPE",
             ScalarFunc::JsonArray => "JSON_ARRAY",
+            ScalarFunc::JsonbArray => "JSONB_ARRAY",
             ScalarFunc::JsonObject => "JSON_OBJECT",
+            ScalarFunc::JsonbObject => "JSONB_OBJECT",
             ScalarFunc::JsonArrayLength => "JSON_ARRAY_LENGTH",
             ScalarFunc::JsonRemove => "JSON_REMOVE",
+            ScalarFunc::JsonbRemove => "JSONB_REMOVE",
             ScalarFunc::JsonSet => "JSON_SET",
+            ScalarFunc::JsonbSet => "JSONB_SET",
             ScalarFunc::JsonInsert => "JSON_INSERT",
+            ScalarFunc::JsonbInsert => "JSONB_INSERT",
             ScalarFunc::JsonReplace => "JSON_REPLACE",
+            ScalarFunc::JsonbReplace => "JSONB_REPLACE",
             ScalarFunc::JsonPatch => "JSON_PATCH",
+            ScalarFunc::JsonbPatch => "JSONB_PATCH",
         }
     }
 
@@ -10677,6 +15346,15 @@ impl<'a, S: PlanningStorageEngine> Executor<'a, S> {
         self.changes.set(changes);
         self.total_changes
             .set(self.total_changes.get().saturating_add(changes));
+    }
+
+    fn record_changes_rows(&self, changes: i64) -> Vec<Row> {
+        self.record_changes(changes);
+        if self.count_changes.get() {
+            vec![vec![Value::Integer(changes)]]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -11137,11 +15815,7 @@ fn apply_sqlite_date_time_modifier(
 }
 
 fn parse_sqlite_modifier_offset(modifier: &str, suffix: &str) -> Option<i64> {
-    if !modifier.ends_with(suffix) {
-        return None;
-    }
-
-    modifier[..modifier.len() - suffix.len()]
+    strip_sqlite_modifier_unit(modifier, suffix)?
         .trim()
         .parse::<i64>()
         .ok()
@@ -11152,11 +15826,7 @@ fn parse_sqlite_modifier_offset_millis(
     suffix: &str,
     millis_per_unit: f64,
 ) -> Option<i64> {
-    if !modifier.ends_with(suffix) {
-        return None;
-    }
-
-    let value = modifier[..modifier.len() - suffix.len()]
+    let value = strip_sqlite_modifier_unit(modifier, suffix)?
         .trim()
         .parse::<f64>()
         .ok()?;
@@ -11170,9 +15840,26 @@ fn parse_sqlite_modifier_offset_millis(
     Some(millis as i64)
 }
 
+fn strip_sqlite_modifier_unit<'a>(modifier: &'a str, suffix: &str) -> Option<&'a str> {
+    let singular = suffix;
+    let plural = format!("{suffix}s");
+    let trimmed = modifier.trim_end();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with(&plural) {
+        return Some(&trimmed[..trimmed.len() - plural.len()]);
+    }
+    if lower.ends_with(singular) {
+        return Some(&trimmed[..trimmed.len() - singular.len()]);
+    }
+    None
+}
+
 fn parse_sqlite_weekday_modifier(modifier: &str) -> Option<i64> {
     let prefix = "weekday ";
-    let suffix = modifier.strip_prefix(prefix)?;
+    if !modifier.to_ascii_lowercase().starts_with(prefix) {
+        return None;
+    }
+    let suffix = &modifier[prefix.len()..];
     let weekday = suffix.trim().parse::<i64>().ok()?;
     if !(0..=6).contains(&weekday) {
         return None;
@@ -11543,6 +16230,7 @@ fn sqlite_unistr_quote(value: &Value) -> String {
     let Value::Text(value) = value else {
         return sqlite_quote_value(value);
     };
+    let value = sqlite_text_prefix_before_nul(value);
     if !value
         .chars()
         .any(|ch| matches!(ch, '\u{0001}'..='\u{001f}'))
@@ -11563,6 +16251,20 @@ fn sqlite_unistr_quote(value: &Value) -> String {
     }
     quoted.push_str("')");
     quoted
+}
+
+fn sqlite_unistr_quote_unquoted(value: &Value) -> String {
+    let quoted = sqlite_unistr_quote(value);
+    quoted
+        .strip_prefix("unistr('")
+        .and_then(|value| value.strip_suffix("')"))
+        .or_else(|| {
+            quoted
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .map(str::to_string)
+        .unwrap_or(quoted)
 }
 
 fn sqlite_quote_value(value: &Value) -> String {
@@ -11593,6 +16295,13 @@ fn sqlite_quote_text(value: &str) -> String {
 }
 
 fn sqlite_real_to_text_for_quote(value: f64) -> String {
+    if value == f64::INFINITY {
+        return "9.0e+999".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-9.0e+999".to_string();
+    }
+
     let rendered = value.to_string();
     if rendered.contains(['.', 'e', 'E']) {
         rendered
@@ -11611,16 +16320,12 @@ fn json_path_lookup<'a>(
         .ok_or_else(|| DbError::plan("JSON path must start with '$'"))?;
     while !remaining.is_empty() {
         if let Some(rest) = remaining.strip_prefix('.') {
-            let key_end = rest.find(['.', '[']).unwrap_or(rest.len());
-            let key = &rest[..key_end];
-            if key.is_empty() {
-                return Err(DbError::plan("invalid JSON path"));
-            }
-            let Some(next) = current.get(key) else {
+            let (key, tail) = json_path_object_key(rest)?;
+            let Some(next) = current.get(key.as_ref()) else {
                 return Ok(None);
             };
             current = next;
-            remaining = &rest[key_end..];
+            remaining = tail;
             continue;
         }
         if let Some(rest) = remaining.strip_prefix('[') {
@@ -11642,8 +16347,49 @@ fn json_path_lookup<'a>(
     Ok(Some(current))
 }
 
+fn json_path_object_key(rest: &str) -> Result<(std::borrow::Cow<'_, str>, &str)> {
+    if rest.starts_with('"') {
+        let mut escaped = false;
+        for (offset, ch) in rest[1..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => {
+                    let end = offset + 2;
+                    let key = serde_json::from_str::<String>(&rest[..end])
+                        .map_err(|_| DbError::plan("invalid JSON path"))?;
+                    return Ok((std::borrow::Cow::Owned(key), &rest[end..]));
+                }
+                _ => {}
+            }
+        }
+        return Err(DbError::plan("invalid JSON path"));
+    }
+
+    let key_end = rest.find(['.', '[']).unwrap_or(rest.len());
+    let key = &rest[..key_end];
+    if key.is_empty() {
+        return Err(DbError::plan("invalid JSON path"));
+    }
+    Ok((std::borrow::Cow::Borrowed(key), &rest[key_end..]))
+}
+
+fn json_container_for_path_tail(tail: &str) -> serde_json::Value {
+    if tail.starts_with('[') {
+        serde_json::Value::Array(Vec::new())
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
+}
+
 fn json_path_array_index(value: &serde_json::Value, index: &str) -> Result<Option<usize>> {
     if index == "#" {
+        return Ok(None);
+    }
+    if index.starts_with('"') && serde_json::from_str::<String>(index).is_ok() {
         return Ok(None);
     }
     if let Some(tail) = index.strip_prefix("#-") {
@@ -12159,19 +16905,14 @@ fn json_remove_path(value: &mut serde_json::Value, path: &str) -> Result<()> {
 
 fn json_remove_path_tail(value: &mut serde_json::Value, remaining: &str) -> Result<()> {
     if let Some(rest) = remaining.strip_prefix('.') {
-        let key_end = rest.find(['.', '[']).unwrap_or(rest.len());
-        let key = &rest[..key_end];
-        if key.is_empty() {
-            return Err(DbError::plan("invalid JSON path"));
-        }
-        let tail = &rest[key_end..];
+        let (key, tail) = json_path_object_key(rest)?;
         if tail.is_empty() {
             if let serde_json::Value::Object(object) = value {
-                object.remove(key);
+                object.remove(key.as_ref());
             }
             return Ok(());
         }
-        let Some(next) = value.get_mut(key) else {
+        let Some(next) = value.get_mut(key.as_ref()) else {
             return Ok(());
         };
         return json_remove_path_tail(next, tail);
@@ -12181,9 +16922,9 @@ fn json_remove_path_tail(value: &mut serde_json::Value, remaining: &str) -> Resu
         let Some(index_end) = rest.find(']') else {
             return Err(DbError::plan("invalid JSON path"));
         };
-        let index = rest[..index_end]
-            .parse::<usize>()
-            .map_err(|_| DbError::plan("invalid JSON array index"))?;
+        let Some(index) = json_path_array_index(value, &rest[..index_end])? else {
+            return Ok(());
+        };
         let tail = &rest[index_end + 1..];
         if tail.is_empty() {
             if let serde_json::Value::Array(values) = value {
@@ -12215,13 +16956,23 @@ fn json_write_path(
     replacement: serde_json::Value,
     mode: JsonWriteMode,
 ) -> Result<()> {
+    json_write_path_with_created_keys(value, path, replacement, mode, None)
+}
+
+fn json_write_path_with_created_keys(
+    value: &mut serde_json::Value,
+    path: &str,
+    replacement: serde_json::Value,
+    mode: JsonWriteMode,
+    raw_object_keys: Option<&mut HashSet<String>>,
+) -> Result<()> {
     let remaining = path
         .strip_prefix('$')
         .ok_or_else(|| DbError::plan("JSON path must start with '$'"))?;
     if remaining.is_empty() {
         return Err(DbError::plan("root path is handled by caller"));
     }
-    json_write_path_tail(value, remaining, replacement, mode)
+    json_write_path_tail(value, remaining, replacement, mode, "", raw_object_keys)
 }
 
 fn json_write_path_tail(
@@ -12229,14 +16980,12 @@ fn json_write_path_tail(
     remaining: &str,
     replacement: serde_json::Value,
     mode: JsonWriteMode,
+    current_path: &str,
+    mut raw_object_keys: Option<&mut HashSet<String>>,
 ) -> Result<()> {
     if let Some(rest) = remaining.strip_prefix('.') {
-        let key_end = rest.find(['.', '[']).unwrap_or(rest.len());
-        let key = &rest[..key_end];
-        if key.is_empty() {
-            return Err(DbError::plan("invalid JSON path"));
-        }
-        let tail = &rest[key_end..];
+        let (key, tail) = json_path_object_key(rest)?;
+        let key_path = crate::sql::jsonb::object_key_path(current_path, key.as_ref());
         if tail.is_empty() {
             if !value.is_object() {
                 if matches!(mode, JsonWriteMode::Replace) {
@@ -12245,13 +16994,16 @@ fn json_write_path_tail(
                 *value = serde_json::Value::Object(serde_json::Map::new());
             }
             if let serde_json::Value::Object(object) = value {
-                let exists = object.contains_key(key);
+                let exists = object.contains_key(key.as_ref());
                 if matches!(
                     (mode, exists),
                     (JsonWriteMode::Set, _)
                         | (JsonWriteMode::Insert, false)
                         | (JsonWriteMode::Replace, true)
                 ) {
+                    if !exists && let Some(raw_object_keys) = raw_object_keys.as_deref_mut() {
+                        raw_object_keys.insert(key_path);
+                    }
                     object.insert(key.to_string(), replacement);
                 }
             }
@@ -12266,24 +17018,59 @@ fn json_write_path_tail(
         let serde_json::Value::Object(object) = value else {
             unreachable!("value was normalized to object");
         };
-        let next = match object.get_mut(key) {
-            Some(next) => next,
-            None if matches!(mode, JsonWriteMode::Set | JsonWriteMode::Insert) => object
-                .entry(key.to_string())
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new())),
-            None => return Ok(()),
+        let exists = object.contains_key(key.as_ref());
+        if !exists {
+            if matches!(mode, JsonWriteMode::Set | JsonWriteMode::Insert) {
+                if let Some(raw_object_keys) = raw_object_keys.as_deref_mut() {
+                    raw_object_keys.insert(key_path.clone());
+                }
+                object.insert(key.to_string(), json_container_for_path_tail(tail));
+            } else {
+                return Ok(());
+            }
         };
-        return json_write_path_tail(next, tail, replacement, mode);
+        let next = object
+            .get_mut(key.as_ref())
+            .expect("inserted or existing JSON object key must be addressable");
+        return json_write_path_tail(next, tail, replacement, mode, &key_path, raw_object_keys);
     }
 
     if let Some(rest) = remaining.strip_prefix('[') {
         let Some(index_end) = rest.find(']') else {
             return Err(DbError::plan("invalid JSON path"));
         };
-        let index = rest[..index_end]
-            .parse::<usize>()
-            .map_err(|_| DbError::plan("invalid JSON array index"))?;
+        let index_token = &rest[..index_end];
         let tail = &rest[index_end + 1..];
+        if index_token == "#" {
+            let serde_json::Value::Array(values) = value else {
+                return Ok(());
+            };
+            if tail.is_empty() {
+                if matches!(mode, JsonWriteMode::Set | JsonWriteMode::Insert) {
+                    values.push(replacement);
+                }
+                return Ok(());
+            }
+            if matches!(mode, JsonWriteMode::Replace) {
+                return Ok(());
+            }
+            let item_path = crate::sql::jsonb::array_index_path(current_path, values.len());
+            values.push(json_container_for_path_tail(tail));
+            let next = values
+                .last_mut()
+                .expect("pushed JSON value must be addressable");
+            return json_write_path_tail(
+                next,
+                tail,
+                replacement,
+                mode,
+                &item_path,
+                raw_object_keys,
+            );
+        }
+        let Some(index) = json_path_array_index(value, index_token)? else {
+            return Ok(());
+        };
         let serde_json::Value::Array(values) = value else {
             return Ok(());
         };
@@ -12299,10 +17086,26 @@ fn json_write_path_tail(
             }
             return Ok(());
         }
+        if index == values.len() && matches!(mode, JsonWriteMode::Set | JsonWriteMode::Insert) {
+            let item_path = crate::sql::jsonb::array_index_path(current_path, index);
+            values.push(json_container_for_path_tail(tail));
+            let next = values
+                .last_mut()
+                .expect("pushed JSON value must be addressable");
+            return json_write_path_tail(
+                next,
+                tail,
+                replacement,
+                mode,
+                &item_path,
+                raw_object_keys,
+            );
+        }
         let Some(next) = values.get_mut(index) else {
             return Ok(());
         };
-        return json_write_path_tail(next, tail, replacement, mode);
+        let item_path = crate::sql::jsonb::array_index_path(current_path, index);
+        return json_write_path_tail(next, tail, replacement, mode, &item_path, raw_object_keys);
     }
 
     Err(DbError::plan("invalid JSON path"))
@@ -12384,6 +17187,61 @@ fn sqlite_ctas_column_dedup_base(name: &str) -> &str {
     base
 }
 
+fn render_column_name_and_declared_type(column: &ColumnDef) -> String {
+    match column.pragma_declared_type() {
+        "" => column.name.clone(),
+        declared_type => format!("{} {}", column.name, declared_type),
+    }
+}
+
+fn sqlite_ctas_declared_type_for_column(column: &ColumnDef) -> Option<String> {
+    let declared_type = column.pragma_declared_type();
+    if declared_type.is_empty() {
+        return None;
+    }
+    match sqlite_declared_type_affinity_name(declared_type) {
+        Some("BLOB") | None => None,
+        Some(name) => Some(name.to_string()),
+    }
+}
+
+fn sqlite_ctas_declared_type_for_column_type(column_type: ColumnType) -> Option<String> {
+    match column_type {
+        ColumnType::Integer => Some("INT".to_string()),
+        ColumnType::Text => Some("TEXT".to_string()),
+        ColumnType::Real => Some("REAL".to_string()),
+        ColumnType::Numeric | ColumnType::Boolean | ColumnType::Any => Some("NUM".to_string()),
+        ColumnType::Blob => None,
+    }
+}
+
+fn sqlite_declared_type_affinity_name(declared_type: &str) -> Option<&'static str> {
+    let normalized = declared_type.trim().to_ascii_uppercase();
+
+    if normalized.contains("INT") {
+        return Some("INT");
+    }
+    if matches!(
+        normalized.as_str(),
+        "CHAR" | "CLOB" | "TEXT" | "VARCHAR" | "NCHAR" | "NVARCHAR"
+    ) || normalized.contains("CHAR")
+        || normalized.contains("CLOB")
+        || normalized.contains("TEXT")
+    {
+        return Some("TEXT");
+    }
+    if normalized.contains("BLOB") || normalized.is_empty() {
+        return Some("BLOB");
+    }
+    if matches!(
+        normalized.as_str(),
+        "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT"
+    ) {
+        return Some("REAL");
+    }
+    Some("NUM")
+}
+
 fn sqlite_ascii_lower(value: &str) -> String {
     value
         .chars()
@@ -12410,6 +17268,10 @@ fn sqlite_ascii_upper(value: &str) -> String {
         .collect()
 }
 
+fn sqlite_text_prefix_before_nul(value: &str) -> &str {
+    value.split('\0').next().unwrap_or(value)
+}
+
 fn sqlite_substr_text(value: &str, start: i64, length: Option<i64>) -> String {
     let characters = value.chars().collect::<Vec<_>>();
     let (begin, end) = sqlite_substr_bounds(characters.len(), start, length);
@@ -12419,6 +17281,17 @@ fn sqlite_substr_text(value: &str, start: i64, length: Option<i64>) -> String {
 fn sqlite_substr_blob(value: &[u8], start: i64, length: Option<i64>) -> Vec<u8> {
     let (begin, end) = sqlite_substr_bounds(value.len(), start, length);
     value[begin..end].to_vec()
+}
+
+fn sqlite_instr_blob(haystack: &[u8], needle: &[u8]) -> i64 {
+    if needle.is_empty() {
+        return 1;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|index| index as i64 + 1)
+        .unwrap_or(0)
 }
 
 fn sqlite_substr_bounds(item_count: usize, start: i64, length: Option<i64>) -> (usize, usize) {
@@ -12435,7 +17308,12 @@ fn sqlite_substr_bounds(item_count: usize, start: i64, length: Option<i64>) -> (
         None => (start_index.clamp(0, len), len),
         Some(length) if length >= 0 => {
             let begin = start_index.clamp(0, len);
-            let end = start_index.saturating_add(length).clamp(0, len);
+            let effective_length = if start == 0 {
+                length.saturating_sub(1)
+            } else {
+                length
+            };
+            let end = start_index.saturating_add(effective_length).clamp(0, len);
             (begin, end)
         }
         Some(length) => {
@@ -12468,7 +17346,13 @@ fn sqlite_text_integer_prefix(value: &str) -> i64 {
     if candidate.is_empty() || matches!(candidate, "+" | "-") {
         0
     } else {
-        candidate.parse::<i64>().unwrap_or(0)
+        candidate.parse::<i64>().unwrap_or_else(|_| {
+            if candidate.starts_with('-') {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        })
     }
 }
 
@@ -12645,14 +17529,87 @@ fn sqlite_rtrim_cmp(left: &str, right: &str) -> Ordering {
     left.trim_end_matches(' ').cmp(right.trim_end_matches(' '))
 }
 
+fn sqlite_header_i32_value(value: u32) -> i64 {
+    i64::from(i32::from_ne_bytes(value.to_ne_bytes()))
+}
+
+fn strict_integer_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Integer(_) => Some(value),
+        Value::Boolean(value) => Some(Value::Integer(i64::from(value))),
+        Value::Real(value) if value.is_finite() && value.fract() == 0.0 => {
+            if value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+                Some(Value::Integer(value as i64))
+            } else {
+                None
+            }
+        }
+        Value::Text(value) => {
+            let trimmed = value.trim();
+            if let Ok(integer) = trimmed.parse::<i64>() {
+                Some(Value::Integer(integer))
+            } else if let Ok(real) = trimmed.parse::<f64>() {
+                if real.is_finite()
+                    && real.fract() == 0.0
+                    && real >= i64::MIN as f64
+                    && real <= i64::MAX as f64
+                {
+                    Some(Value::Integer(real as i64))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn strict_real_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Real(_) => Some(value),
+        Value::Integer(value) => Some(Value::Real(value as f64)),
+        Value::Boolean(value) => Some(Value::Real(if value { 1.0 } else { 0.0 })),
+        Value::Text(value) => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(Value::Real),
+        _ => None,
+    }
+}
+
+fn strict_text_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Text(_) => Some(value),
+        Value::Integer(value) => Some(Value::Text(value.to_string())),
+        Value::Real(value) => Some(Value::Text(value.to_string())),
+        Value::Boolean(value) => Some(Value::Text(if value { "1" } else { "0" }.to_string())),
+        _ => None,
+    }
+}
+
+fn required_pragma_table_function_argument<'a>(
+    name: &str,
+    argument: Option<&'a str>,
+) -> Result<&'a str> {
+    argument.ok_or_else(|| DbError::plan(format!("{name} requires one argument")))
+}
+
 fn plan_writes_database(plan: &Plan) -> bool {
     matches!(
         plan,
         Plan::CreateTable { .. }
             | Plan::CreateTableAs { .. }
+            | Plan::CreateView { .. }
             | Plan::CreateIndex { .. }
             | Plan::DropTable { .. }
+            | Plan::DropView { .. }
             | Plan::DropIndex { .. }
+            | Plan::CreateTrigger { .. }
+            | Plan::DropTrigger { .. }
             | Plan::AlterTable { .. }
             | Plan::Insert { .. }
             | Plan::InsertReturning { .. }
@@ -12689,6 +17646,7 @@ fn plan_writes_database(plan: &Plan) -> bool {
             | Plan::DeleteReturning { .. }
             | Plan::DeleteReturningLimited { .. }
             | Plan::Update { .. }
+            | Plan::UpdateFrom { .. }
             | Plan::UpdateLimited { .. }
             | Plan::UpdateReturning { .. }
             | Plan::UpdateReturningLimited { .. }
@@ -12736,7 +17694,11 @@ fn sqlite_function_list_rows() -> Vec<Row> {
         row("cos", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("count", AGGREGATE, 0, DEFAULT_FLAGS),
         row("count", AGGREGATE, 1, DEFAULT_FLAGS),
+        row("current_date", SCALAR, 0, DEFAULT_FLAGS),
+        row("current_time", SCALAR, 0, DEFAULT_FLAGS),
+        row("current_timestamp", SCALAR, 0, DEFAULT_FLAGS),
         row("date", SCALAR, -1, DETERMINISTIC_FLAGS),
+        row("decimal_sum", AGGREGATE, 1, DETERMINISTIC_FLAGS),
         row("datetime", SCALAR, -1, DETERMINISTIC_FLAGS),
         row("degrees", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("exp", SCALAR, 1, DETERMINISTIC_FLAGS),
@@ -12752,26 +17714,52 @@ fn sqlite_function_list_rows() -> Vec<Row> {
         row("instr", SCALAR, 2, DETERMINISTIC_FLAGS),
         row("julianday", SCALAR, -1, DETERMINISTIC_FLAGS),
         row("json", SCALAR, 1, DETERMINISTIC_FLAGS),
-        row("json_array", SCALAR, -1, DETERMINISTIC_FLAGS),
+        row("jsonb", SCALAR, 1, DETERMINISTIC_FLAGS),
+        row("json_array", SCALAR, -1, 3_147_776),
         row("json_array_length", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("json_array_length", SCALAR, 2, DETERMINISTIC_FLAGS),
         row("json_error_position", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("json_extract", SCALAR, -1, DETERMINISTIC_FLAGS),
-        row("json_insert", SCALAR, -1, DETERMINISTIC_FLAGS),
-        row("json_object", SCALAR, -1, DETERMINISTIC_FLAGS),
+        row("jsonb_extract", SCALAR, -1, DETERMINISTIC_FLAGS),
+        row("json_insert", SCALAR, -1, 3_147_776),
+        row("json_object", SCALAR, -1, 3_147_776),
+        row("jsonb_array", SCALAR, -1, 3_147_776),
+        row("jsonb_object", SCALAR, -1, 3_147_776),
         row("json_patch", SCALAR, 2, DETERMINISTIC_FLAGS),
+        row("jsonb_patch", SCALAR, 2, DETERMINISTIC_FLAGS),
         row("json_pretty", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("json_pretty", SCALAR, 2, DETERMINISTIC_FLAGS),
-        row("json_quote", SCALAR, 1, DETERMINISTIC_FLAGS),
+        row("json_quote", SCALAR, 1, 3_147_776),
         row("json_remove", SCALAR, -1, DETERMINISTIC_FLAGS),
-        row("json_replace", SCALAR, -1, DETERMINISTIC_FLAGS),
-        row("json_set", SCALAR, -1, DETERMINISTIC_FLAGS),
+        row("jsonb_remove", SCALAR, -1, DETERMINISTIC_FLAGS),
+        row("json_replace", SCALAR, -1, 3_147_776),
+        row("jsonb_replace", SCALAR, -1, 3_147_776),
+        row("json_set", SCALAR, -1, 3_147_776),
+        row("jsonb_set", SCALAR, -1, 3_147_776),
+        row("jsonb_insert", SCALAR, -1, 3_147_776),
         row("json_type", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("json_type", SCALAR, 2, DETERMINISTIC_FLAGS),
         row("json_valid", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("json_valid", SCALAR, 2, DETERMINISTIC_FLAGS),
-        row("json_group_array", AGGREGATE, 1, DEFAULT_FLAGS),
-        row("json_group_object", AGGREGATE, 2, DEFAULT_FLAGS),
+        row("json_group_array", AGGREGATE, 1, 3_147_776),
+        row("json_group_object", AGGREGATE, 2, 3_147_776),
+        row("jsonb_group_array", AGGREGATE, 1, 3_147_776),
+        row("jsonb_group_object", AGGREGATE, 2, 3_147_776),
+        row("cume_dist", AGGREGATE, 0, DEFAULT_FLAGS),
+        row("dense_rank", AGGREGATE, 0, DEFAULT_FLAGS),
+        row("first_value", AGGREGATE, 1, DEFAULT_FLAGS),
+        row("lag", AGGREGATE, 1, DEFAULT_FLAGS),
+        row("lag", AGGREGATE, 2, DEFAULT_FLAGS),
+        row("lag", AGGREGATE, 3, DEFAULT_FLAGS),
+        row("last_value", AGGREGATE, 1, DEFAULT_FLAGS),
+        row("lead", AGGREGATE, 1, DEFAULT_FLAGS),
+        row("lead", AGGREGATE, 2, DEFAULT_FLAGS),
+        row("lead", AGGREGATE, 3, DEFAULT_FLAGS),
+        row("nth_value", AGGREGATE, 2, DEFAULT_FLAGS),
+        row("ntile", AGGREGATE, 1, DEFAULT_FLAGS),
+        row("percent_rank", AGGREGATE, 0, DEFAULT_FLAGS),
+        row("rank", AGGREGATE, 0, DEFAULT_FLAGS),
+        row("row_number", AGGREGATE, 0, DEFAULT_FLAGS),
         row("last_insert_rowid", SCALAR, 0, DEFAULT_FLAGS),
         row("length", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("like", SCALAR, 2, DETERMINISTIC_FLAGS),
@@ -12784,6 +17772,7 @@ fn sqlite_function_list_rows() -> Vec<Row> {
         row("log10", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("log2", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("lower", SCALAR, 1, DETERMINISTIC_FLAGS),
+        row("match", SCALAR, 2, 0),
         row("max", AGGREGATE, 1, DEFAULT_FLAGS),
         row("max", SCALAR, -1, DETERMINISTIC_FLAGS),
         row("median", AGGREGATE, 1, DEFAULT_FLAGS),
@@ -12804,6 +17793,7 @@ fn sqlite_function_list_rows() -> Vec<Row> {
         row("random", SCALAR, 0, DEFAULT_FLAGS),
         row("randomblob", SCALAR, 1, DEFAULT_FLAGS),
         row("replace", SCALAR, 3, DETERMINISTIC_FLAGS),
+        row("regexp", SCALAR, 2, DETERMINISTIC_FLAGS),
         row("round", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("round", SCALAR, 2, DETERMINISTIC_FLAGS),
         row("rtrim", SCALAR, 1, DETERMINISTIC_FLAGS),
@@ -12813,6 +17803,7 @@ fn sqlite_function_list_rows() -> Vec<Row> {
         row("sin", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("sqlite_compileoption_get", SCALAR, 1, DEFAULT_FLAGS),
         row("sqlite_compileoption_used", SCALAR, 1, DEFAULT_FLAGS),
+        row("sqlite_log", SCALAR, 2, DETERMINISTIC_FLAGS),
         row("sqlite_source_id", SCALAR, 0, DEFAULT_FLAGS),
         row("sqlite_version", SCALAR, 0, DEFAULT_FLAGS),
         row("sqrt", SCALAR, 1, DETERMINISTIC_FLAGS),
@@ -12822,7 +17813,7 @@ fn sqlite_function_list_rows() -> Vec<Row> {
         row("substr", SCALAR, 3, DETERMINISTIC_FLAGS),
         row("substring", SCALAR, 2, DETERMINISTIC_FLAGS),
         row("substring", SCALAR, 3, DETERMINISTIC_FLAGS),
-        row("subtype", SCALAR, 1, DETERMINISTIC_FLAGS),
+        row("subtype", SCALAR, 1, 3_147_776),
         row("sum", AGGREGATE, 1, DEFAULT_FLAGS),
         row("cosh", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("tan", SCALAR, 1, DETERMINISTIC_FLAGS),
@@ -12840,6 +17831,7 @@ fn sqlite_function_list_rows() -> Vec<Row> {
         row("unlikely", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("unhex", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("unhex", SCALAR, 2, DETERMINISTIC_FLAGS),
+        row("unknown", SCALAR, -1, DETERMINISTIC_FLAGS),
         row("unistr", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("unistr_quote", SCALAR, 1, DETERMINISTIC_FLAGS),
         row("upper", SCALAR, 1, DETERMINISTIC_FLAGS),
@@ -12847,6 +17839,79 @@ fn sqlite_function_list_rows() -> Vec<Row> {
     ];
     rows.sort_by(|left, right| left[0].cmp(&right[0]).then_with(|| left[4].cmp(&right[4])));
     rows
+}
+
+fn supported_pragma_list_rows() -> Vec<Row> {
+    let mut names = vec![
+        "analysis_limit",
+        "application_id",
+        "auto_vacuum",
+        "automatic_index",
+        "busy_timeout",
+        "cache_size",
+        "cache_spill",
+        "case_sensitive_like",
+        "cell_size_check",
+        "checkpoint_fullfsync",
+        "collation_list",
+        "compile_options",
+        "count_changes",
+        "data_version",
+        "database_list",
+        "defer_foreign_keys",
+        "encoding",
+        "empty_result_callbacks",
+        "foreign_key_check",
+        "foreign_key_list",
+        "foreign_keys",
+        "freelist_count",
+        "full_column_names",
+        "fullfsync",
+        "function_list",
+        "hard_heap_limit",
+        "ignore_check_constraints",
+        "index_info",
+        "index_list",
+        "index_xinfo",
+        "incremental_vacuum",
+        "integrity_check",
+        "journal_mode",
+        "journal_size_limit",
+        "locking_mode",
+        "mmap_size",
+        "module_list",
+        "optimize",
+        "max_page_count",
+        "page_count",
+        "page_size",
+        "pragma_list",
+        "query_only",
+        "quick_check",
+        "read_uncommitted",
+        "recursive_triggers",
+        "reverse_unordered_selects",
+        "schema_version",
+        "secure_delete",
+        "short_column_names",
+        "shrink_memory",
+        "soft_heap_limit",
+        "stats",
+        "synchronous",
+        "table_info",
+        "table_list",
+        "table_xinfo",
+        "temp_store",
+        "threads",
+        "trusted_schema",
+        "user_version",
+        "wal_autocheckpoint",
+        "wal_checkpoint",
+    ];
+    names.sort_unstable();
+    names
+        .into_iter()
+        .map(|name| vec![Value::from(name)])
+        .collect()
 }
 
 fn sqlite_compile_option_used(requested: &str) -> bool {
@@ -12863,6 +17928,22 @@ fn sqlite_compile_option_used(requested: &str) -> bool {
 fn sqlite_compile_option_match_key(value: &str) -> String {
     let upper = value.to_ascii_uppercase();
     upper.strip_prefix("SQLITE_").unwrap_or(&upper).to_string()
+}
+
+fn sqlite_min_max_storage_class_rank(value: &Value) -> u8 {
+    match value {
+        Value::Null => 0,
+        Value::Boolean(_) | Value::Integer(_) | Value::Real(_) => 1,
+        Value::Text(_) => 2,
+        Value::Blob(_) => 3,
+    }
+}
+
+fn is_sqlite_trigger_raise_ignore(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Storage(message) if message == "__rustsql_sqlite_trigger_raise_ignore__"
+    )
 }
 
 fn matches_ignore_conflict(or_conflict: Option<&str>, error: &DbError) -> bool {
@@ -12886,6 +17967,22 @@ fn matches_replace_conflict(or_conflict: Option<&str>, error: &DbError) -> bool 
     message.contains("duplicate primary key") || message.contains("unique index")
 }
 
+fn matches_update_fail_conflict(or_conflict: Option<&str>) -> bool {
+    or_conflict.is_some_and(|mode| mode.eq_ignore_ascii_case("FAIL"))
+}
+
+fn matches_fail_conflict(or_conflict: Option<&str>, error: &DbError) -> bool {
+    if !or_conflict.is_some_and(|mode| mode.eq_ignore_ascii_case("FAIL")) {
+        return false;
+    }
+
+    let message = error.to_string();
+    message.contains("cannot be NULL")
+        || message.contains("check constraint")
+        || message.contains("duplicate primary key")
+        || message.contains("unique index")
+}
+
 fn matches_rollback_conflict(or_conflict: Option<&str>, error: &DbError) -> bool {
     if !or_conflict.is_some_and(|mode| mode.eq_ignore_ascii_case("ROLLBACK")) {
         return false;
@@ -12900,6 +17997,83 @@ fn matches_rollback_conflict(or_conflict: Option<&str>, error: &DbError) -> bool
 
 fn autoindex_name(table: &str, ordinal: usize) -> String {
     format!("sqlite_autoindex_{table}_{ordinal}")
+}
+
+fn scalar_expr_contains_expr(haystack: &ScalarExpr, needle: &ScalarExpr) -> bool {
+    if haystack == needle {
+        return true;
+    }
+    match haystack {
+        ScalarExpr::Tuple(values) => values
+            .iter()
+            .any(|value| scalar_expr_contains_expr(value, needle)),
+        ScalarExpr::UnaryPlus(expr)
+        | ScalarExpr::UnaryMinus(expr)
+        | ScalarExpr::BitNot(expr)
+        | ScalarExpr::Not(expr)
+        | ScalarExpr::Cast { expr, .. }
+        | ScalarExpr::Collate { expr, .. }
+        | ScalarExpr::IsBool { expr, .. } => scalar_expr_contains_expr(expr, needle),
+        ScalarExpr::Is { left, right, .. }
+        | ScalarExpr::Compare { left, right, .. }
+        | ScalarExpr::Binary { left, right, .. } => {
+            scalar_expr_contains_expr(left, needle) || scalar_expr_contains_expr(right, needle)
+        }
+        ScalarExpr::InList { expr, values, .. } => {
+            scalar_expr_contains_expr(expr, needle)
+                || values
+                    .iter()
+                    .any(|value| scalar_expr_contains_expr(value, needle))
+        }
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            scalar_expr_contains_expr(expr, needle)
+                || scalar_expr_contains_expr(pattern, needle)
+                || escape
+                    .as_deref()
+                    .is_some_and(|escape| scalar_expr_contains_expr(escape, needle))
+        }
+        ScalarExpr::Glob { expr, pattern, .. } => {
+            scalar_expr_contains_expr(expr, needle) || scalar_expr_contains_expr(pattern, needle)
+        }
+        ScalarExpr::Between {
+            expr, low, high, ..
+        } => {
+            scalar_expr_contains_expr(expr, needle)
+                || scalar_expr_contains_expr(low, needle)
+                || scalar_expr_contains_expr(high, needle)
+        }
+        ScalarExpr::Case {
+            base,
+            when_then_clauses,
+            else_expr,
+        } => {
+            base.as_deref()
+                .is_some_and(|expr| scalar_expr_contains_expr(expr, needle))
+                || when_then_clauses.iter().any(|(when_expr, then_expr)| {
+                    scalar_expr_contains_expr(when_expr, needle)
+                        || scalar_expr_contains_expr(then_expr, needle)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|expr| scalar_expr_contains_expr(expr, needle))
+        }
+        ScalarExpr::Function { args, .. } => args
+            .iter()
+            .any(|arg| scalar_expr_contains_expr(arg, needle)),
+        ScalarExpr::InSubquery { expr, .. } | ScalarExpr::CompareSubquery { left: expr, .. } => {
+            scalar_expr_contains_expr(expr, needle)
+        }
+        ScalarExpr::Literal(_)
+        | ScalarExpr::Column(_)
+        | ScalarExpr::Subquery { .. }
+        | ScalarExpr::WindowFunction { .. }
+        | ScalarExpr::Aggregate { .. } => false,
+    }
 }
 
 fn sqlite_percentile_cont(values: &[f64], fraction: f64) -> f64 {
@@ -12920,4 +18094,14 @@ fn sqlite_percentile_cont(values: &[f64], fraction: f64) -> f64 {
 fn sqlite_percentile_disc(values: &[f64], fraction: f64) -> f64 {
     let index = (fraction * (values.len() as f64 - 1.0)).floor() as usize;
     values[index]
+}
+
+fn update_assignment_columns(assignments: &[Assignment]) -> Vec<String> {
+    let mut columns = Vec::new();
+    for assignment in assignments {
+        if !columns.iter().any(|column| column == &assignment.column) {
+            columns.push(assignment.column.clone());
+        }
+    }
+    columns
 }

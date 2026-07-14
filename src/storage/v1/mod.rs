@@ -46,6 +46,13 @@ struct PersistedState {
 struct ActiveTransaction {
     id: TransactionId,
     snapshot: PersistedState,
+    savepoints: Vec<Savepoint>,
+}
+
+#[derive(Debug, Clone)]
+struct Savepoint {
+    name: String,
+    snapshot: PersistedState,
 }
 
 #[derive(Debug, Clone)]
@@ -394,17 +401,21 @@ impl CatalogStore for FileStorage {
             for row in rows.values() {
                 let mut candidate = row.clone();
                 candidate.push(default_value.clone());
+                let candidate = updated_schema.normalize_strict_row_values(candidate)?;
                 updated_schema.validate_row_values(&candidate)?;
                 updated_schema.validate_check_constraints(&candidate)?;
             }
         }
+        let normalized_schema = updated_schema.clone();
         inner
             .state
             .schemas
             .insert(schema_name.to_string(), updated_schema);
         if let Some(rows) = inner.state.rows.get_mut(schema_name) {
             for row in rows.values_mut() {
-                row.push(default_value.clone());
+                let mut candidate = row.clone();
+                candidate.push(default_value.clone());
+                *row = normalized_schema.normalize_strict_row_values(candidate)?;
             }
         }
         Ok(())
@@ -965,6 +976,7 @@ impl TransactionManager for FileStorage {
         inner.active_txn = Some(ActiveTransaction {
             id: transaction_id,
             snapshot: inner.state.clone(),
+            savepoints: Vec::new(),
         });
         Ok(transaction_id)
     }
@@ -995,6 +1007,62 @@ impl TransactionManager for FileStorage {
 
         inner.state = active.snapshot;
         let _ = txn::clear_active_txn(&self.base);
+        Ok(())
+    }
+
+    fn savepoint(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let snapshot = inner.state.clone();
+        inner
+            .active_txn
+            .as_mut()
+            .expect("validated active transaction")
+            .savepoints
+            .push(Savepoint {
+                name: name.to_string(),
+                snapshot,
+            });
+        Ok(())
+    }
+
+    fn rollback_to_savepoint(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let (savepoint_index, snapshot) = inner
+            .active_txn
+            .as_ref()
+            .and_then(|active| {
+                active
+                    .savepoints
+                    .iter()
+                    .rposition(|savepoint| savepoint.name.eq_ignore_ascii_case(name))
+                    .map(|index| (index, active.savepoints[index].snapshot.clone()))
+            })
+            .ok_or_else(|| DbError::txn(format!("no such savepoint: {name}")))?;
+        inner.state = snapshot;
+        inner
+            .active_txn
+            .as_mut()
+            .expect("validated active transaction")
+            .savepoints
+            .truncate(savepoint_index + 1);
+        Ok(())
+    }
+
+    fn release_savepoint(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let active = inner
+            .active_txn
+            .as_mut()
+            .ok_or_else(|| DbError::txn("no active transaction"))?;
+        let savepoint_index = active
+            .savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| DbError::txn(format!("no such savepoint: {name}")))?;
+        active.savepoints.truncate(savepoint_index);
         Ok(())
     }
 }

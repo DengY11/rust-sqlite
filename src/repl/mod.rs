@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use crate::common::error::{DbError, Result};
 use crate::common::types::{
-    CheckConstraint, CheckExpr, CheckOp, ColumnDef, ColumnDefault, ColumnType, ForeignKey,
-    IndexMeta, PrimaryKeyConstraint, Schema, SortOrder, TableConstraintOrder, Value,
+    CheckConstraint, CheckExpr, CheckOp, ColumnDef, ColumnDefault, ForeignKey, IndexMeta,
+    PrimaryKeyConstraint, Schema, SortOrder, TableConstraintOrder, TrimSide, Value,
 };
 use crate::db::{Database, StatementBatchKind};
 use crate::engine::PlanningStorageEngine;
@@ -345,10 +345,9 @@ fn render_table_constraints(schema: &Schema) -> Vec<String> {
 }
 
 fn render_column_def(schema: &Schema, column: &ColumnDef) -> String {
-    let mut rendered = if matches!(column.column_type, ColumnType::Any) {
-        column.name.clone()
-    } else {
-        format!("{} {}", column.name, column.column_type.name())
+    let mut rendered = match column.pragma_declared_type() {
+        "" => column.name.clone(),
+        declared_type => format!("{} {}", column.name, declared_type),
     };
     if let Some(collation) = &column.collation {
         rendered.push_str(" COLLATE ");
@@ -570,6 +569,17 @@ fn render_check_expr(expr: &CheckExpr) -> String {
                 render_literal(&Value::from(pattern.as_str()))
             )
         }
+        CheckExpr::Regexp {
+            column,
+            pattern,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!(
+                "{column} {not}REGEXP {}",
+                render_literal(&Value::from(pattern.as_str()))
+            )
+        }
         CheckExpr::Like {
             column,
             pattern,
@@ -631,6 +641,387 @@ fn render_check_expr(expr: &CheckExpr) -> String {
         } => {
             let not = if *negated { "" } else { "NOT " };
             format!("{column} IS {not}DISTINCT FROM {}", render_literal(value))
+        }
+        CheckExpr::LengthCompare { column, op, value } => {
+            format!(
+                "length({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::OctetLengthCompare { column, op, value } => {
+            format!(
+                "octet_length({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::UnicodeCompare { column, op, value } => {
+            format!(
+                "unicode({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::UnicodeIsNull { column, negated } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("unicode({column}) IS {not}NULL")
+        }
+        CheckExpr::SignCompare { column, op, value } => {
+            format!(
+                "sign({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::HexCompare { column, op, value } => {
+            format!(
+                "hex({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::QuoteCompare { column, op, value } => {
+            format!(
+                "quote({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::NullIfIsNull {
+            column,
+            value,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("nullif({column}, {}) IS {not}NULL", render_literal(value))
+        }
+        CheckExpr::ReplaceCompare {
+            column,
+            pattern,
+            replacement,
+            op,
+            value,
+        } => {
+            format!(
+                "replace({column}, {}, {}) {} {}",
+                render_literal(&Value::from(pattern.as_str())),
+                render_literal(&Value::from(replacement.as_str())),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::ReplaceColumnCompare {
+            column,
+            pattern,
+            replacement,
+            op,
+        } => {
+            format!(
+                "replace({column}, {}, {}) {} {column}",
+                render_literal(&Value::from(pattern.as_str())),
+                render_literal(&Value::from(replacement.as_str())),
+                render_check_op(*op)
+            )
+        }
+        CheckExpr::RoundCompare {
+            column,
+            precision,
+            op,
+            value,
+        } => {
+            let args = precision
+                .map(|precision| format!(", {precision}"))
+                .unwrap_or_default();
+            format!(
+                "round({column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::RoundingCompare {
+            column,
+            func,
+            op,
+            value,
+        } => {
+            format!(
+                "{}({column}) {} {}",
+                func.sql_name(),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::CastCompare {
+            column,
+            target_type,
+            op,
+            value,
+        } => {
+            format!(
+                "CAST({column} AS {}) {} {}",
+                target_type.name(),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::MinMaxColumnCompare {
+            column,
+            limit,
+            min,
+            op,
+        } => {
+            let func = if *min { "min" } else { "max" };
+            format!(
+                "{func}({column}, {}) {} {column}",
+                render_literal(limit),
+                render_check_op(*op)
+            )
+        }
+        CheckExpr::ConcatCompare {
+            column,
+            suffix,
+            op,
+            value,
+        } => {
+            let args = suffix
+                .iter()
+                .map(|value| format!(", {}", render_literal(value)))
+                .collect::<String>();
+            format!(
+                "concat({column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::ConcatWsCompare {
+            column,
+            separator,
+            suffix,
+            op,
+            value,
+        } => {
+            let separator = separator
+                .as_ref()
+                .map(|separator| render_literal(&Value::from(separator.as_str())))
+                .unwrap_or_else(|| render_literal(&Value::Null));
+            let args = suffix
+                .iter()
+                .map(|value| format!(", {}", render_literal(value)))
+                .collect::<String>();
+            format!(
+                "concat_ws({separator}, {column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::JsonValidCompare {
+            column,
+            flags,
+            compare,
+        } => {
+            let args = flags.map(|flags| format!(", {flags}")).unwrap_or_default();
+            let expr = format!("json_valid({column}{args})");
+            if let Some((op, value)) = compare {
+                format!("{expr} {} {}", render_check_op(*op), render_literal(value))
+            } else {
+                expr
+            }
+        }
+        CheckExpr::AbsCompare { column, op, value } => {
+            format!(
+                "abs({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::UnaryMathCompare {
+            column,
+            func,
+            op,
+            value,
+        } => {
+            format!(
+                "{}({column}) {} {}",
+                func.sql_name(),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::BinaryMathCompare {
+            column,
+            func,
+            argument,
+            column_is_second,
+            op,
+            value,
+        } => {
+            let rendered_argument = render_literal(argument);
+            let args = if *column_is_second {
+                format!("{rendered_argument}, {column}")
+            } else {
+                format!("{column}, {rendered_argument}")
+            };
+            format!(
+                "{}({args}) {} {}",
+                func.sql_name(),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::ArithmeticCompare {
+            column,
+            addend,
+            op,
+            value,
+        } => {
+            format!(
+                "({column} + {}) {} {}",
+                render_literal(addend),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::MultiplyCompare {
+            column,
+            factor,
+            op,
+            value,
+        } => {
+            format!(
+                "({column} * {}) {} {}",
+                render_literal(factor),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::DivideCompare {
+            column,
+            divisor,
+            op,
+            value,
+        } => {
+            format!(
+                "({column} / {}) {} {}",
+                render_literal(divisor),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::ModuloCompare {
+            column,
+            divisor,
+            op,
+            value,
+            function_form,
+        } => {
+            let expr = if *function_form {
+                format!("mod({column}, {})", render_literal(divisor))
+            } else {
+                format!("({column} % {})", render_literal(divisor))
+            };
+            format!("{expr} {} {}", render_check_op(*op), render_literal(value))
+        }
+        CheckExpr::TypeOfCompare { column, op, value } => {
+            format!(
+                "typeof({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::NoCaseCompare {
+            column,
+            collation,
+            op,
+            value,
+        } => {
+            format!(
+                "{column} COLLATE {collation} {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::CaseFoldCompare {
+            column,
+            upper,
+            op,
+            value,
+        } => {
+            let func = if *upper { "upper" } else { "lower" };
+            format!(
+                "{func}({column}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::TrimCompare {
+            column,
+            side,
+            characters,
+            op,
+            value,
+        } => {
+            let func = match side {
+                TrimSide::Both => "trim",
+                TrimSide::Start => "ltrim",
+                TrimSide::End => "rtrim",
+            };
+            let args = characters
+                .as_ref()
+                .map(|characters| {
+                    format!(", {}", render_literal(&Value::from(characters.as_str())))
+                })
+                .unwrap_or_default();
+            format!(
+                "{func}({column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::CoalesceCompare {
+            column,
+            fallbacks,
+            op,
+            value,
+        } => {
+            let args = fallbacks
+                .iter()
+                .map(|fallback| format!(", {}", render_literal(fallback)))
+                .collect::<String>();
+            format!(
+                "coalesce({column}{args}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::InstrCompare {
+            column,
+            needle,
+            op,
+            value,
+        } => {
+            format!(
+                "instr({column}, {}) {} {}",
+                render_literal(needle),
+                render_check_op(*op),
+                render_literal(value)
+            )
+        }
+        CheckExpr::SubstrCompare {
+            column,
+            start,
+            length,
+            op,
+            value,
+        } => {
+            let length = length
+                .map(|length| format!(", {length}"))
+                .unwrap_or_default();
+            format!(
+                "substr({column}, {start}{length}) {} {}",
+                render_check_op(*op),
+                render_literal(value)
+            )
         }
         CheckExpr::And(left, right) => {
             format!(
@@ -731,6 +1122,7 @@ fn infer_headers(statements: &[Statement], row_width: usize) -> Vec<String> {
                     match func {
                         crate::sql::ast::AggregateFunc::Count => "COUNT",
                         crate::sql::ast::AggregateFunc::Sum => "SUM",
+                        crate::sql::ast::AggregateFunc::DecimalSum => "DECIMAL_SUM",
                         crate::sql::ast::AggregateFunc::Avg => "AVG",
                         crate::sql::ast::AggregateFunc::Total => "TOTAL",
                         crate::sql::ast::AggregateFunc::Median => "MEDIAN",
@@ -739,7 +1131,9 @@ fn infer_headers(statements: &[Statement], row_width: usize) -> Vec<String> {
                         crate::sql::ast::AggregateFunc::PercentileDisc => "PERCENTILE_DISC",
                         crate::sql::ast::AggregateFunc::GroupConcat => "GROUP_CONCAT",
                         crate::sql::ast::AggregateFunc::JsonGroupArray => "JSON_GROUP_ARRAY",
+                        crate::sql::ast::AggregateFunc::JsonbGroupArray => "JSONB_GROUP_ARRAY",
                         crate::sql::ast::AggregateFunc::JsonGroupObject => "JSON_GROUP_OBJECT",
+                        crate::sql::ast::AggregateFunc::JsonbGroupObject => "JSONB_GROUP_OBJECT",
                         crate::sql::ast::AggregateFunc::Min => "MIN",
                         crate::sql::ast::AggregateFunc::Max => "MAX",
                     },
@@ -790,6 +1184,7 @@ fn scalar_expr_label(expr: &crate::sql::ast::ScalarExpr) -> String {
     match expr {
         crate::sql::ast::ScalarExpr::Literal(value) => value.to_string(),
         crate::sql::ast::ScalarExpr::Column(name) => name.clone(),
+        crate::sql::ast::ScalarExpr::UnaryPlus(expr) => format!("+{}", scalar_expr_label(expr)),
         crate::sql::ast::ScalarExpr::UnaryMinus(expr) => format!("-{}", scalar_expr_label(expr)),
         crate::sql::ast::ScalarExpr::BitNot(expr) => format!("~{}", scalar_expr_label(expr)),
         crate::sql::ast::ScalarExpr::Not(expr) => format!("NOT {}", scalar_expr_label(expr)),
@@ -849,13 +1244,13 @@ fn scalar_expr_label(expr: &crate::sql::ast::ScalarExpr) -> String {
             escape,
             negated,
         } => format!(
-            "{} {}LIKE '{}'{}",
+            "{} {}LIKE {}{}",
             scalar_expr_label(expr),
             if *negated { "NOT " } else { "" },
-            pattern,
+            scalar_expr_label(pattern),
             escape
                 .as_ref()
-                .map(|escape| format!(" ESCAPE '{}'", escape.replace('\'', "''")))
+                .map(|escape| format!(" ESCAPE {}", scalar_expr_label(escape)))
                 .unwrap_or_default()
         ),
         crate::sql::ast::ScalarExpr::Glob {
@@ -863,10 +1258,10 @@ fn scalar_expr_label(expr: &crate::sql::ast::ScalarExpr) -> String {
             pattern,
             negated,
         } => format!(
-            "{} {}GLOB '{}'",
+            "{} {}GLOB {}",
             scalar_expr_label(expr),
             if *negated { "NOT " } else { "" },
-            pattern
+            scalar_expr_label(pattern)
         ),
         crate::sql::ast::ScalarExpr::Between {
             expr,
@@ -979,6 +1374,7 @@ fn scalar_expr_label(expr: &crate::sql::ast::ScalarExpr) -> String {
                     "SQLITE_COMPILEOPTION_USED"
                 }
                 crate::sql::ast::ScalarFunc::SqliteCompileOptionGet => "SQLITE_COMPILEOPTION_GET",
+                crate::sql::ast::ScalarFunc::SqliteLog => "SQLITE_LOG",
                 crate::sql::ast::ScalarFunc::Likely => "LIKELY",
                 crate::sql::ast::ScalarFunc::Unlikely => "UNLIKELY",
                 crate::sql::ast::ScalarFunc::Likelihood => "LIKELIHOOD",
@@ -1020,6 +1416,8 @@ fn scalar_expr_label(expr: &crate::sql::ast::ScalarExpr) -> String {
                 crate::sql::ast::ScalarFunc::Replace => "REPLACE",
                 crate::sql::ast::ScalarFunc::LikeFunc => "LIKE",
                 crate::sql::ast::ScalarFunc::GlobFunc => "GLOB",
+                crate::sql::ast::ScalarFunc::RegexpFunc => "REGEXP",
+                crate::sql::ast::ScalarFunc::MatchFunc => "MATCH",
                 crate::sql::ast::ScalarFunc::Quote => "QUOTE",
                 crate::sql::ast::ScalarFunc::Unicode => "UNICODE",
                 crate::sql::ast::ScalarFunc::Trim => "TRIM",
@@ -1033,27 +1431,38 @@ fn scalar_expr_label(expr: &crate::sql::ast::ScalarExpr) -> String {
                 crate::sql::ast::ScalarFunc::Coalesce => "COALESCE",
                 crate::sql::ast::ScalarFunc::IfNull => "IFNULL",
                 crate::sql::ast::ScalarFunc::NullIf => "NULLIF",
+                crate::sql::ast::ScalarFunc::Unknown => "UNKNOWN",
                 crate::sql::ast::ScalarFunc::Json => "JSON",
+                crate::sql::ast::ScalarFunc::Jsonb => "JSONB",
                 crate::sql::ast::ScalarFunc::JsonValid => "JSON_VALID",
                 crate::sql::ast::ScalarFunc::JsonErrorPosition => "JSON_ERROR_POSITION",
                 crate::sql::ast::ScalarFunc::JsonPretty => "JSON_PRETTY",
                 crate::sql::ast::ScalarFunc::JsonQuote => "JSON_QUOTE",
                 crate::sql::ast::ScalarFunc::JsonExtract => "JSON_EXTRACT",
+                crate::sql::ast::ScalarFunc::JsonbExtract => "JSONB_EXTRACT",
                 crate::sql::ast::ScalarFunc::JsonType => "JSON_TYPE",
                 crate::sql::ast::ScalarFunc::JsonArray => "JSON_ARRAY",
+                crate::sql::ast::ScalarFunc::JsonbArray => "JSONB_ARRAY",
                 crate::sql::ast::ScalarFunc::JsonObject => "JSON_OBJECT",
+                crate::sql::ast::ScalarFunc::JsonbObject => "JSONB_OBJECT",
                 crate::sql::ast::ScalarFunc::JsonArrayLength => "JSON_ARRAY_LENGTH",
                 crate::sql::ast::ScalarFunc::JsonRemove => "JSON_REMOVE",
+                crate::sql::ast::ScalarFunc::JsonbRemove => "JSONB_REMOVE",
                 crate::sql::ast::ScalarFunc::JsonSet => "JSON_SET",
+                crate::sql::ast::ScalarFunc::JsonbSet => "JSONB_SET",
                 crate::sql::ast::ScalarFunc::JsonInsert => "JSON_INSERT",
+                crate::sql::ast::ScalarFunc::JsonbInsert => "JSONB_INSERT",
                 crate::sql::ast::ScalarFunc::JsonReplace => "JSON_REPLACE",
+                crate::sql::ast::ScalarFunc::JsonbReplace => "JSONB_REPLACE",
                 crate::sql::ast::ScalarFunc::JsonPatch => "JSON_PATCH",
+                crate::sql::ast::ScalarFunc::JsonbPatch => "JSONB_PATCH",
             },
             args.iter()
                 .map(scalar_expr_label)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        crate::sql::ast::ScalarExpr::WindowFunction { .. } => "ROW_NUMBER()".to_string(),
         crate::sql::ast::ScalarExpr::Aggregate { func, arg, .. } => {
             aggregate_expr_label(*func, arg)
         }
@@ -1077,6 +1486,7 @@ fn aggregate_expr_label(
         match func {
             crate::sql::ast::AggregateFunc::Count => "COUNT",
             crate::sql::ast::AggregateFunc::Sum => "SUM",
+            crate::sql::ast::AggregateFunc::DecimalSum => "DECIMAL_SUM",
             crate::sql::ast::AggregateFunc::Avg => "AVG",
             crate::sql::ast::AggregateFunc::Total => "TOTAL",
             crate::sql::ast::AggregateFunc::Median => "MEDIAN",
@@ -1085,7 +1495,9 @@ fn aggregate_expr_label(
             crate::sql::ast::AggregateFunc::PercentileDisc => "PERCENTILE_DISC",
             crate::sql::ast::AggregateFunc::GroupConcat => "GROUP_CONCAT",
             crate::sql::ast::AggregateFunc::JsonGroupArray => "JSON_GROUP_ARRAY",
+            crate::sql::ast::AggregateFunc::JsonbGroupArray => "JSONB_GROUP_ARRAY",
             crate::sql::ast::AggregateFunc::JsonGroupObject => "JSON_GROUP_OBJECT",
+            crate::sql::ast::AggregateFunc::JsonbGroupObject => "JSONB_GROUP_OBJECT",
             crate::sql::ast::AggregateFunc::Min => "MIN",
             crate::sql::ast::AggregateFunc::Max => "MAX",
         },

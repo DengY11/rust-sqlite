@@ -5,8 +5,8 @@ use crate::common::types::{ColumnDef, ColumnType, IndexMeta, Schema, Value};
 use crate::sql::ast::{
     AggregateArg, AggregateFunc, AlterTableAction, Assignment, CompareOp, CompoundOperator,
     CteBody, Expr, FromItem, IsolationLevel, NullOrder, OrderBy, OrderByExpr,
-    SINGLE_ROW_SOURCE_TABLE, ScalarExpr, SelectItem, SelectStatement, Statement, UpsertClause,
-    WithClause,
+    SINGLE_ROW_SOURCE_TABLE, ScalarExpr, SelectItem, SelectStatement, Statement, TableIndexHint,
+    UpsertClause, WindowFunc, WithClause,
 };
 use crate::sql::parser::parse_scalar_sql_expression;
 use crate::sql::plan::{JoinPlan, Plan};
@@ -58,6 +58,10 @@ struct LoweredCte {
 
 type CteRegistry = HashMap<String, LoweredCte>;
 
+fn temp_table_name(name: &str) -> String {
+    format!("__rustsql_temp__{name}")
+}
+
 impl PlanningContext {
     #[must_use]
     pub fn new(schemas: HashMap<String, Schema>, indexes: HashMap<String, Vec<IndexMeta>>) -> Self {
@@ -72,8 +76,21 @@ impl PlanningContext {
         self.indexes.get(table).map_or(&[], Vec::as_slice)
     }
 
+    fn resolved_table_name(&self, name: &str, schema: Option<&str>) -> String {
+        match schema {
+            Some(schema) if schema.eq_ignore_ascii_case("temp") => temp_table_name(name),
+            Some(schema) if schema.eq_ignore_ascii_case("main") => name.to_string(),
+            Some(_) => name.to_string(),
+            None if self.schema(&temp_table_name(name)).is_some() => temp_table_name(name),
+            None => name.to_string(),
+        }
+    }
+
     fn sqlite_catalog_schema(table: &str) -> Option<Schema> {
-        if !matches!(table, "sqlite_master" | "sqlite_schema") {
+        if !matches!(
+            table,
+            "sqlite_master" | "sqlite_schema" | "sqlite_temp_master" | "sqlite_temp_schema"
+        ) {
             return None;
         }
         Some(Schema::new(
@@ -124,33 +141,111 @@ impl Planner {
                 strict,
                 without_rowid,
                 if_not_exists,
+                temporary,
             } => Ok(Plan::CreateTable {
-                name: name.clone(),
+                name: if *temporary {
+                    temp_table_name(name)
+                } else {
+                    name.clone()
+                },
                 columns: columns.clone(),
                 constraints: constraints.clone(),
                 strict: *strict,
                 without_rowid: *without_rowid,
                 if_not_exists: *if_not_exists,
+                temporary: *temporary,
             }),
             Statement::CreateTableAs {
                 name,
                 if_not_exists,
                 select,
+                temporary,
             } => {
-                if context.schema(name).is_some() {
+                let storage_name = if *temporary {
+                    temp_table_name(name)
+                } else {
+                    name.clone()
+                };
+                if context.schema(&storage_name).is_some() {
                     if *if_not_exists {
                         return Ok(Plan::NoOp);
                     }
                     return Err(DbError::plan(format!("table {name} already exists")));
                 }
                 Ok(Plan::CreateTableAs {
-                    name: name.clone(),
+                    name: storage_name,
                     if_not_exists: *if_not_exists,
                     source: Box::new(self.plan_select(select, context)?),
+                    temporary: *temporary,
+                })
+            }
+            Statement::CreateTableAsValues {
+                name,
+                if_not_exists,
+                with,
+                rows,
+                temporary,
+            } => {
+                let storage_name = if *temporary {
+                    temp_table_name(name)
+                } else {
+                    name.clone()
+                };
+                if context.schema(&storage_name).is_some() {
+                    if *if_not_exists {
+                        return Ok(Plan::NoOp);
+                    }
+                    return Err(DbError::plan(format!("table {name} already exists")));
+                }
+                let rows = if let Some(with) = with {
+                    let ctes = self.cte_registry_from_with(with)?;
+                    self.lower_cte_value_rows(rows, &ctes)?
+                } else {
+                    rows.clone()
+                };
+                Ok(Plan::CreateTableAs {
+                    name: storage_name,
+                    if_not_exists: *if_not_exists,
+                    source: Box::new(Plan::Values { rows }),
+                    temporary: *temporary,
+                })
+            }
+            Statement::CreateView {
+                name,
+                columns: view_columns,
+                if_not_exists,
+                select,
+                temporary,
+            } => {
+                let storage_name = if *temporary {
+                    temp_table_name(name)
+                } else {
+                    name.clone()
+                };
+                if context.schema(&storage_name).is_some() {
+                    if *if_not_exists {
+                        return Ok(Plan::NoOp);
+                    }
+                    return Err(DbError::plan(format!("view {name} already exists")));
+                }
+                let columns = match self.view_output_schema(select, context) {
+                    Ok(columns) => {
+                        self.apply_view_column_names_for_create(columns, view_columns.as_ref())
+                    }
+                    Err(_) => self.fallback_view_output_schema(select, view_columns.as_ref()),
+                };
+                Ok(Plan::CreateView {
+                    name: storage_name,
+                    columns,
+                    view_columns: view_columns.clone(),
+                    select: select.clone(),
+                    create_sql: self.render_create_view_sql(name, view_columns.as_ref(), select),
+                    temporary: *temporary,
                 })
             }
             Statement::CreateIndex {
                 name,
+                schema,
                 table,
                 columns,
                 decorated_columns,
@@ -158,13 +253,14 @@ impl Planner {
                 predicate,
                 if_not_exists,
             } => {
-                let schema = self.require_schema(context, table)?;
+                let storage_table = context.resolved_table_name(table, schema.as_deref());
+                let schema = self.require_schema(context, &storage_table)?;
                 if columns.is_empty() {
                     return Err(DbError::plan("index must define at least one column"));
                 }
                 let mut seen = std::collections::BTreeSet::new();
                 for column in columns {
-                    self.require_index_term(schema, table, column)?;
+                    self.require_index_term(schema, &storage_table, column)?;
                     if !seen.insert(column.clone()) {
                         return Err(DbError::plan(format!(
                             "duplicate index column name: {column}"
@@ -174,7 +270,7 @@ impl Planner {
 
                 Ok(Plan::CreateIndex {
                     name: name.clone(),
-                    table: table.clone(),
+                    table: storage_table,
                     columns: columns.clone(),
                     decorated_columns: decorated_columns.clone(),
                     unique: *unique,
@@ -182,40 +278,106 @@ impl Planner {
                     if_not_exists: *if_not_exists,
                 })
             }
-            Statement::DropTable { name, if_exists } => {
-                if context.schema(name).is_none() {
-                    return if *if_exists {
-                        Ok(Plan::NoOp)
-                    } else {
-                        Err(DbError::plan(format!("unknown table: {name}")))
-                    };
+            Statement::CreateTrigger {
+                name,
+                schema,
+                table,
+                sql,
+                if_not_exists,
+            } => Ok(Plan::CreateTrigger {
+                name: context.resolved_table_name(name, schema.as_deref()),
+                table: context.resolved_table_name(table, schema.as_deref()),
+                sql: sql.clone(),
+                if_not_exists: *if_not_exists,
+            }),
+            Statement::DropTable {
+                name,
+                schema,
+                if_exists,
+            } => {
+                let storage_name = context.resolved_table_name(name, schema.as_deref());
+                match context.schema(&storage_name) {
+                    None => {
+                        return if *if_exists {
+                            Ok(Plan::NoOp)
+                        } else {
+                            Err(DbError::plan(format!("unknown table: {name}")))
+                        };
+                    }
+                    Some(schema) if schema.is_view() => {
+                        return Err(DbError::plan(format!(
+                            "use DROP VIEW to delete view {name}"
+                        )));
+                    }
+                    Some(_) => {}
                 }
                 Ok(Plan::DropTable {
-                    name: name.clone(),
+                    name: storage_name,
                     if_exists: *if_exists,
                 })
             }
-            Statement::DropIndex { name, if_exists } => {
-                let table = match self.resolve_index_table(context, name) {
-                    Ok(table) => table,
-                    Err(error)
-                        if *if_exists
-                            && error.to_string()
-                                == format!("plan error: unknown index: {name}") =>
-                    {
-                        return Ok(Plan::NoOp);
+            Statement::DropView {
+                name,
+                schema,
+                if_exists,
+            } => {
+                let storage_name = context.resolved_table_name(name, schema.as_deref());
+                match context.schema(&storage_name) {
+                    None => {
+                        return if *if_exists {
+                            Ok(Plan::NoOp)
+                        } else {
+                            Err(DbError::plan(format!("unknown view: {name}")))
+                        };
                     }
-                    Err(error) => return Err(error),
-                };
+                    Some(schema) if !schema.is_view() => {
+                        return Err(DbError::plan(format!(
+                            "use DROP TABLE to delete table {name}"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+                Ok(Plan::DropView {
+                    name: storage_name,
+                    if_exists: *if_exists,
+                })
+            }
+            Statement::DropIndex {
+                name,
+                schema,
+                if_exists,
+            } => {
+                let table =
+                    match self.resolve_index_table_in_schema(context, name, schema.as_deref()) {
+                        Ok(table) => table,
+                        Err(error)
+                            if *if_exists
+                                && error.to_string()
+                                    == format!("plan error: unknown index: {name}") =>
+                        {
+                            return Ok(Plan::NoOp);
+                        }
+                        Err(error) => return Err(error),
+                    };
                 Ok(Plan::DropIndex {
                     table,
                     name: name.clone(),
                     if_exists: *if_exists,
                 })
             }
-            Statement::AlterTable { table, action } => {
-                self.plan_alter_table(table, action, context)
-            }
+            Statement::DropTrigger {
+                name,
+                schema,
+                if_exists,
+            } => Ok(Plan::DropTrigger {
+                name: context.resolved_table_name(name, schema.as_deref()),
+                if_exists: *if_exists,
+            }),
+            Statement::AlterTable {
+                table,
+                schema,
+                action,
+            } => self.plan_alter_table(table, schema.as_deref(), action, context),
             Statement::Insert {
                 table,
                 columns,
@@ -580,19 +742,32 @@ impl Planner {
             ),
             Statement::Delete {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
-            } => self.plan_delete(table, table_alias.as_deref(), filter, context),
+            } => self.plan_delete(
+                table,
+                schema.as_deref(),
+                table_alias.as_deref(),
+                index_hint.as_ref(),
+                filter,
+                context,
+            ),
             Statement::DeleteLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
                 order_by,
                 limit,
                 offset,
             } => self.plan_delete_limited(
                 table,
+                schema.as_deref(),
                 table_alias.as_deref(),
+                index_hint.as_ref(),
                 filter,
                 order_by,
                 *limit,
@@ -601,12 +776,16 @@ impl Planner {
             ),
             Statement::DeleteReturning {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
                 returning,
             } => self.plan_delete_returning(
                 table,
+                schema.as_deref(),
                 table_alias.as_deref(),
+                index_hint.as_ref(),
                 filter,
                 returning,
                 &[],
@@ -616,7 +795,9 @@ impl Planner {
             ),
             Statement::DeleteReturningLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
                 returning,
                 order_by,
@@ -624,7 +805,9 @@ impl Planner {
                 offset,
             } => self.plan_delete_returning(
                 table,
+                schema.as_deref(),
                 table_alias.as_deref(),
+                index_hint.as_ref(),
                 filter,
                 returning,
                 order_by,
@@ -634,49 +817,121 @@ impl Planner {
             ),
             Statement::Update {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from,
                 filter,
-            } => self.plan_update(table, table_alias.as_deref(), assignments, filter, context),
+            } => self.plan_update(
+                table,
+                schema.as_deref(),
+                table_alias.as_deref(),
+                index_hint.as_ref(),
+                or_conflict.as_deref(),
+                assignments,
+                from.as_ref(),
+                filter,
+                context,
+            ),
             Statement::UpdateLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from,
                 filter,
                 order_by,
                 limit,
                 offset,
-            } => self.plan_update_limited(
-                table,
-                table_alias.as_deref(),
-                assignments,
-                filter,
-                order_by,
-                *limit,
-                *offset,
-                context,
-            ),
+            } => {
+                if let Some(from) = from.as_ref() {
+                    self.plan_update_from(
+                        table,
+                        schema.as_deref(),
+                        table_alias.as_deref(),
+                        index_hint.as_ref(),
+                        or_conflict.as_deref(),
+                        assignments,
+                        from,
+                        filter,
+                        None,
+                        order_by,
+                        *limit,
+                        *offset,
+                        context,
+                    )
+                } else {
+                    self.plan_update_limited(
+                        table,
+                        schema.as_deref(),
+                        table_alias.as_deref(),
+                        index_hint.as_ref(),
+                        or_conflict.as_deref(),
+                        assignments,
+                        filter,
+                        order_by,
+                        *limit,
+                        *offset,
+                        context,
+                    )
+                }
+            }
             Statement::UpdateReturning {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from,
                 filter,
                 returning,
-            } => self.plan_update_returning(
-                table,
-                table_alias.as_deref(),
-                assignments,
-                filter,
-                returning,
-                &[],
-                None,
-                None,
-                context,
-            ),
+            } => {
+                if let Some(from) = from.as_ref() {
+                    self.plan_update_from(
+                        table,
+                        schema.as_deref(),
+                        table_alias.as_deref(),
+                        index_hint.as_ref(),
+                        or_conflict.as_deref(),
+                        assignments,
+                        from,
+                        filter,
+                        Some(returning),
+                        &[],
+                        None,
+                        None,
+                        context,
+                    )
+                } else {
+                    self.plan_update_returning(
+                        table,
+                        schema.as_deref(),
+                        table_alias.as_deref(),
+                        index_hint.as_ref(),
+                        or_conflict.as_deref(),
+                        assignments,
+                        filter,
+                        returning,
+                        &[],
+                        None,
+                        None,
+                        context,
+                    )
+                }
+            }
             Statement::UpdateReturningLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from: _,
                 filter,
                 returning,
                 order_by,
@@ -684,7 +939,10 @@ impl Planner {
                 offset,
             } => self.plan_update_returning(
                 table,
+                schema.as_deref(),
                 table_alias.as_deref(),
+                index_hint.as_ref(),
+                or_conflict.as_deref(),
                 assignments,
                 filter,
                 returning,
@@ -705,34 +963,45 @@ impl Planner {
                 plan: Box::new(self.plan_statement(statement, context)?),
             }),
             Statement::Analyze | Statement::Reindex | Statement::Vacuum => Ok(Plan::NoOp),
-            Statement::PragmaTableInfo { table } => Ok(Plan::PragmaTableInfo {
+            Statement::PragmaTableInfo { table, schema } => Ok(Plan::PragmaTableInfo {
                 table: table.clone(),
+                schema: schema.clone(),
             }),
-            Statement::PragmaTableXInfo { table } => Ok(Plan::PragmaTableXInfo {
+            Statement::PragmaTableXInfo { table, schema } => Ok(Plan::PragmaTableXInfo {
                 table: table.clone(),
+                schema: schema.clone(),
             }),
             Statement::PragmaTableList { table, schema } => Ok(Plan::PragmaTableList {
                 table: table.clone(),
                 schema: schema.clone(),
             }),
-            Statement::PragmaIndexList { table } => Ok(Plan::PragmaIndexList {
+            Statement::PragmaIndexList { table, schema } => Ok(Plan::PragmaIndexList {
                 table: table.clone(),
+                schema: schema.clone(),
             }),
-            Statement::PragmaIndexInfo { index } => Ok(Plan::PragmaIndexInfo {
+            Statement::PragmaIndexInfo { index, schema } => Ok(Plan::PragmaIndexInfo {
                 index: index.clone(),
+                schema: schema.clone(),
             }),
-            Statement::PragmaIndexXInfo { index } => Ok(Plan::PragmaIndexXInfo {
+            Statement::PragmaIndexXInfo { index, schema } => Ok(Plan::PragmaIndexXInfo {
                 index: index.clone(),
+                schema: schema.clone(),
             }),
-            Statement::PragmaForeignKeyList { table } => Ok(Plan::PragmaForeignKeyList {
+            Statement::PragmaForeignKeyList { table, schema } => Ok(Plan::PragmaForeignKeyList {
                 table: table.clone(),
+                schema: schema.clone(),
             }),
-            Statement::PragmaForeignKeyCheck { table } => Ok(Plan::PragmaForeignKeyCheck {
+            Statement::PragmaForeignKeyCheck { table, schema } => Ok(Plan::PragmaForeignKeyCheck {
                 table: table.clone(),
+                schema: schema.clone(),
             }),
             Statement::PragmaForeignKeys => Ok(Plan::PragmaForeignKeys),
             Statement::SetPragmaForeignKeys { enabled } => {
                 Ok(Plan::SetPragmaForeignKeys { enabled: *enabled })
+            }
+            Statement::PragmaDeferForeignKeys => Ok(Plan::PragmaDeferForeignKeys),
+            Statement::SetPragmaDeferForeignKeys { enabled } => {
+                Ok(Plan::SetPragmaDeferForeignKeys { enabled: *enabled })
             }
             Statement::PragmaReadUncommitted => Ok(Plan::PragmaReadUncommitted),
             Statement::SetPragmaReadUncommitted { enabled } => {
@@ -741,6 +1010,10 @@ impl Planner {
             Statement::PragmaQueryOnly => Ok(Plan::PragmaQueryOnly),
             Statement::SetPragmaQueryOnly { enabled } => {
                 Ok(Plan::SetPragmaQueryOnly { enabled: *enabled })
+            }
+            Statement::PragmaCountChanges => Ok(Plan::PragmaCountChanges),
+            Statement::SetPragmaCountChanges { enabled } => {
+                Ok(Plan::SetPragmaCountChanges { enabled: *enabled })
             }
             Statement::PragmaRecursiveTriggers => Ok(Plan::PragmaRecursiveTriggers),
             Statement::SetPragmaRecursiveTriggers { enabled } => {
@@ -755,26 +1028,120 @@ impl Planner {
                 Ok(Plan::SetPragmaIgnoreCheckConstraints { enabled: *enabled })
             }
             Statement::PragmaEncoding => Ok(Plan::PragmaEncoding),
+            Statement::SetPragmaEncoding => Ok(Plan::SetPragmaEncoding),
             Statement::PragmaCollationList => Ok(Plan::PragmaCollationList),
             Statement::PragmaDataVersion => Ok(Plan::PragmaDataVersion),
             Statement::PragmaQuickCheck => Ok(Plan::PragmaQuickCheck),
             Statement::PragmaIntegrityCheck => Ok(Plan::PragmaIntegrityCheck),
             Statement::PragmaFunctionList => Ok(Plan::PragmaFunctionList),
             Statement::PragmaCompileOptions => Ok(Plan::PragmaCompileOptions),
-            Statement::PragmaJournalMode => Ok(Plan::PragmaJournalMode),
-            Statement::PragmaSynchronous => Ok(Plan::PragmaSynchronous),
-            Statement::PragmaCacheSize => Ok(Plan::PragmaCacheSize),
-            Statement::SetPragmaCacheSize { value } => {
-                Ok(Plan::SetPragmaCacheSize { value: *value })
+            Statement::PragmaPragmaList => Ok(Plan::PragmaPragmaList),
+            Statement::PragmaModuleList => Ok(Plan::PragmaModuleList),
+            Statement::PragmaStats => Ok(Plan::PragmaStats),
+            Statement::PragmaJournalMode { schema } => Ok(Plan::PragmaJournalMode {
+                schema: schema.clone(),
+            }),
+            Statement::SetPragmaJournalMode { mode, schema } => Ok(Plan::SetPragmaJournalMode {
+                mode: mode.clone(),
+                schema: schema.clone(),
+            }),
+            Statement::PragmaSynchronous { schema } => Ok(Plan::PragmaSynchronous {
+                schema: schema.clone(),
+            }),
+            Statement::SetPragmaSynchronous { value, schema } => Ok(Plan::SetPragmaSynchronous {
+                value: *value,
+                schema: schema.clone(),
+            }),
+            Statement::PragmaCacheSize { schema } => Ok(Plan::PragmaCacheSize {
+                schema: schema.clone(),
+            }),
+            Statement::SetPragmaCacheSize { value, schema } => Ok(Plan::SetPragmaCacheSize {
+                value: *value,
+                schema: schema.clone(),
+            }),
+            Statement::PragmaCacheSpill => Ok(Plan::PragmaCacheSpill),
+            Statement::SetPragmaCacheSpill { value } => {
+                Ok(Plan::SetPragmaCacheSpill { value: *value })
             }
             Statement::PragmaTempStore => Ok(Plan::PragmaTempStore),
-            Statement::PragmaLockingMode => Ok(Plan::PragmaLockingMode),
+            Statement::SetPragmaTempStore { value } => {
+                Ok(Plan::SetPragmaTempStore { value: *value })
+            }
+            Statement::PragmaLockingMode { schema } => Ok(Plan::PragmaLockingMode {
+                schema: schema.clone(),
+            }),
+            Statement::SetPragmaLockingMode { mode, schema } => Ok(Plan::SetPragmaLockingMode {
+                mode: mode.clone(),
+                schema: schema.clone(),
+            }),
+            Statement::PragmaMmapSize => Ok(Plan::PragmaMmapSize),
+            Statement::SetPragmaMmapSize { value } => Ok(Plan::SetPragmaMmapSize { value: *value }),
+            Statement::PragmaAutoVacuum => Ok(Plan::PragmaAutoVacuum),
+            Statement::SetPragmaAutoVacuum { value } => {
+                Ok(Plan::SetPragmaAutoVacuum { value: *value })
+            }
+            Statement::PragmaSecureDelete { schema } => Ok(Plan::PragmaSecureDelete {
+                schema: schema.clone(),
+            }),
+            Statement::SetPragmaSecureDelete { value, schema } => Ok(Plan::SetPragmaSecureDelete {
+                value: *value,
+                schema: schema.clone(),
+            }),
+            Statement::PragmaWalAutocheckpoint => Ok(Plan::PragmaWalAutocheckpoint),
+            Statement::SetPragmaWalAutocheckpoint { value } => {
+                Ok(Plan::SetPragmaWalAutocheckpoint { value: *value })
+            }
+            Statement::PragmaWalCheckpoint => Ok(Plan::PragmaWalCheckpoint),
             Statement::PragmaBusyTimeout => Ok(Plan::PragmaBusyTimeout),
             Statement::SetPragmaBusyTimeout { value } => {
                 Ok(Plan::SetPragmaBusyTimeout { value: *value })
             }
+            Statement::PragmaAnalysisLimit => Ok(Plan::PragmaAnalysisLimit),
+            Statement::SetPragmaAnalysisLimit { value } => {
+                Ok(Plan::SetPragmaAnalysisLimit { value: *value })
+            }
+            Statement::PragmaJournalSizeLimit => Ok(Plan::PragmaJournalSizeLimit),
+            Statement::SetPragmaJournalSizeLimit { value } => {
+                Ok(Plan::SetPragmaJournalSizeLimit { value: *value })
+            }
+            Statement::PragmaSoftHeapLimit => Ok(Plan::PragmaSoftHeapLimit),
+            Statement::SetPragmaSoftHeapLimit { value } => {
+                Ok(Plan::SetPragmaSoftHeapLimit { value: *value })
+            }
+            Statement::PragmaHardHeapLimit => Ok(Plan::PragmaHardHeapLimit),
+            Statement::SetPragmaHardHeapLimit { value } => {
+                Ok(Plan::SetPragmaHardHeapLimit { value: *value })
+            }
             Statement::PragmaThreads => Ok(Plan::PragmaThreads),
             Statement::SetPragmaThreads { value } => Ok(Plan::SetPragmaThreads { value: *value }),
+            Statement::PragmaAutomaticIndex => Ok(Plan::PragmaAutomaticIndex),
+            Statement::SetPragmaAutomaticIndex { enabled } => {
+                Ok(Plan::SetPragmaAutomaticIndex { enabled: *enabled })
+            }
+            Statement::PragmaCellSizeCheck => Ok(Plan::PragmaCellSizeCheck),
+            Statement::SetPragmaCellSizeCheck { enabled } => {
+                Ok(Plan::SetPragmaCellSizeCheck { enabled: *enabled })
+            }
+            Statement::PragmaFullColumnNames => Ok(Plan::PragmaFullColumnNames),
+            Statement::SetPragmaFullColumnNames { enabled } => {
+                Ok(Plan::SetPragmaFullColumnNames { enabled: *enabled })
+            }
+            Statement::PragmaShortColumnNames => Ok(Plan::PragmaShortColumnNames),
+            Statement::SetPragmaShortColumnNames { enabled } => {
+                Ok(Plan::SetPragmaShortColumnNames { enabled: *enabled })
+            }
+            Statement::PragmaFullFsync => Ok(Plan::PragmaFullFsync),
+            Statement::SetPragmaFullFsync { enabled } => {
+                Ok(Plan::SetPragmaFullFsync { enabled: *enabled })
+            }
+            Statement::PragmaCheckpointFullFsync => Ok(Plan::PragmaCheckpointFullFsync),
+            Statement::SetPragmaCheckpointFullFsync { enabled } => {
+                Ok(Plan::SetPragmaCheckpointFullFsync { enabled: *enabled })
+            }
+            Statement::PragmaEmptyResultCallbacks => Ok(Plan::PragmaEmptyResultCallbacks),
+            Statement::SetPragmaEmptyResultCallbacks { enabled } => {
+                Ok(Plan::SetPragmaEmptyResultCallbacks { enabled: *enabled })
+            }
             Statement::PragmaCaseSensitiveLike => Ok(Plan::PragmaCaseSensitiveLike),
             Statement::SetPragmaCaseSensitiveLike { enabled } => {
                 Ok(Plan::SetPragmaCaseSensitiveLike { enabled: *enabled })
@@ -783,38 +1150,72 @@ impl Planner {
             Statement::SetPragmaReverseUnorderedSelects { enabled } => {
                 Ok(Plan::SetPragmaReverseUnorderedSelects { enabled: *enabled })
             }
-            Statement::PragmaOptimize => Ok(Plan::NoOp),
+            Statement::PragmaOptimize
+            | Statement::PragmaShrinkMemory
+            | Statement::PragmaIncrementalVacuum => Ok(Plan::NoOp),
             Statement::PragmaDatabaseList => Ok(Plan::PragmaDatabaseList),
-            Statement::PragmaPageSize => Ok(Plan::PragmaPageSize),
-            Statement::PragmaPageCount => Ok(Plan::PragmaPageCount),
-            Statement::PragmaFreelistCount => Ok(Plan::PragmaFreelistCount),
-            Statement::PragmaUserVersion => Ok(Plan::PragmaUserVersion),
-            Statement::SetPragmaUserVersion { value } => {
-                Ok(Plan::SetPragmaUserVersion { value: *value })
+            Statement::PragmaPageSize { schema } => Ok(Plan::PragmaPageSize {
+                schema: schema.clone(),
+            }),
+            Statement::SetPragmaPageSize { value, schema } => Ok(Plan::SetPragmaPageSize {
+                value: *value,
+                schema: schema.clone(),
+            }),
+            Statement::PragmaPageCount { schema } => Ok(Plan::PragmaPageCount {
+                schema: schema.clone(),
+            }),
+            Statement::PragmaMaxPageCount => Ok(Plan::PragmaMaxPageCount),
+            Statement::SetPragmaMaxPageCount { value } => {
+                Ok(Plan::SetPragmaMaxPageCount { value: *value })
             }
-            Statement::PragmaApplicationId => Ok(Plan::PragmaApplicationId),
-            Statement::SetPragmaApplicationId { value } => {
-                Ok(Plan::SetPragmaApplicationId { value: *value })
+            Statement::PragmaFreelistCount { schema } => Ok(Plan::PragmaFreelistCount {
+                schema: schema.clone(),
+            }),
+            Statement::PragmaUserVersion { schema } => Ok(Plan::PragmaUserVersion {
+                schema: schema.clone(),
+            }),
+            Statement::SetPragmaUserVersion { value, schema } => Ok(Plan::SetPragmaUserVersion {
+                value: *value,
+                schema: schema.clone(),
+            }),
+            Statement::PragmaApplicationId { schema } => Ok(Plan::PragmaApplicationId {
+                schema: schema.clone(),
+            }),
+            Statement::SetPragmaApplicationId { value, schema } => {
+                Ok(Plan::SetPragmaApplicationId {
+                    value: *value,
+                    schema: schema.clone(),
+                })
             }
-            Statement::PragmaSchemaVersion => Ok(Plan::PragmaSchemaVersion),
-            Statement::SetPragmaSchemaVersion { value } => {
-                Ok(Plan::SetPragmaSchemaVersion { value: *value })
+            Statement::PragmaSchemaVersion { schema } => Ok(Plan::PragmaSchemaVersion {
+                schema: schema.clone(),
+            }),
+            Statement::SetPragmaSchemaVersion { value, schema } => {
+                Ok(Plan::SetPragmaSchemaVersion {
+                    value: *value,
+                    schema: schema.clone(),
+                })
             }
             Statement::Begin { isolation_level } => Ok(Plan::BeginTxn {
                 isolation_level: isolation_level.unwrap_or(IsolationLevel::ReadCommitted),
             }),
             Statement::Commit => Ok(Plan::CommitTxn),
             Statement::Rollback => Ok(Plan::RollbackTxn),
+            Statement::Savepoint { name } => Ok(Plan::Savepoint { name: name.clone() }),
+            Statement::RollbackTo { name } => Ok(Plan::RollbackTo { name: name.clone() }),
+            Statement::Release { name } => Ok(Plan::Release { name: name.clone() }),
         }
     }
 
     fn plan_alter_table(
         &self,
         table: &str,
+        table_schema: Option<&str>,
         action: &AlterTableAction,
         context: &PlanningContext,
     ) -> Result<Plan> {
-        let schema = self.require_schema(context, table)?;
+        let storage_table = context.resolved_table_name(table, table_schema);
+        let schema = self.require_schema(context, &storage_table)?;
         match action {
             AlterTableAction::AddColumn(column) => {
                 if schema.columns.iter().any(|entry| entry.name == column.name) {
@@ -823,9 +1224,17 @@ impl Planner {
                         column.name
                     )));
                 }
+                if schema.strict {
+                    validate_strict_column_declared_type(table, column)?;
+                }
             }
             AlterTableAction::RenameTable { new_name } => {
-                if context.schema(new_name).is_some() {
+                let storage_new_name = if storage_table.starts_with("__rustsql_temp__") {
+                    temp_table_name(new_name)
+                } else {
+                    new_name.clone()
+                };
+                if context.schema(&storage_new_name).is_some() {
                     return Err(DbError::plan(format!("table already exists: {new_name}")));
                 }
             }
@@ -843,8 +1252,19 @@ impl Planner {
         }
 
         Ok(Plan::AlterTable {
-            table: table.to_string(),
-            action: action.clone(),
+            table: storage_table,
+            action: match action {
+                AlterTableAction::RenameTable { new_name }
+                    if context
+                        .resolved_table_name(table, table_schema)
+                        .starts_with("__rustsql_temp__") =>
+                {
+                    AlterTableAction::RenameTable {
+                        new_name: temp_table_name(new_name),
+                    }
+                }
+                _ => action.clone(),
+            },
         })
     }
 
@@ -856,10 +1276,11 @@ impl Planner {
         values: &[Value],
         context: &PlanningContext,
     ) -> Result<Plan> {
-        let schema = self.require_schema(context, table)?;
-        let row = self.build_insert_row(schema, table, columns, values)?;
+        let storage_table = context.resolved_table_name(table, None);
+        let schema = self.require_schema(context, &storage_table)?;
+        let row = self.build_insert_row(schema, &storage_table, columns, values)?;
         Ok(Plan::Insert {
-            table: table.to_string(),
+            table: storage_table,
             or_conflict: or_conflict.map(str::to_string),
             values: row,
         })
@@ -1104,10 +1525,12 @@ impl Planner {
         values: &[ScalarExpr],
         context: &PlanningContext,
     ) -> Result<Plan> {
-        let schema = self.require_schema(context, table)?;
-        let normalized_values = self.plan_insert_value_exprs(schema, table, columns, values)?;
+        let storage_table = context.resolved_table_name(table, None);
+        let schema = self.require_schema(context, &storage_table)?;
+        let normalized_values =
+            self.plan_insert_value_exprs(schema, &storage_table, columns, values)?;
         Ok(Plan::InsertExpr {
-            table: table.to_string(),
+            table: storage_table,
             or_conflict: or_conflict.map(str::to_string),
             values: normalized_values,
         })
@@ -1572,8 +1995,10 @@ impl Planner {
             Plan::PragmaForeignKeyList { .. } => Ok(8),
             Plan::PragmaForeignKeyCheck { .. } => Ok(4),
             Plan::PragmaForeignKeys => Ok(1),
+            Plan::PragmaDeferForeignKeys => Ok(1),
             Plan::PragmaReadUncommitted => Ok(1),
             Plan::PragmaQueryOnly => Ok(1),
+            Plan::PragmaCountChanges => Ok(1),
             Plan::PragmaRecursiveTriggers => Ok(1),
             Plan::PragmaTrustedSchema => Ok(1),
             Plan::PragmaIgnoreCheckConstraints => Ok(1),
@@ -1584,32 +2009,71 @@ impl Planner {
             Plan::PragmaIntegrityCheck => Ok(1),
             Plan::PragmaFunctionList => Ok(6),
             Plan::PragmaCompileOptions => Ok(1),
-            Plan::PragmaJournalMode => Ok(1),
-            Plan::PragmaSynchronous => Ok(1),
-            Plan::PragmaCacheSize => Ok(1),
+            Plan::PragmaPragmaList => Ok(1),
+            Plan::PragmaModuleList => Ok(1),
+            Plan::PragmaStats => Ok(4),
+            Plan::PragmaJournalMode { .. } => Ok(1),
+            Plan::PragmaSynchronous { .. } => Ok(1),
+            Plan::PragmaCacheSize { .. } => Ok(1),
+            Plan::PragmaCacheSpill => Ok(1),
             Plan::PragmaTempStore => Ok(1),
-            Plan::PragmaLockingMode => Ok(1),
+            Plan::PragmaLockingMode { .. } => Ok(1),
+            Plan::SetPragmaLockingMode { .. } => Ok(1),
+            Plan::PragmaMmapSize => Ok(1),
+            Plan::PragmaAutoVacuum => Ok(1),
+            Plan::PragmaSecureDelete { .. } => Ok(1),
+            Plan::SetPragmaSecureDelete { .. } => Ok(1),
+            Plan::PragmaWalAutocheckpoint => Ok(1),
+            Plan::SetPragmaWalAutocheckpoint { .. } => Ok(1),
+            Plan::PragmaWalCheckpoint => Ok(3),
             Plan::PragmaBusyTimeout => Ok(1),
+            Plan::PragmaAnalysisLimit => Ok(1),
+            Plan::PragmaJournalSizeLimit => Ok(1),
+            Plan::PragmaSoftHeapLimit => Ok(1),
+            Plan::PragmaHardHeapLimit => Ok(1),
             Plan::PragmaThreads => Ok(1),
+            Plan::PragmaAutomaticIndex => Ok(1),
+            Plan::PragmaCellSizeCheck => Ok(1),
+            Plan::PragmaFullColumnNames => Ok(1),
+            Plan::PragmaShortColumnNames => Ok(1),
+            Plan::PragmaFullFsync => Ok(1),
+            Plan::PragmaCheckpointFullFsync => Ok(1),
+            Plan::PragmaEmptyResultCallbacks => Ok(1),
             Plan::PragmaCaseSensitiveLike => Ok(1),
             Plan::PragmaReverseUnorderedSelects => Ok(1),
             Plan::PragmaDatabaseList => Ok(3),
-            Plan::PragmaPageSize => Ok(1),
-            Plan::PragmaPageCount => Ok(1),
-            Plan::PragmaFreelistCount => Ok(1),
-            Plan::PragmaUserVersion => Ok(1),
-            Plan::PragmaApplicationId => Ok(1),
-            Plan::PragmaSchemaVersion => Ok(1),
+            Plan::PragmaPageSize { .. } => Ok(1),
+            Plan::PragmaPageCount { .. } => Ok(1),
+            Plan::PragmaMaxPageCount => Ok(1),
+            Plan::SetPragmaMaxPageCount { .. } => Ok(1),
+            Plan::PragmaFreelistCount { .. } => Ok(1),
+            Plan::PragmaUserVersion { .. } => Ok(1),
+            Plan::PragmaApplicationId { .. } => Ok(1),
+            Plan::PragmaSchemaVersion { .. } => Ok(1),
             other => Err(DbError::plan(format!(
                 "unexpected insert-select source plan: {other:?}"
             ))),
         }
     }
 
-    fn resolve_index_table(&self, context: &PlanningContext, index_name: &str) -> Result<String> {
+    fn resolve_index_table_in_schema(
+        &self,
+        context: &PlanningContext,
+        index_name: &str,
+        schema: Option<&str>,
+    ) -> Result<String> {
         let matches = context
             .indexes
             .iter()
+            .filter(|(table, _)| match schema {
+                Some(schema) if schema.eq_ignore_ascii_case("temp") => {
+                    table.starts_with("__rustsql_temp__")
+                }
+                Some(schema) if schema.eq_ignore_ascii_case("main") => {
+                    !table.starts_with("__rustsql_temp__")
+                }
+                _ => true,
+            })
             .filter(|(_, indexes)| indexes.iter().any(|index| index.name == index_name))
             .map(|(table, _)| table.clone())
             .collect::<Vec<_>>();
@@ -1624,24 +2088,28 @@ impl Planner {
     fn plan_delete(
         &self,
         table: &str,
+        table_schema: Option<&str>,
         table_alias: Option<&str>,
+        index_hint: Option<&TableIndexHint>,
         filter: &Option<Expr>,
         context: &PlanningContext,
     ) -> Result<Plan> {
-        let schema = self.require_schema(context, table)?;
+        let storage_table = context.resolved_table_name(table, table_schema);
+        let schema = self.require_schema(context, &storage_table)?;
+        self.validate_dml_index_hint(context, &storage_table, index_hint)?;
         let normalized_filter = filter
             .as_ref()
-            .map(|expr| self.normalize_expr(schema, table, table_alias, expr))
+            .map(|expr| self.normalize_expr(schema, &storage_table, table_alias, expr))
             .transpose()?;
 
         if let Some(expr) = &normalized_filter {
-            let scope = self.build_single_table_scope(table, table_alias, context)?;
+            let scope = self.build_single_table_scope(&storage_table, table_alias, context)?;
             self.require_scope_columns_with_outer(&scope, None, expr)?;
             self.validate_subqueries(expr, context, &scope)?;
         }
 
         Ok(Plan::Delete {
-            table: table.to_string(),
+            table: storage_table,
             filter: normalized_filter,
         })
     }
@@ -1649,20 +2117,24 @@ impl Planner {
     fn plan_delete_limited(
         &self,
         table: &str,
+        table_schema: Option<&str>,
         table_alias: Option<&str>,
+        index_hint: Option<&TableIndexHint>,
         filter: &Option<Expr>,
         order_by: &[OrderBy],
         limit: Option<usize>,
         offset: Option<usize>,
         context: &PlanningContext,
     ) -> Result<Plan> {
-        let schema = self.require_schema(context, table)?;
+        let storage_table = context.resolved_table_name(table, table_schema);
+        let schema = self.require_schema(context, &storage_table)?;
+        self.validate_dml_index_hint(context, &storage_table, index_hint)?;
         let normalized_filter = filter
             .as_ref()
-            .map(|expr| self.normalize_expr(schema, table, table_alias, expr))
+            .map(|expr| self.normalize_expr(schema, &storage_table, table_alias, expr))
             .transpose()?;
 
-        let scope = self.build_single_table_scope(table, table_alias, context)?;
+        let scope = self.build_single_table_scope(&storage_table, table_alias, context)?;
         if let Some(expr) = &normalized_filter {
             self.require_scope_columns_with_outer(&scope, None, expr)?;
             self.validate_subqueries(expr, context, &scope)?;
@@ -1672,11 +2144,11 @@ impl Planner {
         }
         let order_by = order_by
             .iter()
-            .map(|item| self.normalize_order_by(schema, table, table_alias, &[], item))
+            .map(|item| self.normalize_order_by(schema, &storage_table, table_alias, &[], item))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Plan::DeleteLimited {
-            table: table.to_string(),
+            table: storage_table,
             filter: normalized_filter,
             order_by,
             limit,
@@ -1687,7 +2159,9 @@ impl Planner {
     fn plan_delete_returning(
         &self,
         table: &str,
+        table_schema: Option<&str>,
         table_alias: Option<&str>,
+        index_hint: Option<&TableIndexHint>,
         filter: &Option<Expr>,
         returning: &[SelectItem],
         order_by: &[OrderBy],
@@ -1695,13 +2169,15 @@ impl Planner {
         offset: Option<usize>,
         context: &PlanningContext,
     ) -> Result<Plan> {
-        let schema = self.require_schema(context, table)?;
+        let storage_table = context.resolved_table_name(table, table_schema);
+        let schema = self.require_schema(context, &storage_table)?;
+        self.validate_dml_index_hint(context, &storage_table, index_hint)?;
         let normalized_filter = filter
             .as_ref()
-            .map(|expr| self.normalize_expr(schema, table, table_alias, expr))
+            .map(|expr| self.normalize_expr(schema, &storage_table, table_alias, expr))
             .transpose()?;
 
-        let scope = self.build_single_table_scope(table, table_alias, context)?;
+        let scope = self.build_single_table_scope(&storage_table, table_alias, context)?;
         if let Some(expr) = &normalized_filter {
             self.require_scope_columns_with_outer(&scope, None, expr)?;
             self.validate_subqueries(expr, context, &scope)?;
@@ -1711,13 +2187,13 @@ impl Planner {
         }
         let order_by = order_by
             .iter()
-            .map(|item| self.normalize_order_by(schema, table, table_alias, &[], item))
+            .map(|item| self.normalize_order_by(schema, &storage_table, table_alias, &[], item))
             .collect::<Result<Vec<_>>>()?;
 
-        let returning = self.plan_returning_items(schema, table, returning)?;
+        let returning = self.plan_returning_items(schema, &storage_table, returning)?;
         if !order_by.is_empty() || limit.is_some() || offset.is_some() {
             Ok(Plan::DeleteReturningLimited {
-                table: table.to_string(),
+                table: storage_table,
                 filter: normalized_filter,
                 returning,
                 order_by,
@@ -1726,7 +2202,7 @@ impl Planner {
             })
         } else {
             Ok(Plan::DeleteReturning {
-                table: table.to_string(),
+                table: storage_table,
                 filter: normalized_filter,
                 returning,
             })
@@ -1736,13 +2212,36 @@ impl Planner {
     fn plan_update(
         &self,
         table: &str,
+        table_schema: Option<&str>,
         table_alias: Option<&str>,
+        index_hint: Option<&TableIndexHint>,
+        or_conflict: Option<&str>,
         assignments: &[Assignment],
+        from: Option<&FromItem>,
         filter: &Option<Expr>,
         context: &PlanningContext,
     ) -> Result<Plan> {
-        let schema = self.require_schema(context, table)?;
-        let scope = self.build_single_table_scope(table, table_alias, context)?;
+        let storage_table = context.resolved_table_name(table, table_schema);
+        let schema = self.require_schema(context, &storage_table)?;
+        self.validate_dml_index_hint(context, &storage_table, index_hint)?;
+        if let Some(from) = from {
+            return self.plan_update_from(
+                &storage_table,
+                None,
+                table_alias,
+                index_hint,
+                or_conflict,
+                assignments,
+                from,
+                filter,
+                None,
+                &[],
+                None,
+                None,
+                context,
+            );
+        }
+        let scope = self.build_single_table_scope(&storage_table, table_alias, context)?;
         let mut seen = std::collections::BTreeSet::new();
         let mut normalized_assignments = Vec::with_capacity(assignments.len());
         for assignment in assignments {
@@ -1754,7 +2253,7 @@ impl Planner {
                 )));
             }
             let value =
-                self.normalize_scalar_expr(schema, table, table_alias, &assignment.value)?;
+                self.normalize_scalar_expr(schema, &storage_table, table_alias, &assignment.value)?;
             self.require_scalar_expr_scope(&scope, &value)?;
             normalized_assignments.push(Assignment {
                 column: assignment.column.clone(),
@@ -1764,7 +2263,7 @@ impl Planner {
 
         let normalized_filter = filter
             .as_ref()
-            .map(|expr| self.normalize_expr(schema, table, table_alias, expr))
+            .map(|expr| self.normalize_expr(schema, &storage_table, table_alias, expr))
             .transpose()?;
         if let Some(expr) = &normalized_filter {
             self.require_scope_columns_with_outer(&scope, None, expr)?;
@@ -1772,16 +2271,80 @@ impl Planner {
         }
 
         Ok(Plan::Update {
-            table: table.to_string(),
+            table: storage_table,
+            or_conflict: or_conflict.map(str::to_string),
             assignments: normalized_assignments,
             filter: normalized_filter,
+        })
+    }
+
+    fn plan_update_from(
+        &self,
+        table: &str,
+        table_schema: Option<&str>,
+        table_alias: Option<&str>,
+        index_hint: Option<&TableIndexHint>,
+        or_conflict: Option<&str>,
+        assignments: &[Assignment],
+        from: &FromItem,
+        filter: &Option<Expr>,
+        returning: Option<&[SelectItem]>,
+        order_by: &[OrderBy],
+        limit: Option<usize>,
+        offset: Option<usize>,
+        context: &PlanningContext,
+    ) -> Result<Plan> {
+        let storage_table = context.resolved_table_name(table, table_schema);
+        let schema = self.require_schema(context, &storage_table)?;
+        self.validate_dml_index_hint(context, &storage_table, index_hint)?;
+        match from {
+            FromItem::TableIndexed { name, index, .. } => {
+                let _ = self.require_schema(context, name)?;
+                self.validate_table_index_hint(context, name, TableIndexHintRef::IndexedBy(index))?;
+            }
+            FromItem::TableNotIndexed { name, .. } => {
+                let _ = self.require_schema(context, name)?;
+            }
+            FromItem::PragmaTableFunction { .. } => {}
+            FromItem::Table { name, .. } => {
+                let _ = self.require_schema(context, name)?;
+            }
+            FromItem::Subquery { .. } | FromItem::Values { .. } => {}
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for assignment in assignments {
+            self.require_column(schema, &assignment.column)?;
+            if !seen.insert(assignment.column.clone()) {
+                return Err(DbError::plan(format!(
+                    "duplicate assignment target: {}",
+                    assignment.column
+                )));
+            }
+        }
+        let returning = returning
+            .map(|returning| self.plan_returning_items(schema, &storage_table, returning))
+            .transpose()?;
+        Ok(Plan::UpdateFrom {
+            table: storage_table,
+            table_alias: table_alias.map(str::to_string),
+            source: from.clone(),
+            or_conflict: or_conflict.map(str::to_string),
+            assignments: assignments.to_vec(),
+            filter: filter.clone(),
+            returning,
+            order_by: order_by.to_vec(),
+            limit,
+            offset,
         })
     }
 
     fn plan_update_limited(
         &self,
         table: &str,
+        table_schema: Option<&str>,
         table_alias: Option<&str>,
+        index_hint: Option<&TableIndexHint>,
+        or_conflict: Option<&str>,
         assignments: &[Assignment],
         filter: &Option<Expr>,
         order_by: &[OrderBy],
@@ -1789,8 +2352,10 @@ impl Planner {
         offset: Option<usize>,
         context: &PlanningContext,
     ) -> Result<Plan> {
-        let schema = self.require_schema(context, table)?;
-        let scope = self.build_single_table_scope(table, table_alias, context)?;
+        let storage_table = context.resolved_table_name(table, table_schema);
+        let schema = self.require_schema(context, &storage_table)?;
+        self.validate_dml_index_hint(context, &storage_table, index_hint)?;
+        let scope = self.build_single_table_scope(&storage_table, table_alias, context)?;
         let mut seen = std::collections::BTreeSet::new();
         let mut normalized_assignments = Vec::with_capacity(assignments.len());
         for assignment in assignments {
@@ -1802,7 +2367,7 @@ impl Planner {
                 )));
             }
             let value =
-                self.normalize_scalar_expr(schema, table, table_alias, &assignment.value)?;
+                self.normalize_scalar_expr(schema, &storage_table, table_alias, &assignment.value)?;
             self.require_scalar_expr_scope(&scope, &value)?;
             normalized_assignments.push(Assignment {
                 column: assignment.column.clone(),
@@ -1812,7 +2377,7 @@ impl Planner {
 
         let normalized_filter = filter
             .as_ref()
-            .map(|expr| self.normalize_expr(schema, table, table_alias, expr))
+            .map(|expr| self.normalize_expr(schema, &storage_table, table_alias, expr))
             .transpose()?;
         if let Some(expr) = &normalized_filter {
             self.require_scope_columns_with_outer(&scope, None, expr)?;
@@ -1823,11 +2388,12 @@ impl Planner {
         }
         let order_by = order_by
             .iter()
-            .map(|item| self.normalize_order_by(schema, table, table_alias, &[], item))
+            .map(|item| self.normalize_order_by(schema, &storage_table, table_alias, &[], item))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Plan::UpdateLimited {
-            table: table.to_string(),
+            table: storage_table,
+            or_conflict: or_conflict.map(str::to_string),
             assignments: normalized_assignments,
             filter: normalized_filter,
             order_by,
@@ -1839,7 +2405,10 @@ impl Planner {
     fn plan_update_returning(
         &self,
         table: &str,
+        table_schema: Option<&str>,
         table_alias: Option<&str>,
+        index_hint: Option<&TableIndexHint>,
+        or_conflict: Option<&str>,
         assignments: &[Assignment],
         filter: &Option<Expr>,
         returning: &[SelectItem],
@@ -1848,8 +2417,10 @@ impl Planner {
         offset: Option<usize>,
         context: &PlanningContext,
     ) -> Result<Plan> {
-        let schema = self.require_schema(context, table)?;
-        let scope = self.build_single_table_scope(table, table_alias, context)?;
+        let storage_table = context.resolved_table_name(table, table_schema);
+        let schema = self.require_schema(context, &storage_table)?;
+        self.validate_dml_index_hint(context, &storage_table, index_hint)?;
+        let scope = self.build_single_table_scope(&storage_table, table_alias, context)?;
         let mut seen = std::collections::BTreeSet::new();
         let mut normalized_assignments = Vec::with_capacity(assignments.len());
         for assignment in assignments {
@@ -1861,7 +2432,7 @@ impl Planner {
                 )));
             }
             let value =
-                self.normalize_scalar_expr(schema, table, table_alias, &assignment.value)?;
+                self.normalize_scalar_expr(schema, &storage_table, table_alias, &assignment.value)?;
             self.require_scalar_expr_scope(&scope, &value)?;
             normalized_assignments.push(Assignment {
                 column: assignment.column.clone(),
@@ -1871,7 +2442,7 @@ impl Planner {
 
         let normalized_filter = filter
             .as_ref()
-            .map(|expr| self.normalize_expr(schema, table, table_alias, expr))
+            .map(|expr| self.normalize_expr(schema, &storage_table, table_alias, expr))
             .transpose()?;
         if let Some(expr) = &normalized_filter {
             self.require_scope_columns_with_outer(&scope, None, expr)?;
@@ -1882,13 +2453,14 @@ impl Planner {
         }
         let order_by = order_by
             .iter()
-            .map(|item| self.normalize_order_by(schema, table, table_alias, &[], item))
+            .map(|item| self.normalize_order_by(schema, &storage_table, table_alias, &[], item))
             .collect::<Result<Vec<_>>>()?;
 
-        let returning = self.plan_returning_items(schema, table, returning)?;
+        let returning = self.plan_returning_items(schema, &storage_table, returning)?;
         if !order_by.is_empty() || limit.is_some() || offset.is_some() {
             Ok(Plan::UpdateReturningLimited {
-                table: table.to_string(),
+                table: storage_table,
+                or_conflict: or_conflict.map(str::to_string),
                 assignments: normalized_assignments,
                 filter: normalized_filter,
                 returning,
@@ -1898,7 +2470,8 @@ impl Planner {
             })
         } else {
             Ok(Plan::UpdateReturning {
-                table: table.to_string(),
+                table: storage_table,
+                or_conflict: or_conflict.map(str::to_string),
                 assignments: normalized_assignments,
                 filter: normalized_filter,
                 returning,
@@ -1965,11 +2538,15 @@ impl Planner {
             }
             Statement::Delete {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
             } => Statement::Delete {
                 table: table.clone(),
+                schema: schema.clone(),
                 table_alias: table_alias.clone(),
+                index_hint: index_hint.clone(),
                 filter: filter
                     .as_ref()
                     .map(|expr| self.lower_cte_expr(expr, ctes))
@@ -1977,14 +2554,18 @@ impl Planner {
             },
             Statement::DeleteLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
                 order_by,
                 limit,
                 offset,
             } => Statement::DeleteLimited {
                 table: table.clone(),
+                schema: schema.clone(),
                 table_alias: table_alias.clone(),
+                index_hint: index_hint.clone(),
                 filter: filter
                     .as_ref()
                     .map(|expr| self.lower_cte_expr(expr, ctes))
@@ -1995,12 +2576,16 @@ impl Planner {
             },
             Statement::DeleteReturning {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
                 returning,
             } => Statement::DeleteReturning {
                 table: table.clone(),
+                schema: schema.clone(),
                 table_alias: table_alias.clone(),
+                index_hint: index_hint.clone(),
                 filter: filter
                     .as_ref()
                     .map(|expr| self.lower_cte_expr(expr, ctes))
@@ -2009,7 +2594,9 @@ impl Planner {
             },
             Statement::DeleteReturningLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
                 returning,
                 order_by,
@@ -2017,7 +2604,9 @@ impl Planner {
                 offset,
             } => Statement::DeleteReturningLimited {
                 table: table.clone(),
+                schema: schema.clone(),
                 table_alias: table_alias.clone(),
+                index_hint: index_hint.clone(),
                 filter: filter
                     .as_ref()
                     .map(|expr| self.lower_cte_expr(expr, ctes))
@@ -2032,13 +2621,24 @@ impl Planner {
             },
             Statement::Update {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from,
                 filter,
             } => Statement::Update {
                 table: table.clone(),
+                schema: schema.clone(),
                 table_alias: table_alias.clone(),
+                index_hint: index_hint.clone(),
+                or_conflict: or_conflict.clone(),
                 assignments: assignments.clone(),
+                from: from
+                    .as_ref()
+                    .map(|from| self.lower_cte_from_item(from, ctes))
+                    .transpose()?,
                 filter: filter
                     .as_ref()
                     .map(|expr| self.lower_cte_expr(expr, ctes))
@@ -2046,16 +2646,27 @@ impl Planner {
             },
             Statement::UpdateLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from,
                 filter,
                 order_by,
                 limit,
                 offset,
             } => Statement::UpdateLimited {
                 table: table.clone(),
+                schema: schema.clone(),
                 table_alias: table_alias.clone(),
+                index_hint: index_hint.clone(),
+                or_conflict: or_conflict.clone(),
                 assignments: assignments.clone(),
+                from: from
+                    .as_ref()
+                    .map(|from| self.lower_cte_from_item(from, ctes))
+                    .transpose()?,
                 filter: filter
                     .as_ref()
                     .map(|expr| self.lower_cte_expr(expr, ctes))
@@ -2066,14 +2677,25 @@ impl Planner {
             },
             Statement::UpdateReturning {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from,
                 filter,
                 returning,
             } => Statement::UpdateReturning {
                 table: table.clone(),
+                schema: schema.clone(),
                 table_alias: table_alias.clone(),
+                index_hint: index_hint.clone(),
+                or_conflict: or_conflict.clone(),
                 assignments: assignments.clone(),
+                from: from
+                    .as_ref()
+                    .map(|from| self.lower_cte_from_item(from, ctes))
+                    .transpose()?,
                 filter: filter
                     .as_ref()
                     .map(|expr| self.lower_cte_expr(expr, ctes))
@@ -2082,8 +2704,12 @@ impl Planner {
             },
             Statement::UpdateReturningLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from,
                 filter,
                 returning,
                 order_by,
@@ -2091,8 +2717,15 @@ impl Planner {
                 offset,
             } => Statement::UpdateReturningLimited {
                 table: table.clone(),
+                schema: schema.clone(),
                 table_alias: table_alias.clone(),
+                index_hint: index_hint.clone(),
+                or_conflict: or_conflict.clone(),
                 assignments: assignments.clone(),
+                from: from
+                    .as_ref()
+                    .map(|from| self.lower_cte_from_item(from, ctes))
+                    .transpose()?,
                 filter: filter
                     .as_ref()
                     .map(|expr| self.lower_cte_expr(expr, ctes))
@@ -2178,9 +2811,9 @@ impl Planner {
 
     fn lower_cte_from_item(&self, from: &FromItem, ctes: &CteRegistry) -> Result<FromItem> {
         match from {
-            FromItem::Table { name, alias }
+            FromItem::Table { name, alias, .. }
             | FromItem::TableIndexed { name, alias, .. }
-            | FromItem::TableNotIndexed { name, alias } => {
+            | FromItem::TableNotIndexed { name, alias, .. } => {
                 let Some(cte) = ctes.get(name) else {
                     return Ok(from.clone());
                 };
@@ -2215,6 +2848,7 @@ impl Planner {
                 alias: alias.clone(),
                 columns: columns.clone(),
             }),
+            FromItem::PragmaTableFunction { .. } => Ok(from.clone()),
         }
     }
 
@@ -2309,8 +2943,11 @@ impl Planner {
                 negated,
             } => Ok(Expr::LikeScalar {
                 expr: self.lower_cte_scalar_expr(expr, ctes)?,
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.lower_cte_scalar_expr(pattern, ctes)?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| self.lower_cte_scalar_expr(escape, ctes).map(Box::new))
+                    .transpose()?,
                 negated: *negated,
             }),
             Expr::GlobScalar {
@@ -2319,7 +2956,7 @@ impl Planner {
                 negated,
             } => Ok(Expr::GlobScalar {
                 expr: self.lower_cte_scalar_expr(expr, ctes)?,
-                pattern: pattern.clone(),
+                pattern: Box::new(self.lower_cte_scalar_expr(pattern, ctes)?),
                 negated: *negated,
             }),
             Expr::Between {
@@ -2483,6 +3120,9 @@ impl Planner {
                     .map(|value| self.lower_cte_scalar_expr(value, ctes))
                     .collect::<Result<Vec<_>>>()?,
             ),
+            ScalarExpr::UnaryPlus(expr) => {
+                ScalarExpr::UnaryPlus(Box::new(self.lower_cte_scalar_expr(expr, ctes)?))
+            }
             ScalarExpr::UnaryMinus(expr) => {
                 ScalarExpr::UnaryMinus(Box::new(self.lower_cte_scalar_expr(expr, ctes)?))
             }
@@ -2549,8 +3189,11 @@ impl Planner {
                 negated,
             } => ScalarExpr::Like {
                 expr: Box::new(self.lower_cte_scalar_expr(expr, ctes)?),
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.lower_cte_scalar_expr(pattern, ctes)?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| self.lower_cte_scalar_expr(escape, ctes).map(Box::new))
+                    .transpose()?,
                 negated: *negated,
             },
             ScalarExpr::Glob {
@@ -2559,7 +3202,7 @@ impl Planner {
                 negated,
             } => ScalarExpr::Glob {
                 expr: Box::new(self.lower_cte_scalar_expr(expr, ctes)?),
-                pattern: pattern.clone(),
+                pattern: Box::new(self.lower_cte_scalar_expr(pattern, ctes)?),
                 negated: *negated,
             },
             ScalarExpr::Between {
@@ -2620,6 +3263,38 @@ impl Planner {
                     .map(|arg| self.lower_cte_scalar_expr(arg, ctes))
                     .collect::<Result<Vec<_>>>()?,
             },
+            ScalarExpr::WindowFunction {
+                func,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                exclude,
+                window_name,
+                filter,
+            } => ScalarExpr::WindowFunction {
+                func: *func,
+                args: args
+                    .iter()
+                    .map(|arg| self.lower_cte_scalar_expr(arg, ctes))
+                    .collect::<Result<Vec<_>>>()?,
+                partition_by: partition_by
+                    .iter()
+                    .map(|expr| self.lower_cte_scalar_expr(expr, ctes))
+                    .collect::<Result<Vec<_>>>()?,
+                order_by: order_by
+                    .iter()
+                    .map(|item| self.lower_cte_order_by(item, ctes))
+                    .collect::<Result<Vec<_>>>()?,
+                frame: *frame,
+                exclude: *exclude,
+                window_name: window_name.clone(),
+                filter: filter
+                    .as_deref()
+                    .map(|expr| self.lower_cte_expr(expr, ctes))
+                    .transpose()?
+                    .map(Box::new),
+            },
             ScalarExpr::Aggregate { func, arg, filter } => ScalarExpr::Aggregate {
                 func: *func,
                 arg: Box::new(self.lower_cte_aggregate_arg(arg, ctes)?),
@@ -2646,29 +3321,41 @@ impl Planner {
 
         if has_aggregates || !select.group_by.is_empty() {
             self.validate_aggregate_projection(select, context)?;
-            let rewritten_group_by =
-                self.rewrite_group_by_positions(&select.group_by, &select.columns);
+            let group_by_source_columns = self.visible_source_output_columns(select, context)?;
+            let rewritten_group_by = self.rewrite_group_by_positions(
+                &select.group_by,
+                &select.columns,
+                &group_by_source_columns,
+            )?;
 
             if self.select_is_simple_base_table_source(select) {
-                let (table, table_alias) = select
-                    .base_table()
+                let (table, schema, table_alias, index_hint) = table_source_parts(&select.from)
                     .ok_or_else(|| DbError::plan("subquery sources are not supported yet"))?;
-                let schema = self.require_schema(context, table)?;
+                let storage_table = context.resolved_table_name(table, schema);
+                let schema = self.require_schema(context, &storage_table)?;
+                let rewritten_filter = select
+                    .filter
+                    .as_ref()
+                    .map(|expr| rewrite_expr_alias_refs(expr, &select.columns));
                 let columns = self.normalize_aggregate_select_items(
-                    table,
+                    &storage_table,
                     table_alias,
                     &select.columns,
                     context,
                 )?;
-                let group_by =
-                    self.normalize_group_by(table, table_alias, &rewritten_group_by, context)?;
+                let group_by = self.normalize_group_by(
+                    &storage_table,
+                    table_alias,
+                    &rewritten_group_by,
+                    context,
+                )?;
                 let having = select
                     .having
                     .as_ref()
                     .map(|expr| {
                         self.normalize_aggregate_expr(
                             schema,
-                            table,
+                            &storage_table,
                             table_alias,
                             &columns,
                             &group_by,
@@ -2683,7 +3370,7 @@ impl Planner {
                     .map(|item| {
                         self.normalize_aggregate_order_by(
                             schema,
-                            table,
+                            &storage_table,
                             table_alias,
                             &columns,
                             &group_by,
@@ -2696,11 +3383,11 @@ impl Planner {
                     .collect::<Result<Vec<_>>>()?;
                 let source = self.plan_single_table_source(
                     SingleTablePlanInput {
-                        table,
+                        table: &storage_table,
                         table_alias,
-                        index_hint: TableIndexHintRef::None,
+                        index_hint,
                         columns: &[SelectItem::Wildcard],
-                        filter: &select.filter,
+                        filter: &rewritten_filter,
                         order_by: &[],
                         limit: None,
                         offset: None,
@@ -2744,6 +3431,17 @@ impl Planner {
 
         if !select.joins.is_empty() {
             let scope = self.build_scope(select, context)?;
+            let rewritten_joins = select
+                .joins
+                .iter()
+                .map(|join| crate::sql::ast::JoinClause {
+                    kind: join.kind,
+                    source: join.source.clone(),
+                    on: rewrite_expr_alias_refs(&join.on, &select.columns),
+                    using_columns: join.using_columns.clone(),
+                    natural: join.natural,
+                })
+                .collect::<Vec<_>>();
             for item in &select.columns {
                 self.require_join_select_item(&scope, item)?;
             }
@@ -2751,7 +3449,7 @@ impl Planner {
                 self.require_scope_columns_with_outer(&scope, outer_scope, filter)?;
                 self.validate_subqueries(filter, context, &scope)?;
             }
-            for (index, join) in select.joins.iter().enumerate() {
+            for (index, join) in rewritten_joins.iter().enumerate() {
                 let join_scope = self.build_join_scope(select, context, index)?;
                 self.require_scope_columns_with_outer(&join_scope, outer_scope, &join.on)?;
                 self.validate_subqueries(&join.on, context, &join_scope)?;
@@ -2762,7 +3460,12 @@ impl Planner {
 
             return Ok(Plan::NestedLoopJoin {
                 source: Box::new(self.plan_source_item(&select.from, context, outer_scope)?),
-                joins: self.plan_join_clauses(&select.from, &select.joins, context, outer_scope)?,
+                joins: self.plan_join_clauses(
+                    &select.from,
+                    &rewritten_joins,
+                    context,
+                    outer_scope,
+                )?,
                 columns: select.columns.clone(),
                 filter: select.filter.clone(),
                 order_by: select.order_by.clone(),
@@ -2803,17 +3506,21 @@ impl Planner {
             });
         }
 
-        let (table, table_alias) = select
-            .base_table()
+        let (table, schema, table_alias, index_hint) = table_source_parts(&select.from)
             .ok_or_else(|| DbError::plan("subquery sources are not supported yet"))?;
+        let storage_table = context.resolved_table_name(table, schema);
+        let rewritten_filter = select
+            .filter
+            .as_ref()
+            .map(|expr| rewrite_expr_alias_refs(expr, &select.columns));
 
         self.plan_single_table_source(
             SingleTablePlanInput {
-                table,
+                table: &storage_table,
                 table_alias,
-                index_hint: table_index_hint(&select.from),
+                index_hint,
                 columns: &select.columns,
-                filter: &select.filter,
+                filter: &rewritten_filter,
                 order_by: &select.order_by,
                 limit: select.limit,
                 offset: select.offset,
@@ -2833,8 +3540,13 @@ impl Planner {
         let output_columns = self.derived_output_columns(select, context)?;
         let expected_width = output_columns.len();
         let compound_scope = self.build_derived_scope("__compound__", &output_columns);
+        let compound_order_by = select
+            .order_by
+            .iter()
+            .map(|item| self.normalize_compound_order_by(select, item))
+            .collect::<Result<Vec<_>>>()?;
 
-        for item in &select.order_by {
+        for item in &compound_order_by {
             self.require_order_by_scope(&compound_scope, &select.columns, item)?;
         }
 
@@ -2866,7 +3578,7 @@ impl Planner {
                 operator: compound.operator,
                 all: matches!(compound.operator, CompoundOperator::UnionAll),
                 order_by: if is_last {
-                    select.order_by.clone()
+                    compound_order_by.clone()
                 } else {
                     vec![]
                 },
@@ -2876,6 +3588,74 @@ impl Planner {
         }
 
         Ok(plan)
+    }
+
+    fn normalize_compound_order_by(
+        &self,
+        select: &SelectStatement,
+        item: &OrderBy,
+    ) -> Result<OrderBy> {
+        let expr = match &item.expr {
+            OrderByExpr::Column(column) => self
+                .compound_order_by_position_for_column(select, column)
+                .map(OrderByExpr::Position)
+                .unwrap_or_else(|| OrderByExpr::Column(column.clone())),
+            OrderByExpr::Expr(expr) => self
+                .compound_order_by_position_for_expr(select, expr)
+                .map(OrderByExpr::Position)
+                .ok_or_else(|| {
+                    DbError::plan("ORDER BY term does not match any column in the result set")
+                })?,
+            OrderByExpr::Position(position) => OrderByExpr::Position(*position),
+        };
+        Ok(OrderBy {
+            expr,
+            collation: item.collation.clone(),
+            descending: item.descending,
+            nulls: item.nulls,
+        })
+    }
+
+    fn compound_order_by_position_for_column(
+        &self,
+        select: &SelectStatement,
+        column: &str,
+    ) -> Option<usize> {
+        self.compound_select_columns(select)
+            .into_iter()
+            .find_map(|columns| {
+                columns
+                    .iter()
+                    .position(|item| select_item_output_name_matches(item, column))
+                    .map(|index| index + 1)
+            })
+    }
+
+    fn compound_order_by_position_for_expr(
+        &self,
+        select: &SelectStatement,
+        expr: &ScalarExpr,
+    ) -> Option<usize> {
+        self.compound_select_columns(select)
+            .into_iter()
+            .find_map(|columns| {
+                columns
+                    .iter()
+                    .position(|item| select_item_matches_expr(item, expr))
+                    .map(|index| index + 1)
+            })
+    }
+
+    fn compound_select_columns<'a>(&self, select: &'a SelectStatement) -> Vec<&'a [SelectItem]> {
+        let mut columns = Vec::with_capacity(select.compounds.len() + 1);
+        columns.push(select.columns.as_slice());
+        columns.extend(
+            select
+                .compounds
+                .iter()
+                .map(|compound| compound.select.columns.as_slice()),
+        );
+        columns
     }
 
     fn plan_aggregate_source(
@@ -2892,11 +3672,12 @@ impl Planner {
             FromItem::Table { .. }
             | FromItem::TableIndexed { .. }
             | FromItem::TableNotIndexed { .. } => {
-                let (name, alias, index_hint) = table_source_parts(&select.from)
+                let (name, schema, alias, index_hint) = table_source_parts(&select.from)
                     .expect("table source pattern must expose table parts");
+                let storage_name = context.resolved_table_name(name, schema);
                 self.plan_single_table_source(
                     SingleTablePlanInput {
-                        table: name,
+                        table: &storage_name,
                         table_alias: alias,
                         index_hint,
                         columns: &[SelectItem::Wildcard],
@@ -2910,7 +3691,9 @@ impl Planner {
                     outer_scope,
                 )
             }
-            FromItem::Subquery { .. } | FromItem::Values { .. } => {
+            FromItem::Subquery { .. }
+            | FromItem::Values { .. }
+            | FromItem::PragmaTableFunction { .. } => {
                 let (source, alias, output_columns) = self
                     .plan_inline_source_item(&select.from, context, outer_scope)?
                     .expect("inline source item should produce a plan");
@@ -2975,6 +3758,18 @@ impl Planner {
                     output_columns,
                 )))
             }
+            FromItem::PragmaTableFunction {
+                name,
+                argument,
+                alias,
+            } => Ok(Some((
+                Plan::PragmaTableFunction {
+                    name: name.clone(),
+                    argument: argument.clone(),
+                },
+                alias.clone().unwrap_or_else(|| name.clone()),
+                self.pragma_table_function_output_columns(name)?,
+            ))),
             FromItem::Table { .. }
             | FromItem::TableIndexed { .. }
             | FromItem::TableNotIndexed { .. } => Ok(None),
@@ -3010,6 +3805,71 @@ impl Planner {
         } = input;
         let schema = self.require_schema(context, table)?;
         self.validate_table_index_hint(context, table, index_hint)?;
+
+        if schema.is_view() {
+            if !matches!(index_hint, TableIndexHintRef::None) {
+                return Err(DbError::plan(format!(
+                    "cannot use INDEXED BY or NOT INDEXED on view {table}"
+                )));
+            }
+            let view_select = schema
+                .view_select
+                .as_ref()
+                .ok_or_else(|| DbError::plan(format!("view {table} is missing SELECT body")))?;
+            let output_schema = self.apply_view_column_names(
+                self.view_output_schema(view_select, context)?,
+                schema.view_columns.as_ref(),
+            )?;
+            let view_schema = Schema::new(table, output_schema.clone());
+            let normalized_columns = columns
+                .iter()
+                .map(|column| self.normalize_select_item(&view_schema, table, table_alias, column))
+                .collect::<Result<Vec<_>>>()?;
+            for column in &normalized_columns {
+                self.require_select_item_columns(&view_schema, column)?;
+            }
+            let normalized_filter = filter
+                .as_ref()
+                .map(|expr| self.normalize_expr(&view_schema, table, table_alias, expr))
+                .transpose()?;
+            let output_columns = output_schema
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            let alias = table_alias.unwrap_or(table).to_string();
+            let derived_scope = self.build_derived_scope(&alias, &output_columns);
+            if let Some(expr) = &normalized_filter {
+                self.require_scope_columns_with_outer(&derived_scope, outer_scope, expr)?;
+                self.validate_subqueries(expr, context, &derived_scope)?;
+            }
+            let normalized_order_by = order_by
+                .iter()
+                .map(|item| {
+                    self.normalize_order_by(
+                        &view_schema,
+                        table,
+                        table_alias,
+                        &normalized_columns,
+                        item,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for item in &normalized_order_by {
+                self.require_order_by_scope(&derived_scope, &normalized_columns, item)?;
+            }
+            let source = self.plan_select_with_outer(view_select, context, outer_scope)?;
+            return self.plan_derived_source(DerivedSourcePlanInput {
+                alias: &alias,
+                source,
+                output_columns,
+                columns: &normalized_columns,
+                filter: &normalized_filter,
+                order_by: &normalized_order_by,
+                limit,
+                offset,
+                distinct,
+            });
+        }
 
         let normalized_columns = columns
             .iter()
@@ -3070,6 +3930,26 @@ impl Planner {
         index_hint: TableIndexHintRef<'_>,
     ) -> Result<()> {
         let TableIndexHintRef::IndexedBy(index_name) = index_hint else {
+            return Ok(());
+        };
+        if context
+            .indexes_for(table)
+            .iter()
+            .any(|index| index.name == *index_name)
+        {
+            Ok(())
+        } else {
+            Err(DbError::plan(format!("no such index: {index_name}")))
+        }
+    }
+
+    fn validate_dml_index_hint(
+        &self,
+        context: &PlanningContext,
+        table: &str,
+        index_hint: Option<&TableIndexHint>,
+    ) -> Result<()> {
+        let Some(TableIndexHint::IndexedBy(index_name)) = index_hint else {
             return Ok(());
         };
         if context
@@ -3407,6 +4287,9 @@ impl Planner {
                     .map(|value| self.normalize_upsert_scalar_expr(schema, table, value))
                     .collect::<Result<Vec<_>>>()?,
             )),
+            ScalarExpr::UnaryPlus(value) => Ok(ScalarExpr::UnaryPlus(Box::new(
+                self.normalize_upsert_scalar_expr(schema, table, value)?,
+            ))),
             ScalarExpr::UnaryMinus(value) => Ok(ScalarExpr::UnaryMinus(Box::new(
                 self.normalize_upsert_scalar_expr(schema, table, value)?,
             ))),
@@ -3473,8 +4356,14 @@ impl Planner {
                 negated,
             } => Ok(ScalarExpr::Like {
                 expr: Box::new(self.normalize_upsert_scalar_expr(schema, table, expr)?),
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.normalize_upsert_scalar_expr(schema, table, pattern)?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| {
+                        self.normalize_upsert_scalar_expr(schema, table, escape)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
                 negated: *negated,
             }),
             ScalarExpr::Glob {
@@ -3483,7 +4372,7 @@ impl Planner {
                 negated,
             } => Ok(ScalarExpr::Glob {
                 expr: Box::new(self.normalize_upsert_scalar_expr(schema, table, expr)?),
-                pattern: pattern.clone(),
+                pattern: Box::new(self.normalize_upsert_scalar_expr(schema, table, pattern)?),
                 negated: *negated,
             }),
             ScalarExpr::Between {
@@ -3544,6 +4433,9 @@ impl Planner {
                     .map(|arg| self.normalize_upsert_scalar_expr(schema, table, arg))
                     .collect::<Result<Vec<_>>>()?,
             }),
+            ScalarExpr::WindowFunction { .. } => Err(DbError::plan(
+                "window functions are not allowed in ON CONFLICT DO UPDATE",
+            )),
             ScalarExpr::Aggregate { .. } => Err(DbError::plan(
                 "aggregate functions are not allowed in ON CONFLICT DO UPDATE",
             )),
@@ -3635,8 +4527,14 @@ impl Planner {
                 negated,
             } => Expr::LikeScalar {
                 expr: self.normalize_upsert_scalar_expr(schema, table, expr)?,
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.normalize_upsert_scalar_expr(schema, table, pattern)?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| {
+                        self.normalize_upsert_scalar_expr(schema, table, escape)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
                 negated: *negated,
             },
             Expr::GlobScalar {
@@ -3645,7 +4543,7 @@ impl Planner {
                 negated,
             } => Expr::GlobScalar {
                 expr: self.normalize_upsert_scalar_expr(schema, table, expr)?,
-                pattern: pattern.clone(),
+                pattern: Box::new(self.normalize_upsert_scalar_expr(schema, table, pattern)?),
                 negated: *negated,
             },
             Expr::BetweenScalar {
@@ -3694,8 +4592,14 @@ impl Planner {
                     table,
                     &ScalarExpr::Column(column.clone()),
                 )?,
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.normalize_upsert_scalar_expr(schema, table, pattern)?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| {
+                        self.normalize_upsert_scalar_expr(schema, table, escape)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
                 negated: *negated,
             },
             Expr::Glob {
@@ -3708,7 +4612,7 @@ impl Planner {
                     table,
                     &ScalarExpr::Column(column.clone()),
                 )?,
-                pattern: pattern.clone(),
+                pattern: Box::new(self.normalize_upsert_scalar_expr(schema, table, pattern)?),
                 negated: *negated,
             },
             Expr::Between {
@@ -3936,13 +4840,19 @@ impl Planner {
                         schema,
                         table,
                         table_alias,
-                        expr,
+                        &rewrite_scalar_alias_refs(expr, columns),
                     )?),
                     collation: item.collation.clone(),
                     descending: item.descending,
                     nulls: item.nulls,
                 }),
-                OrderByExpr::Position(_) => Ok(item.clone()),
+                OrderByExpr::Position(position) => {
+                    self.require_order_by_position(
+                        *position,
+                        self.order_by_single_table_column_count(schema, columns),
+                    )?;
+                    Ok(item.clone())
+                }
                 OrderByExpr::Column(_) => unreachable!(),
             };
         };
@@ -3997,12 +4907,28 @@ impl Planner {
                         expr,
                     )?)
                 }
-                OrderByExpr::Position(position) => OrderByExpr::Position(*position),
+                OrderByExpr::Position(position) => {
+                    self.require_order_by_position(
+                        *position,
+                        self.order_by_single_table_column_count(schema, columns),
+                    )?;
+                    OrderByExpr::Position(*position)
+                }
             },
             collation: item.collation.clone(),
             descending: item.descending,
             nulls: item.nulls,
         })
+    }
+
+    fn order_by_single_table_column_count(&self, schema: &Schema, columns: &[SelectItem]) -> usize {
+        columns
+            .iter()
+            .map(|item| match item {
+                SelectItem::Wildcard => schema.columns.len(),
+                _ => 1,
+            })
+            .sum()
     }
 
     fn select_aliases(&self, columns: &[SelectItem]) -> Vec<String> {
@@ -4132,8 +5058,19 @@ impl Planner {
                 negated,
             } => Expr::Like {
                 column: self.normalize_column_reference(schema, table, table_alias, column)?,
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.normalize_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    pattern,
+                )?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| {
+                        self.normalize_scalar_expr(schema, table, table_alias, escape)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
                 negated: *negated,
             },
             Expr::LikeScalar {
@@ -4143,8 +5080,19 @@ impl Planner {
                 negated,
             } => Expr::LikeScalar {
                 expr: self.normalize_scalar_expr(schema, table, table_alias, expr)?,
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.normalize_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    pattern,
+                )?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| {
+                        self.normalize_scalar_expr(schema, table, table_alias, escape)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
                 negated: *negated,
             },
             Expr::Glob {
@@ -4153,7 +5101,12 @@ impl Planner {
                 negated,
             } => Expr::Glob {
                 column: self.normalize_column_reference(schema, table, table_alias, column)?,
-                pattern: pattern.clone(),
+                pattern: Box::new(self.normalize_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    pattern,
+                )?),
                 negated: *negated,
             },
             Expr::GlobScalar {
@@ -4162,7 +5115,12 @@ impl Planner {
                 negated,
             } => Expr::GlobScalar {
                 expr: self.normalize_scalar_expr(schema, table, table_alias, expr)?,
-                pattern: pattern.clone(),
+                pattern: Box::new(self.normalize_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    pattern,
+                )?),
                 negated: *negated,
             },
             Expr::Between {
@@ -4445,8 +5403,28 @@ impl Planner {
                     group_by,
                     column,
                 )?,
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    pattern,
+                )?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| {
+                        self.normalize_aggregate_scalar_expr(
+                            schema,
+                            table,
+                            table_alias,
+                            columns,
+                            group_by,
+                            escape,
+                        )
+                        .map(Box::new)
+                    })
+                    .transpose()?,
                 negated: *negated,
             },
             Expr::LikeScalar {
@@ -4463,8 +5441,28 @@ impl Planner {
                     group_by,
                     expr,
                 )?,
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    pattern,
+                )?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| {
+                        self.normalize_aggregate_scalar_expr(
+                            schema,
+                            table,
+                            table_alias,
+                            columns,
+                            group_by,
+                            escape,
+                        )
+                        .map(Box::new)
+                    })
+                    .transpose()?,
                 negated: *negated,
             },
             Expr::Glob {
@@ -4480,7 +5478,14 @@ impl Planner {
                     group_by,
                     column,
                 )?,
-                pattern: pattern.clone(),
+                pattern: Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    pattern,
+                )?),
                 negated: *negated,
             },
             Expr::GlobScalar {
@@ -4496,7 +5501,14 @@ impl Planner {
                     group_by,
                     expr,
                 )?,
-                pattern: pattern.clone(),
+                pattern: Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    pattern,
+                )?),
                 negated: *negated,
             },
             Expr::Between {
@@ -4636,6 +5648,16 @@ impl Planner {
                     group_by,
                     name,
                 )?)
+            }
+            ScalarExpr::UnaryPlus(expr) => {
+                ScalarExpr::UnaryPlus(Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    expr,
+                )?))
             }
             ScalarExpr::UnaryMinus(expr) => {
                 ScalarExpr::UnaryMinus(Box::new(self.normalize_aggregate_scalar_expr(
@@ -4789,8 +5811,28 @@ impl Planner {
                     group_by,
                     expr,
                 )?),
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    pattern,
+                )?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| {
+                        self.normalize_aggregate_scalar_expr(
+                            schema,
+                            table,
+                            table_alias,
+                            columns,
+                            group_by,
+                            escape,
+                        )
+                        .map(Box::new)
+                    })
+                    .transpose()?,
                 negated: *negated,
             },
             ScalarExpr::Glob {
@@ -4806,7 +5848,14 @@ impl Planner {
                     group_by,
                     expr,
                 )?),
-                pattern: pattern.clone(),
+                pattern: Box::new(self.normalize_aggregate_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    columns,
+                    group_by,
+                    pattern,
+                )?),
                 negated: *negated,
             },
             ScalarExpr::Between {
@@ -4958,6 +6007,25 @@ impl Planner {
                     })
                     .collect::<Result<Vec<_>>>()?,
             },
+            ScalarExpr::WindowFunction {
+                func,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                exclude,
+                window_name,
+                filter,
+            } => ScalarExpr::WindowFunction {
+                func: *func,
+                args: args.clone(),
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                frame: *frame,
+                exclude: *exclude,
+                window_name: window_name.clone(),
+                filter: filter.clone(),
+            },
             ScalarExpr::Aggregate { func, arg, filter } => ScalarExpr::Aggregate {
                 func: *func,
                 arg: Box::new(self.normalize_aggregate_arg(schema, table, table_alias, arg)?),
@@ -5020,6 +6088,9 @@ impl Planner {
                 table_alias,
                 name,
             )?),
+            ScalarExpr::UnaryPlus(expr) => ScalarExpr::UnaryPlus(Box::new(
+                self.normalize_scalar_expr(schema, table, table_alias, expr)?,
+            )),
             ScalarExpr::UnaryMinus(expr) => ScalarExpr::UnaryMinus(Box::new(
                 self.normalize_scalar_expr(schema, table, table_alias, expr)?,
             )),
@@ -5092,8 +6163,19 @@ impl Planner {
                 negated,
             } => ScalarExpr::Like {
                 expr: Box::new(self.normalize_scalar_expr(schema, table, table_alias, expr)?),
-                pattern: pattern.clone(),
-                escape: escape.clone(),
+                pattern: Box::new(self.normalize_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    pattern,
+                )?),
+                escape: escape
+                    .as_deref()
+                    .map(|escape| {
+                        self.normalize_scalar_expr(schema, table, table_alias, escape)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
                 negated: *negated,
             },
             ScalarExpr::Glob {
@@ -5102,7 +6184,12 @@ impl Planner {
                 negated,
             } => ScalarExpr::Glob {
                 expr: Box::new(self.normalize_scalar_expr(schema, table, table_alias, expr)?),
-                pattern: pattern.clone(),
+                pattern: Box::new(self.normalize_scalar_expr(
+                    schema,
+                    table,
+                    table_alias,
+                    pattern,
+                )?),
                 negated: *negated,
             },
             ScalarExpr::Between {
@@ -5171,6 +6258,25 @@ impl Planner {
                     .map(|arg| self.normalize_scalar_expr(schema, table, table_alias, arg))
                     .collect::<Result<Vec<_>>>()?,
             },
+            ScalarExpr::WindowFunction {
+                func,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                exclude,
+                window_name,
+                filter,
+            } => ScalarExpr::WindowFunction {
+                func: *func,
+                args: args.clone(),
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                frame: *frame,
+                exclude: *exclude,
+                window_name: window_name.clone(),
+                filter: filter.clone(),
+            },
             ScalarExpr::Aggregate { func, arg, filter } => ScalarExpr::Aggregate {
                 func: *func,
                 arg: Box::new(self.normalize_aggregate_arg(schema, table, table_alias, arg)?),
@@ -5199,6 +6305,7 @@ impl Planner {
                 }
                 Ok(())
             }
+            ScalarExpr::UnaryPlus(expr) => self.require_scalar_expr_columns(schema, expr),
             ScalarExpr::UnaryMinus(expr) => self.require_scalar_expr_columns(schema, expr),
             ScalarExpr::BitNot(expr) => self.require_scalar_expr_columns(schema, expr),
             ScalarExpr::Not(expr) => self.require_scalar_expr_columns(schema, expr),
@@ -5221,8 +6328,22 @@ impl Planner {
                 self.require_scalar_expr_columns(schema, expr)
             }
             ScalarExpr::Subquery { .. } => Ok(()),
-            ScalarExpr::Like { expr, .. } | ScalarExpr::Glob { expr, .. } => {
-                self.require_scalar_expr_columns(schema, expr)
+            ScalarExpr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.require_scalar_expr_columns(schema, expr)?;
+                self.require_scalar_expr_columns(schema, pattern)?;
+                if let Some(escape) = escape {
+                    self.require_scalar_expr_columns(schema, escape)?;
+                }
+                Ok(())
+            }
+            ScalarExpr::Glob { expr, pattern, .. } => {
+                self.require_scalar_expr_columns(schema, expr)?;
+                self.require_scalar_expr_columns(schema, pattern)
             }
             ScalarExpr::Between {
                 expr, low, high, ..
@@ -5262,6 +6383,21 @@ impl Planner {
                 }
                 Ok(())
             }
+            ScalarExpr::WindowFunction {
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for expr in partition_by {
+                    self.require_scalar_expr_columns(schema, expr)?;
+                }
+                for item in order_by {
+                    if let OrderByExpr::Expr(expr) = &item.expr {
+                        self.require_scalar_expr_columns(schema, expr)?;
+                    }
+                }
+                Ok(())
+            }
             ScalarExpr::Aggregate { func, arg, filter } => {
                 self.require_aggregate_arg_columns(schema, *func, arg)?;
                 if let Some(filter) = filter {
@@ -5282,6 +6418,7 @@ impl Planner {
                 }
                 Ok(())
             }
+            ScalarExpr::UnaryPlus(expr) => self.require_scalar_expr_scope(scope, expr),
             ScalarExpr::UnaryMinus(expr) => self.require_scalar_expr_scope(scope, expr),
             ScalarExpr::BitNot(expr) => self.require_scalar_expr_scope(scope, expr),
             ScalarExpr::Not(expr) => self.require_scalar_expr_scope(scope, expr),
@@ -5304,8 +6441,22 @@ impl Planner {
                 self.require_scalar_expr_scope(scope, expr)
             }
             ScalarExpr::Subquery { .. } => Ok(()),
-            ScalarExpr::Like { expr, .. } | ScalarExpr::Glob { expr, .. } => {
-                self.require_scalar_expr_scope(scope, expr)
+            ScalarExpr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.require_scalar_expr_scope(scope, expr)?;
+                self.require_scalar_expr_scope(scope, pattern)?;
+                if let Some(escape) = escape {
+                    self.require_scalar_expr_scope(scope, escape)?;
+                }
+                Ok(())
+            }
+            ScalarExpr::Glob { expr, pattern, .. } => {
+                self.require_scalar_expr_scope(scope, expr)?;
+                self.require_scalar_expr_scope(scope, pattern)
             }
             ScalarExpr::Between {
                 expr, low, high, ..
@@ -5342,6 +6493,21 @@ impl Planner {
             ScalarExpr::Function { args, .. } => {
                 for arg in args {
                     self.require_scalar_expr_scope(scope, arg)?;
+                }
+                Ok(())
+            }
+            ScalarExpr::WindowFunction {
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for expr in partition_by {
+                    self.require_scalar_expr_scope(scope, expr)?;
+                }
+                for item in order_by {
+                    if let OrderByExpr::Expr(expr) = &item.expr {
+                        self.require_scalar_expr_scope(scope, expr)?;
+                    }
                 }
                 Ok(())
             }
@@ -5553,14 +6719,22 @@ impl Planner {
     fn scalar_expr_has_aggregate(expr: &ScalarExpr) -> bool {
         match expr {
             ScalarExpr::Aggregate { .. } => true,
-            ScalarExpr::UnaryMinus(expr)
+            ScalarExpr::UnaryPlus(expr)
+            | ScalarExpr::UnaryMinus(expr)
             | ScalarExpr::BitNot(expr)
             | ScalarExpr::Not(expr)
             | ScalarExpr::Cast { expr, .. }
             | ScalarExpr::Collate { expr, .. }
-            | ScalarExpr::IsBool { expr, .. }
-            | ScalarExpr::Like { expr, .. }
-            | ScalarExpr::Glob { expr, .. } => Self::scalar_expr_has_aggregate(expr),
+            | ScalarExpr::IsBool { expr, .. } => Self::scalar_expr_has_aggregate(expr),
+            ScalarExpr::Glob { expr, pattern, .. } => {
+                Self::scalar_expr_has_aggregate(expr) || Self::scalar_expr_has_aggregate(pattern)
+            }
+            ScalarExpr::Like { expr, escape, .. } => {
+                Self::scalar_expr_has_aggregate(expr)
+                    || escape
+                        .as_deref()
+                        .is_some_and(Self::scalar_expr_has_aggregate)
+            }
             ScalarExpr::Is { left, right, .. }
             | ScalarExpr::Compare { left, right, .. }
             | ScalarExpr::Binary { left, right, .. } => {
@@ -5597,6 +6771,16 @@ impl Planner {
                         .is_some_and(Self::scalar_expr_has_aggregate)
             }
             ScalarExpr::Function { args, .. } => args.iter().any(Self::scalar_expr_has_aggregate),
+            ScalarExpr::WindowFunction {
+                partition_by,
+                order_by,
+                ..
+            } => {
+                partition_by.iter().any(Self::scalar_expr_has_aggregate)
+                    || order_by.iter().any(|item| {
+                        matches!(&item.expr, OrderByExpr::Expr(expr) if Self::scalar_expr_has_aggregate(expr))
+                    })
+            }
             ScalarExpr::Tuple(values) => values.iter().any(Self::scalar_expr_has_aggregate),
             ScalarExpr::Literal(_) | ScalarExpr::Column(_) => false,
         }
@@ -5701,18 +6885,35 @@ impl Planner {
         &self,
         group_by: &[ScalarExpr],
         columns: &[SelectItem],
-    ) -> Vec<ScalarExpr> {
+        source_columns: &[String],
+    ) -> Result<Vec<ScalarExpr>> {
+        let group_exprs = select_item_group_exprs(columns, source_columns);
         group_by
             .iter()
             .map(|expr| match expr {
-                ScalarExpr::Literal(Value::Integer(position)) if *position > 0 => {
-                    let index = usize::try_from(*position - 1).ok();
-                    index
-                        .and_then(|index| columns.get(index))
-                        .and_then(select_item_group_expr)
-                        .unwrap_or_else(|| expr.clone())
+                ScalarExpr::Literal(Value::Integer(position)) => {
+                    rewrite_group_by_integer_position(*position, &group_exprs)
                 }
-                _ => expr.clone(),
+                ScalarExpr::UnaryMinus(expr) => {
+                    if let ScalarExpr::Literal(Value::Integer(position)) = expr.as_ref() {
+                        rewrite_group_by_integer_position(position.saturating_neg(), &group_exprs)
+                    } else {
+                        Ok(rewrite_scalar_alias_refs(expr, columns))
+                    }
+                }
+                ScalarExpr::UnaryPlus(expr) => {
+                    if let ScalarExpr::Literal(Value::Integer(position)) = expr.as_ref() {
+                        rewrite_group_by_integer_position(*position, &group_exprs)
+                    } else {
+                        Ok(rewrite_scalar_alias_refs(expr, columns))
+                    }
+                }
+                ScalarExpr::Column(name) => columns
+                    .iter()
+                    .find_map(|item| select_item_alias_group_expr(item, name))
+                    .map(Ok)
+                    .unwrap_or_else(|| Ok(expr.clone())),
+                _ => Ok(rewrite_scalar_alias_refs(expr, columns)),
             })
             .collect()
     }
@@ -5722,11 +6923,18 @@ impl Planner {
         select: &SelectStatement,
         context: &PlanningContext,
     ) -> Result<()> {
-        let group_by = self.rewrite_group_by_positions(&select.group_by, &select.columns);
+        let group_by_source_columns = self.visible_source_output_columns(select, context)?;
+        let group_by = self.rewrite_group_by_positions(
+            &select.group_by,
+            &select.columns,
+            &group_by_source_columns,
+        )?;
         if !select.joins.is_empty()
             || matches!(
                 select.from,
-                FromItem::Subquery { .. } | FromItem::Values { .. }
+                FromItem::Subquery { .. }
+                    | FromItem::Values { .. }
+                    | FromItem::PragmaTableFunction { .. }
             )
         {
             let scope = self.build_scope(select, context)?;
@@ -5785,21 +6993,8 @@ impl Planner {
         for item in &normalized_columns {
             self.require_select_item_columns(schema, item)?;
             match item {
-                SelectItem::Wildcard => {
-                    return Err(DbError::plan(
-                        "wildcard cannot be used with GROUP BY or aggregate projections",
-                    ));
-                }
-                SelectItem::Column(name) | SelectItem::AliasedColumn { name, .. } => {
-                    if !self.group_by_contains_expr(
-                        &normalized_group_by,
-                        &ScalarExpr::Column(name.clone()),
-                    ) {
-                        return Err(DbError::plan(format!(
-                            "non-aggregate column {name} must appear in GROUP BY"
-                        )));
-                    }
-                }
+                SelectItem::Wildcard => {}
+                SelectItem::Column(_) | SelectItem::AliasedColumn { .. } => {}
                 SelectItem::Expr { expr, .. } => {
                     if Self::scalar_expr_has_aggregate(expr) {
                         self.require_aggregate_scalar_reference(
@@ -5807,11 +7002,6 @@ impl Planner {
                             &normalized_columns,
                             &normalized_group_by,
                         )?;
-                    } else if !self.group_by_contains_expr(&normalized_group_by, expr) {
-                        return Err(DbError::plan(format!(
-                            "non-aggregate expression {} must appear in GROUP BY",
-                            self.scalar_expr_display(expr)
-                        )));
                     }
                 }
                 SelectItem::Aggregate { .. } => {}
@@ -5914,13 +7104,27 @@ impl Planner {
         hidden_columns: Vec<String>,
     ) -> Result<TableBinding> {
         match from {
-            FromItem::Table { name, alias }
-            | FromItem::TableIndexed { name, alias, .. }
-            | FromItem::TableNotIndexed { name, alias } => {
-                let schema = self.require_schema(context, name)?.clone();
+            FromItem::Table {
+                name,
+                schema: table_schema,
+                alias,
+            }
+            | FromItem::TableIndexed {
+                name,
+                schema: table_schema,
+                alias,
+                ..
+            }
+            | FromItem::TableNotIndexed {
+                name,
+                schema: table_schema,
+                alias,
+            } => {
+                let storage_name = context.resolved_table_name(name, table_schema.as_deref());
+                let schema = self.require_schema(context, &storage_name)?.clone();
                 let exposes_rowid = self.schema_exposes_rowid(&schema);
                 Ok(TableBinding {
-                    table: name.clone(),
+                    table: storage_name,
                     alias: alias.clone(),
                     schema,
                     exposes_rowid,
@@ -5959,7 +7163,24 @@ impl Planner {
                 Ok(TableBinding {
                     table: table.clone(),
                     alias: alias.clone(),
-                    schema: Schema::new(&table, self.derived_output_schema(&output_columns)),
+                    schema: Schema::new(
+                        &table,
+                        self.derived_typeless_output_schema(&output_columns),
+                    ),
+                    exposes_rowid: false,
+                    hidden_columns,
+                })
+            }
+            FromItem::PragmaTableFunction { name, alias, .. } => {
+                let table = alias.clone().unwrap_or_else(|| name.clone());
+                let output_columns = self.pragma_table_function_output_columns(name)?;
+                Ok(TableBinding {
+                    table: table.clone(),
+                    alias: Some(table.clone()),
+                    schema: Schema::new(
+                        &table,
+                        self.derived_typeless_output_schema(&output_columns),
+                    ),
                     exposes_rowid: false,
                     hidden_columns,
                 })
@@ -5992,6 +7213,193 @@ impl Planner {
             .collect()
     }
 
+    fn derived_typeless_output_schema(&self, columns: &[String]) -> Vec<ColumnDef> {
+        columns
+            .iter()
+            .cloned()
+            .map(|name| ColumnDef::new(name, ColumnType::Any).declared_type(""))
+            .collect()
+    }
+
+    pub(crate) fn view_output_schema(
+        &self,
+        select: &SelectStatement,
+        context: &PlanningContext,
+    ) -> Result<Vec<ColumnDef>> {
+        let scope = self.build_scope(select, context)?;
+        let wildcard_columns = select
+            .columns
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard))
+            .then(|| self.view_visible_source_columns(select, context))
+            .transpose()?;
+
+        let mut columns = Vec::new();
+        for item in &select.columns {
+            match item {
+                SelectItem::Wildcard => columns.extend(
+                    wildcard_columns
+                        .as_ref()
+                        .expect("wildcard columns must be precomputed")
+                        .iter()
+                        .cloned(),
+                ),
+                SelectItem::Column(name) => {
+                    columns.push(self.view_column_def_for_column_ref(&scope, name, name)?);
+                }
+                SelectItem::AliasedColumn { name, alias } => {
+                    columns.push(self.view_column_def_for_column_ref(&scope, name, alias)?);
+                }
+                SelectItem::Expr { expr, alias } => {
+                    let output_name = alias
+                        .clone()
+                        .unwrap_or_else(|| self.scalar_expr_display(expr));
+                    let mut column = ColumnDef::new(output_name, ColumnType::Any);
+                    if let Some(declared_type) =
+                        self.view_declared_type_for_scalar_expr(&scope, expr)?
+                    {
+                        column = column.declared_type(declared_type);
+                    }
+                    columns.push(column);
+                }
+                SelectItem::Aggregate {
+                    func, arg, alias, ..
+                } => {
+                    let output_name = alias
+                        .clone()
+                        .unwrap_or_else(|| self.aggregate_output_name(*func, arg));
+                    columns.push(ColumnDef::new(output_name, ColumnType::Any));
+                }
+            }
+        }
+        Ok(columns)
+    }
+
+    fn fallback_view_output_schema(
+        &self,
+        select: &SelectStatement,
+        view_columns: Option<&Vec<String>>,
+    ) -> Vec<ColumnDef> {
+        let columns = select
+            .columns
+            .iter()
+            .filter_map(|item| self.select_item_output_name(item))
+            .map(|name| ColumnDef::new(name, ColumnType::Any))
+            .collect::<Vec<_>>();
+        self.apply_view_column_names_for_create(columns, view_columns)
+    }
+
+    fn apply_view_column_names_for_create(
+        &self,
+        mut columns: Vec<ColumnDef>,
+        view_columns: Option<&Vec<String>>,
+    ) -> Vec<ColumnDef> {
+        let Some(view_columns) = view_columns else {
+            return columns;
+        };
+        if view_columns.len() != columns.len() {
+            return view_columns
+                .iter()
+                .cloned()
+                .map(|name| ColumnDef::new(name, ColumnType::Any))
+                .collect();
+        }
+        for (column, name) in columns.iter_mut().zip(view_columns.iter()) {
+            column.name = name.clone();
+        }
+        columns
+    }
+
+    pub(crate) fn apply_view_column_names(
+        &self,
+        mut columns: Vec<ColumnDef>,
+        view_columns: Option<&Vec<String>>,
+    ) -> Result<Vec<ColumnDef>> {
+        let Some(view_columns) = view_columns else {
+            return Ok(columns);
+        };
+        if view_columns.len() != columns.len() {
+            return Err(DbError::plan(format!(
+                "expected {} columns for view but got {}",
+                view_columns.len(),
+                columns.len()
+            )));
+        }
+        for (column, name) in columns.iter_mut().zip(view_columns.iter()) {
+            column.name = name.clone();
+        }
+        Ok(columns)
+    }
+
+    fn view_column_def_for_column_ref(
+        &self,
+        scope: &QueryScope,
+        column_ref: &str,
+        output_name: &str,
+    ) -> Result<ColumnDef> {
+        let (table, column_name) = self.resolve_column_in_scope(scope, column_ref)?;
+        let source_column = scope
+            .bindings
+            .iter()
+            .find(|binding| {
+                binding.table == table || binding.alias.as_deref() == Some(table.as_str())
+            })
+            .and_then(|binding| {
+                binding
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|column| column.name == column_name)
+            })
+            .ok_or_else(|| DbError::plan(format!("unknown column {column_ref}")))?;
+        let mut column = ColumnDef::new(output_name.to_string(), source_column.column_type);
+        column = column.declared_type(sqlite_view_declared_type_for_column(source_column));
+        Ok(column)
+    }
+
+    fn view_declared_type_for_scalar_expr(
+        &self,
+        scope: &QueryScope,
+        expr: &ScalarExpr,
+    ) -> Result<Option<String>> {
+        match expr {
+            ScalarExpr::Column(name) => self
+                .view_column_def_for_column_ref(scope, name, name)
+                .map(|column| Some(column.pragma_declared_type().to_string())),
+            ScalarExpr::Collate { expr, .. } => {
+                self.view_declared_type_for_scalar_expr(scope, expr)
+            }
+            ScalarExpr::Cast { ty, .. } => Ok(sqlite_view_declared_type_for_column_type(*ty)),
+            _ => Ok(None),
+        }
+    }
+
+    fn view_visible_source_columns(
+        &self,
+        select: &SelectStatement,
+        context: &PlanningContext,
+    ) -> Result<Vec<ColumnDef>> {
+        let scope = self.build_scope(select, context)?;
+        let mut output = Vec::new();
+        for binding in &scope.bindings {
+            for column in &binding.schema.columns {
+                if binding
+                    .hidden_columns
+                    .iter()
+                    .any(|hidden| hidden == &column.name)
+                {
+                    continue;
+                }
+                output.push(self.view_column_def_for_column_ref(
+                    &scope,
+                    &column.name,
+                    &column.name,
+                )?);
+            }
+        }
+        Ok(output)
+    }
+
     fn values_output_columns(&self, rows: &[Vec<ScalarExpr>]) -> Result<Vec<String>> {
         let width = rows.first().map_or(0, Vec::len);
         if rows.iter().any(|row| row.len() != width) {
@@ -6000,6 +7408,146 @@ impl Planner {
             ));
         }
         Ok((1..=width).map(|index| format!("column{index}")).collect())
+    }
+
+    fn pragma_table_function_output_columns(&self, name: &str) -> Result<Vec<String>> {
+        let columns = if name.eq_ignore_ascii_case("pragma_table_info") {
+            ["cid", "name", "type", "notnull", "dflt_value", "pk"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_table_xinfo") {
+            [
+                "cid",
+                "name",
+                "type",
+                "notnull",
+                "dflt_value",
+                "pk",
+                "hidden",
+            ]
+            .as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_index_list") {
+            ["seq", "name", "unique", "origin", "partial"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_index_info") {
+            ["seqno", "cid", "name"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_index_xinfo") {
+            ["seqno", "cid", "name", "desc", "coll", "key"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_foreign_key_list") {
+            [
+                "id",
+                "seq",
+                "table",
+                "from",
+                "to",
+                "on_update",
+                "on_delete",
+                "match",
+            ]
+            .as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_foreign_key_check") {
+            ["table", "rowid", "parent", "fkid"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_table_list") {
+            ["schema", "name", "type", "ncol", "wr", "strict"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_database_list") {
+            ["seq", "name", "file"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_pragma_list") {
+            ["name"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_function_list") {
+            ["name", "builtin", "type", "enc", "narg", "flags"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_compile_options") {
+            ["compile_options"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_collation_list") {
+            ["seq", "name"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_module_list") {
+            ["name"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_optimize") {
+            ["optimize"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_quick_check") {
+            ["quick_check"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_encoding") {
+            ["encoding"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_integrity_check") {
+            ["integrity_check"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_page_size") {
+            ["page_size"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_page_count") {
+            ["page_count"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_max_page_count") {
+            ["max_page_count"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_freelist_count") {
+            ["freelist_count"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_user_version") {
+            ["user_version"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_application_id") {
+            ["application_id"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_schema_version") {
+            ["schema_version"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_data_version") {
+            ["data_version"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_journal_mode") {
+            ["journal_mode"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_synchronous") {
+            ["synchronous"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_cache_size") {
+            ["cache_size"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_cache_spill") {
+            ["cache_spill"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_temp_store") {
+            ["temp_store"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_locking_mode") {
+            ["locking_mode"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_auto_vacuum") {
+            ["auto_vacuum"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_busy_timeout") {
+            ["timeout"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_analysis_limit") {
+            ["analysis_limit"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_journal_size_limit") {
+            ["journal_size_limit"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_foreign_keys") {
+            ["foreign_keys"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_defer_foreign_keys") {
+            ["defer_foreign_keys"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_read_uncommitted") {
+            ["read_uncommitted"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_query_only") {
+            ["query_only"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_count_changes") {
+            ["count_changes"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_recursive_triggers") {
+            ["recursive_triggers"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_trusted_schema") {
+            ["trusted_schema"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_ignore_check_constraints") {
+            ["ignore_check_constraints"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_automatic_index") {
+            ["automatic_index"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_cell_size_check") {
+            ["cell_size_check"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_secure_delete") {
+            ["secure_delete"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_threads") {
+            ["threads"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_soft_heap_limit") {
+            ["soft_heap_limit"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_hard_heap_limit") {
+            ["hard_heap_limit"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_full_column_names") {
+            ["full_column_names"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_short_column_names") {
+            ["short_column_names"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_fullfsync") {
+            ["fullfsync"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_checkpoint_fullfsync") {
+            ["checkpoint_fullfsync"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_empty_result_callbacks") {
+            ["empty_result_callbacks"].as_slice()
+        } else if name.eq_ignore_ascii_case("pragma_reverse_unordered_selects") {
+            ["reverse_unordered_selects"].as_slice()
+        } else {
+            return Err(DbError::plan(format!(
+                "unsupported PRAGMA table-valued function: {name}"
+            )));
+        };
+        Ok(columns.iter().map(|column| (*column).to_string()).collect())
     }
 
     fn apply_output_columns_override(
@@ -6083,10 +7631,13 @@ impl Planner {
             {
                 Ok(Vec::new())
             }
-            FromItem::Table { name, .. }
-            | FromItem::TableIndexed { name, .. }
-            | FromItem::TableNotIndexed { name, .. } => Ok(self
-                .require_schema(context, name)?
+            FromItem::Table { name, schema, .. }
+            | FromItem::TableIndexed { name, schema, .. }
+            | FromItem::TableNotIndexed { name, schema, .. } => Ok(self
+                .require_schema(
+                    context,
+                    &context.resolved_table_name(name, schema.as_deref()),
+                )?
                 .columns
                 .iter()
                 .map(|column| column.name.clone())
@@ -6097,6 +7648,9 @@ impl Planner {
             ),
             FromItem::Values { rows, columns, .. } => self
                 .apply_output_columns_override(self.values_output_columns(rows)?, columns.as_ref()),
+            FromItem::PragmaTableFunction { name, .. } => {
+                self.pragma_table_function_output_columns(name)
+            }
         }
     }
 
@@ -6112,11 +7666,12 @@ impl Planner {
             FromItem::Table { .. }
             | FromItem::TableIndexed { .. }
             | FromItem::TableNotIndexed { .. } => {
-                let (name, alias, index_hint) =
+                let (name, schema, alias, index_hint) =
                     table_source_parts(from).expect("table source pattern must expose table parts");
+                let storage_name = context.resolved_table_name(name, schema);
                 self.plan_single_table_source(
                     SingleTablePlanInput {
-                        table: name,
+                        table: &storage_name,
                         table_alias: alias,
                         index_hint,
                         columns: &wildcard,
@@ -6152,10 +7707,10 @@ impl Planner {
                     distinct: false,
                 })
             }
-            FromItem::Values { .. } => {
+            FromItem::Values { .. } | FromItem::PragmaTableFunction { .. } => {
                 let (source, alias, output_columns) = self
                     .plan_inline_source_item(from, context, outer_scope)?
-                    .expect("VALUES source item should produce a plan");
+                    .expect("inline source item should produce a plan");
                 self.plan_derived_source(DerivedSourcePlanInput {
                     alias: &alias,
                     source,
@@ -6309,16 +7864,9 @@ impl Planner {
         item: &SelectItem,
     ) -> Result<()> {
         match item {
-            SelectItem::Wildcard => Err(DbError::plan(
-                "wildcard cannot be used with GROUP BY or aggregate projections",
-            )),
+            SelectItem::Wildcard => Ok(()),
             SelectItem::Column(name) | SelectItem::AliasedColumn { name, .. } => {
                 self.resolve_column_in_scope(scope, name)?;
-                if !self.group_by_contains_expr(group_by, &ScalarExpr::Column(name.clone())) {
-                    return Err(DbError::plan(format!(
-                        "non-aggregate column {name} must appear in GROUP BY"
-                    )));
-                }
                 Ok(())
             }
             SelectItem::Expr { expr, .. } => {
@@ -6327,14 +7875,6 @@ impl Planner {
                     self.require_aggregate_scalar_reference(expr, &[item.clone()], group_by)?;
                 } else {
                     self.require_scalar_expr_scope(scope, expr)?;
-                }
-                if !Self::scalar_expr_has_aggregate(expr)
-                    && !self.group_by_contains_expr(group_by, expr)
-                {
-                    return Err(DbError::plan(format!(
-                        "non-aggregate expression {} must appear in GROUP BY",
-                        self.scalar_expr_display(expr)
-                    )));
                 }
                 Ok(())
             }
@@ -6401,13 +7941,14 @@ impl Planner {
     fn group_by_contains_expr(&self, group_by: &[ScalarExpr], expr: &ScalarExpr) -> bool {
         group_by.iter().any(|group_expr| {
             group_expr == expr
+                || scalar_expr_contains_expr(group_expr, expr)
                 || matches!((group_expr, expr), (ScalarExpr::Column(left), ScalarExpr::Column(right)) if left == right)
         })
     }
 
     fn scalar_expr_display(&self, expr: &ScalarExpr) -> String {
         match expr {
-            ScalarExpr::Literal(value) => value.to_string(),
+            ScalarExpr::Literal(value) => render_literal_sql(value),
             ScalarExpr::Column(name) => name.clone(),
             ScalarExpr::Tuple(values) => format!(
                 "({})",
@@ -6417,6 +7958,7 @@ impl Planner {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            ScalarExpr::UnaryPlus(expr) => format!("+{}", self.scalar_expr_display(expr)),
             ScalarExpr::UnaryMinus(expr) => format!("-{}", self.scalar_expr_display(expr)),
             ScalarExpr::BitNot(expr) => format!("~{}", self.scalar_expr_display(expr)),
             ScalarExpr::Not(expr) => format!("NOT {}", self.scalar_expr_display(expr)),
@@ -6476,13 +8018,13 @@ impl Planner {
                 escape,
                 negated,
             } => format!(
-                "{} {}LIKE '{}'{}",
+                "{} {}LIKE {}{}",
                 self.scalar_expr_display(expr),
                 if *negated { "NOT " } else { "" },
-                pattern,
+                self.scalar_expr_display(pattern),
                 escape
                     .as_ref()
-                    .map(|escape| format!(" ESCAPE '{}'", escape.replace('\'', "''")))
+                    .map(|escape| format!(" ESCAPE {}", self.scalar_expr_display(escape)))
                     .unwrap_or_default()
             ),
             ScalarExpr::Glob {
@@ -6490,10 +8032,10 @@ impl Planner {
                 pattern,
                 negated,
             } => format!(
-                "{} {}GLOB '{}'",
+                "{} {}GLOB {}",
                 self.scalar_expr_display(expr),
                 if *negated { "NOT " } else { "" },
-                pattern
+                self.scalar_expr_display(pattern)
             ),
             ScalarExpr::Between {
                 expr,
@@ -6608,6 +8150,7 @@ impl Planner {
                     crate::sql::ast::ScalarFunc::SqliteCompileOptionGet => {
                         "SQLITE_COMPILEOPTION_GET"
                     }
+                    crate::sql::ast::ScalarFunc::SqliteLog => "SQLITE_LOG",
                     crate::sql::ast::ScalarFunc::Likely => "LIKELY",
                     crate::sql::ast::ScalarFunc::Unlikely => "UNLIKELY",
                     crate::sql::ast::ScalarFunc::Likelihood => "LIKELIHOOD",
@@ -6649,6 +8192,8 @@ impl Planner {
                     crate::sql::ast::ScalarFunc::Replace => "REPLACE",
                     crate::sql::ast::ScalarFunc::LikeFunc => "LIKE",
                     crate::sql::ast::ScalarFunc::GlobFunc => "GLOB",
+                    crate::sql::ast::ScalarFunc::RegexpFunc => "REGEXP",
+                    crate::sql::ast::ScalarFunc::MatchFunc => "MATCH",
                     crate::sql::ast::ScalarFunc::Quote => "QUOTE",
                     crate::sql::ast::ScalarFunc::Unicode => "UNICODE",
                     crate::sql::ast::ScalarFunc::Trim => "TRIM",
@@ -6662,27 +8207,40 @@ impl Planner {
                     crate::sql::ast::ScalarFunc::Coalesce => "COALESCE",
                     crate::sql::ast::ScalarFunc::IfNull => "IFNULL",
                     crate::sql::ast::ScalarFunc::NullIf => "NULLIF",
+                    crate::sql::ast::ScalarFunc::Unknown => "UNKNOWN",
                     crate::sql::ast::ScalarFunc::Json => "JSON",
+                    crate::sql::ast::ScalarFunc::Jsonb => "JSONB",
                     crate::sql::ast::ScalarFunc::JsonValid => "JSON_VALID",
                     crate::sql::ast::ScalarFunc::JsonErrorPosition => "JSON_ERROR_POSITION",
                     crate::sql::ast::ScalarFunc::JsonPretty => "JSON_PRETTY",
                     crate::sql::ast::ScalarFunc::JsonQuote => "JSON_QUOTE",
                     crate::sql::ast::ScalarFunc::JsonExtract => "JSON_EXTRACT",
+                    crate::sql::ast::ScalarFunc::JsonbExtract => "JSONB_EXTRACT",
                     crate::sql::ast::ScalarFunc::JsonType => "JSON_TYPE",
                     crate::sql::ast::ScalarFunc::JsonArray => "JSON_ARRAY",
+                    crate::sql::ast::ScalarFunc::JsonbArray => "JSONB_ARRAY",
                     crate::sql::ast::ScalarFunc::JsonObject => "JSON_OBJECT",
+                    crate::sql::ast::ScalarFunc::JsonbObject => "JSONB_OBJECT",
                     crate::sql::ast::ScalarFunc::JsonArrayLength => "JSON_ARRAY_LENGTH",
                     crate::sql::ast::ScalarFunc::JsonRemove => "JSON_REMOVE",
+                    crate::sql::ast::ScalarFunc::JsonbRemove => "JSONB_REMOVE",
                     crate::sql::ast::ScalarFunc::JsonSet => "JSON_SET",
+                    crate::sql::ast::ScalarFunc::JsonbSet => "JSONB_SET",
                     crate::sql::ast::ScalarFunc::JsonInsert => "JSON_INSERT",
+                    crate::sql::ast::ScalarFunc::JsonbInsert => "JSONB_INSERT",
                     crate::sql::ast::ScalarFunc::JsonReplace => "JSON_REPLACE",
+                    crate::sql::ast::ScalarFunc::JsonbReplace => "JSONB_REPLACE",
                     crate::sql::ast::ScalarFunc::JsonPatch => "JSON_PATCH",
+                    crate::sql::ast::ScalarFunc::JsonbPatch => "JSONB_PATCH",
                 },
                 args.iter()
                     .map(|arg| self.scalar_expr_display(arg))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            ScalarExpr::WindowFunction { func, .. } => {
+                window_function_display_name(*func).to_string()
+            }
             ScalarExpr::Aggregate { func, arg, .. } => self.aggregate_output_name(*func, arg),
         }
     }
@@ -6705,7 +8263,50 @@ impl Planner {
                 self.resolve_column_in_scope(scope, column).map(|_| ())
             }
             OrderByExpr::Expr(expr) => self.require_scalar_expr_scope(scope, expr),
-            OrderByExpr::Position(_) => Ok(()),
+            OrderByExpr::Position(position) => self.require_order_by_position(
+                *position,
+                self.order_by_result_column_count(scope, columns),
+            ),
+        }
+    }
+
+    fn order_by_result_column_count(&self, scope: &QueryScope, columns: &[SelectItem]) -> usize {
+        columns
+            .iter()
+            .map(|item| match item {
+                SelectItem::Wildcard => self.scope_visible_column_count(scope),
+                _ => 1,
+            })
+            .sum()
+    }
+
+    fn scope_visible_column_count(&self, scope: &QueryScope) -> usize {
+        scope
+            .bindings
+            .iter()
+            .map(|binding| {
+                binding
+                    .schema
+                    .columns
+                    .iter()
+                    .filter(|column| {
+                        !binding
+                            .hidden_columns
+                            .iter()
+                            .any(|hidden| hidden == &column.name)
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    fn require_order_by_position(&self, position: usize, column_count: usize) -> Result<()> {
+        if position == 0 || position > column_count {
+            Err(DbError::plan(format!(
+                "ORDER BY term out of range - should be between 1 and {column_count}"
+            )))
+        } else {
+            Ok(())
         }
     }
 
@@ -6724,9 +8325,7 @@ impl Planner {
         group_by: &[ScalarExpr],
     ) -> Result<()> {
         match &item.expr {
-            OrderByExpr::Column(column) => {
-                self.require_aggregate_column_reference(column, columns, group_by)
-            }
+            OrderByExpr::Column(_) => Ok(()),
             OrderByExpr::Expr(expr) => {
                 self.require_aggregate_scalar_reference(expr, columns, group_by)
             }
@@ -6743,17 +8342,29 @@ impl Planner {
         match expr {
             Expr::Compare { column, .. }
             | Expr::IsNull { column, .. }
-            | Expr::Like { column, .. }
-            | Expr::Glob { column, .. }
             | Expr::Between { column, .. }
             | Expr::InList { column, .. }
             | Expr::InSubquery { column, .. }
             | Expr::CompareSubquery { column, .. } => {
-                self.require_aggregate_column_reference(column, columns, group_by)
+                let _ = column;
+                Ok(())
+            }
+            Expr::Glob {
+                column, pattern, ..
+            } => {
+                let _ = column;
+                self.require_aggregate_scalar_reference(pattern, columns, group_by)
+            }
+            Expr::Like { column, escape, .. } => {
+                let _ = column;
+                if let Some(escape) = escape {
+                    self.require_aggregate_scalar_reference(escape, columns, group_by)?;
+                }
+                Ok(())
             }
             Expr::CompareColumns { left, right, .. } => {
-                self.require_aggregate_column_reference(left, columns, group_by)?;
-                self.require_aggregate_column_reference(right, columns, group_by)
+                let _ = (left, right);
+                Ok(())
             }
             Expr::CompareScalar { left, right, .. } => {
                 self.require_aggregate_scalar_reference(left, columns, group_by)?;
@@ -6761,10 +8372,19 @@ impl Planner {
             }
             Expr::IsNullScalar { expr, .. }
             | Expr::IsBool { expr, .. }
-            | Expr::LikeScalar { expr, .. }
-            | Expr::GlobScalar { expr, .. }
             | Expr::InSubqueryScalar { expr, .. } => {
                 self.require_aggregate_scalar_reference(expr, columns, group_by)
+            }
+            Expr::GlobScalar { expr, pattern, .. } => {
+                self.require_aggregate_scalar_reference(expr, columns, group_by)?;
+                self.require_aggregate_scalar_reference(pattern, columns, group_by)
+            }
+            Expr::LikeScalar { expr, escape, .. } => {
+                self.require_aggregate_scalar_reference(expr, columns, group_by)?;
+                if let Some(escape) = escape {
+                    self.require_aggregate_scalar_reference(escape, columns, group_by)?;
+                }
+                Ok(())
             }
             Expr::Is { left, right, .. } => {
                 self.require_aggregate_scalar_reference(left, columns, group_by)?;
@@ -6808,14 +8428,15 @@ impl Planner {
 
         match expr {
             ScalarExpr::Literal(_) => Ok(()),
-            ScalarExpr::Column(name) => {
-                self.require_aggregate_column_reference(name, columns, group_by)
-            }
+            ScalarExpr::Column(_) => Ok(()),
             ScalarExpr::Tuple(values) => {
                 for value in values {
                     self.require_aggregate_scalar_reference(value, columns, group_by)?;
                 }
                 Ok(())
+            }
+            ScalarExpr::UnaryPlus(expr) => {
+                self.require_aggregate_scalar_reference(expr, columns, group_by)
             }
             ScalarExpr::UnaryMinus(expr) => {
                 self.require_aggregate_scalar_reference(expr, columns, group_by)
@@ -6851,8 +8472,16 @@ impl Planner {
                 self.require_aggregate_scalar_reference(expr, columns, group_by)
             }
             ScalarExpr::Subquery { .. } => Ok(()),
-            ScalarExpr::Like { expr, .. } | ScalarExpr::Glob { expr, .. } => {
-                self.require_aggregate_scalar_reference(expr, columns, group_by)
+            ScalarExpr::Like { expr, escape, .. } => {
+                self.require_aggregate_scalar_reference(expr, columns, group_by)?;
+                if let Some(escape) = escape {
+                    self.require_aggregate_scalar_reference(escape, columns, group_by)?;
+                }
+                Ok(())
+            }
+            ScalarExpr::Glob { expr, pattern, .. } => {
+                self.require_aggregate_scalar_reference(expr, columns, group_by)?;
+                self.require_aggregate_scalar_reference(pattern, columns, group_by)
             }
             ScalarExpr::Between {
                 expr, low, high, ..
@@ -6892,24 +8521,22 @@ impl Planner {
                 }
                 Ok(())
             }
+            ScalarExpr::WindowFunction {
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for expr in partition_by {
+                    self.require_aggregate_scalar_reference(expr, columns, group_by)?;
+                }
+                for item in order_by {
+                    if let OrderByExpr::Expr(expr) = &item.expr {
+                        self.require_aggregate_scalar_reference(expr, columns, group_by)?;
+                    }
+                }
+                Ok(())
+            }
             ScalarExpr::Aggregate { .. } => Ok(()),
-        }
-    }
-
-    fn require_aggregate_column_reference(
-        &self,
-        column: &str,
-        columns: &[SelectItem],
-        group_by: &[ScalarExpr],
-    ) -> Result<()> {
-        if self
-            .aggregate_reference_names(columns, group_by)
-            .iter()
-            .any(|name| name == column)
-        {
-            Ok(())
-        } else {
-            Err(DbError::plan(format!("unknown column {column}")))
         }
     }
 
@@ -6933,6 +8560,7 @@ impl Planner {
                             .clone()
                             .unwrap_or_else(|| self.scalar_expr_display(expr)),
                     );
+                    self.collect_scalar_expr_aggregate_reference_names(expr, &mut names);
                 }
                 SelectItem::Aggregate {
                     func, arg, alias, ..
@@ -6956,6 +8584,111 @@ impl Planner {
         names
     }
 
+    fn collect_scalar_expr_aggregate_reference_names(
+        &self,
+        expr: &ScalarExpr,
+        names: &mut Vec<String>,
+    ) {
+        match expr {
+            ScalarExpr::Aggregate { func, arg, .. } => {
+                names.push(self.aggregate_output_name(*func, arg));
+            }
+            ScalarExpr::Tuple(values) => {
+                for value in values {
+                    self.collect_scalar_expr_aggregate_reference_names(value, names);
+                }
+            }
+            ScalarExpr::UnaryPlus(expr)
+            | ScalarExpr::UnaryMinus(expr)
+            | ScalarExpr::BitNot(expr)
+            | ScalarExpr::Not(expr)
+            | ScalarExpr::Cast { expr, .. }
+            | ScalarExpr::Collate { expr, .. }
+            | ScalarExpr::IsBool { expr, .. } => {
+                self.collect_scalar_expr_aggregate_reference_names(expr, names);
+            }
+            ScalarExpr::Is { left, right, .. }
+            | ScalarExpr::Compare { left, right, .. }
+            | ScalarExpr::Binary { left, right, .. } => {
+                self.collect_scalar_expr_aggregate_reference_names(left, names);
+                self.collect_scalar_expr_aggregate_reference_names(right, names);
+            }
+            ScalarExpr::InList { expr, values, .. } => {
+                self.collect_scalar_expr_aggregate_reference_names(expr, names);
+                for value in values {
+                    self.collect_scalar_expr_aggregate_reference_names(value, names);
+                }
+            }
+            ScalarExpr::InSubquery { expr, .. }
+            | ScalarExpr::CompareSubquery { left: expr, .. } => {
+                self.collect_scalar_expr_aggregate_reference_names(expr, names);
+            }
+            ScalarExpr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.collect_scalar_expr_aggregate_reference_names(expr, names);
+                self.collect_scalar_expr_aggregate_reference_names(pattern, names);
+                if let Some(escape) = escape {
+                    self.collect_scalar_expr_aggregate_reference_names(escape, names);
+                }
+            }
+            ScalarExpr::Glob { expr, pattern, .. } => {
+                self.collect_scalar_expr_aggregate_reference_names(expr, names);
+                self.collect_scalar_expr_aggregate_reference_names(pattern, names);
+            }
+            ScalarExpr::Between {
+                expr, low, high, ..
+            } => {
+                self.collect_scalar_expr_aggregate_reference_names(expr, names);
+                self.collect_scalar_expr_aggregate_reference_names(low, names);
+                self.collect_scalar_expr_aggregate_reference_names(high, names);
+            }
+            ScalarExpr::Case {
+                base,
+                when_then_clauses,
+                else_expr,
+            } => {
+                if let Some(base) = base {
+                    self.collect_scalar_expr_aggregate_reference_names(base, names);
+                }
+                for (when_expr, then_expr) in when_then_clauses {
+                    self.collect_scalar_expr_aggregate_reference_names(when_expr, names);
+                    self.collect_scalar_expr_aggregate_reference_names(then_expr, names);
+                }
+                if let Some(else_expr) = else_expr {
+                    self.collect_scalar_expr_aggregate_reference_names(else_expr, names);
+                }
+            }
+            ScalarExpr::Function { args, .. } => {
+                for arg in args {
+                    self.collect_scalar_expr_aggregate_reference_names(arg, names);
+                }
+            }
+            ScalarExpr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for arg in args {
+                    self.collect_scalar_expr_aggregate_reference_names(arg, names);
+                }
+                for expr in partition_by {
+                    self.collect_scalar_expr_aggregate_reference_names(expr, names);
+                }
+                for item in order_by {
+                    if let OrderByExpr::Expr(expr) = &item.expr {
+                        self.collect_scalar_expr_aggregate_reference_names(expr, names);
+                    }
+                }
+            }
+            ScalarExpr::Literal(_) | ScalarExpr::Column(_) | ScalarExpr::Subquery { .. } => {}
+        }
+    }
+
     fn rewrite_aggregate_order_by_group_references(
         &self,
         item: &OrderBy,
@@ -6963,7 +8696,10 @@ impl Planner {
     ) -> OrderBy {
         OrderBy {
             expr: match &item.expr {
-                OrderByExpr::Column(column) => OrderByExpr::Column(column.clone()),
+                OrderByExpr::Column(column) => OrderByExpr::Column(
+                    self.rewrite_aggregate_column_group_reference(column, group_by)
+                        .unwrap_or_else(|| column.clone()),
+                ),
                 OrderByExpr::Expr(expr) => OrderByExpr::Expr(
                     self.rewrite_aggregate_scalar_group_references(expr, group_by),
                 ),
@@ -6975,22 +8711,115 @@ impl Planner {
         }
     }
 
+    fn rewrite_aggregate_column_group_reference(
+        &self,
+        column: &str,
+        group_by: &[ScalarExpr],
+    ) -> Option<String> {
+        group_by.iter().find_map(|group_expr| {
+            if matches!(group_expr, ScalarExpr::Column(group_column) if group_column == column) {
+                Some(self.scalar_expr_display(group_expr))
+            } else {
+                None
+            }
+        })
+    }
+
     fn rewrite_aggregate_expr_group_references(
         &self,
         expr: &Expr,
         group_by: &[ScalarExpr],
     ) -> Expr {
         match expr {
-            Expr::Compare { .. }
-            | Expr::CompareColumns { .. }
-            | Expr::IsNull { .. }
-            | Expr::InSubquery { .. }
-            | Expr::InList { .. }
-            | Expr::CompareSubquery { .. }
-            | Expr::ExistsSubquery { .. }
-            | Expr::Like { .. }
-            | Expr::Glob { .. }
-            | Expr::Between { .. } => expr.clone(),
+            Expr::Compare { column, op, value } => Expr::Compare {
+                column: self
+                    .rewrite_aggregate_column_group_reference(column, group_by)
+                    .unwrap_or_else(|| column.clone()),
+                op: *op,
+                value: value.clone(),
+            },
+            Expr::CompareColumns { left, op, right } => Expr::CompareColumns {
+                left: self
+                    .rewrite_aggregate_column_group_reference(left, group_by)
+                    .unwrap_or_else(|| left.clone()),
+                op: *op,
+                right: self
+                    .rewrite_aggregate_column_group_reference(right, group_by)
+                    .unwrap_or_else(|| right.clone()),
+            },
+            Expr::IsNull { column, negated } => Expr::IsNull {
+                column: self
+                    .rewrite_aggregate_column_group_reference(column, group_by)
+                    .unwrap_or_else(|| column.clone()),
+                negated: *negated,
+            },
+            Expr::InSubquery {
+                column,
+                query,
+                negated,
+            } => Expr::InSubquery {
+                column: self
+                    .rewrite_aggregate_column_group_reference(column, group_by)
+                    .unwrap_or_else(|| column.clone()),
+                query: query.clone(),
+                negated: *negated,
+            },
+            Expr::InList {
+                column,
+                values,
+                negated,
+            } => Expr::InList {
+                column: self
+                    .rewrite_aggregate_column_group_reference(column, group_by)
+                    .unwrap_or_else(|| column.clone()),
+                values: values.clone(),
+                negated: *negated,
+            },
+            Expr::CompareSubquery { column, op, query } => Expr::CompareSubquery {
+                column: self
+                    .rewrite_aggregate_column_group_reference(column, group_by)
+                    .unwrap_or_else(|| column.clone()),
+                op: *op,
+                query: query.clone(),
+            },
+            Expr::Like {
+                column,
+                pattern,
+                escape,
+                negated,
+            } => Expr::Like {
+                column: self
+                    .rewrite_aggregate_column_group_reference(column, group_by)
+                    .unwrap_or_else(|| column.clone()),
+                pattern: pattern.clone(),
+                escape: escape.clone(),
+                negated: *negated,
+            },
+            Expr::Glob {
+                column,
+                pattern,
+                negated,
+            } => Expr::Glob {
+                column: self
+                    .rewrite_aggregate_column_group_reference(column, group_by)
+                    .unwrap_or_else(|| column.clone()),
+                pattern: pattern.clone(),
+                negated: *negated,
+            },
+            Expr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                column: self
+                    .rewrite_aggregate_column_group_reference(column, group_by)
+                    .unwrap_or_else(|| column.clone()),
+                low: low.clone(),
+                high: high.clone(),
+                negated: *negated,
+            },
+            Expr::ExistsSubquery { .. } => expr.clone(),
             Expr::Is {
                 left,
                 right,
@@ -7054,7 +8883,9 @@ impl Planner {
             } => Expr::LikeScalar {
                 expr: self.rewrite_aggregate_scalar_group_references(expr, group_by),
                 pattern: pattern.clone(),
-                escape: escape.clone(),
+                escape: escape.as_deref().map(|escape| {
+                    Box::new(self.rewrite_aggregate_scalar_group_references(escape, group_by))
+                }),
                 negated: *negated,
             },
             Expr::GlobScalar {
@@ -7063,7 +8894,9 @@ impl Planner {
                 negated,
             } => Expr::GlobScalar {
                 expr: self.rewrite_aggregate_scalar_group_references(expr, group_by),
-                pattern: pattern.clone(),
+                pattern: Box::new(
+                    self.rewrite_aggregate_scalar_group_references(pattern, group_by),
+                ),
                 negated: *negated,
             },
             Expr::BetweenScalar {
@@ -7112,6 +8945,9 @@ impl Planner {
                     .map(|value| self.rewrite_aggregate_scalar_group_references(value, group_by))
                     .collect(),
             ),
+            ScalarExpr::UnaryPlus(expr) => ScalarExpr::UnaryPlus(Box::new(
+                self.rewrite_aggregate_scalar_group_references(expr, group_by),
+            )),
             ScalarExpr::UnaryMinus(expr) => ScalarExpr::UnaryMinus(Box::new(
                 self.rewrite_aggregate_scalar_group_references(expr, group_by),
             )),
@@ -7179,7 +9015,9 @@ impl Planner {
             } => ScalarExpr::Like {
                 expr: Box::new(self.rewrite_aggregate_scalar_group_references(expr, group_by)),
                 pattern: pattern.clone(),
-                escape: escape.clone(),
+                escape: escape.as_deref().map(|escape| {
+                    Box::new(self.rewrite_aggregate_scalar_group_references(escape, group_by))
+                }),
                 negated: *negated,
             },
             ScalarExpr::Glob {
@@ -7188,7 +9026,9 @@ impl Planner {
                 negated,
             } => ScalarExpr::Glob {
                 expr: Box::new(self.rewrite_aggregate_scalar_group_references(expr, group_by)),
-                pattern: pattern.clone(),
+                pattern: Box::new(
+                    self.rewrite_aggregate_scalar_group_references(pattern, group_by),
+                ),
                 negated: *negated,
             },
             ScalarExpr::Between {
@@ -7245,11 +9085,124 @@ impl Planner {
                     .map(|arg| self.rewrite_aggregate_scalar_group_references(arg, group_by))
                     .collect(),
             },
+            ScalarExpr::WindowFunction {
+                func,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                exclude,
+                window_name,
+                filter,
+            } => ScalarExpr::WindowFunction {
+                func: *func,
+                args: args.clone(),
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                frame: *frame,
+                exclude: *exclude,
+                window_name: window_name.clone(),
+                filter: filter.clone(),
+            },
             ScalarExpr::Aggregate { func, arg, filter } => ScalarExpr::Aggregate {
                 func: *func,
                 arg: arg.clone(),
                 filter: filter.clone(),
             },
+        }
+    }
+
+    fn render_select_sql(&self, select: &SelectStatement) -> String {
+        let mut sql = String::from("SELECT ");
+        if select.distinct {
+            sql.push_str("DISTINCT ");
+        }
+        sql.push_str(
+            &select
+                .columns
+                .iter()
+                .map(|item| self.render_select_item_sql(item))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        if !matches!(select.from, FromItem::Table { ref name, .. } if name == SINGLE_ROW_SOURCE_TABLE)
+        {
+            sql.push_str(" FROM ");
+            sql.push_str(&render_from_item_sql(&select.from, |expr| {
+                self.scalar_expr_display(expr)
+            }));
+        }
+        if let Some(filter) = &select.filter {
+            sql.push_str(" WHERE ");
+            sql.push_str(&self.render_expr_sql(filter));
+        }
+        sql
+    }
+
+    fn render_create_view_sql(
+        &self,
+        name: &str,
+        columns: Option<&Vec<String>>,
+        select: &SelectStatement,
+    ) -> String {
+        let columns = columns
+            .map(|columns| format!("({})", columns.join(", ")))
+            .unwrap_or_default();
+        format!(
+            "CREATE VIEW {name}{columns} AS {}",
+            self.render_select_sql(select)
+        )
+    }
+
+    fn render_select_item_sql(&self, item: &SelectItem) -> String {
+        match item {
+            SelectItem::Wildcard => "*".to_string(),
+            SelectItem::Column(name) => name.clone(),
+            SelectItem::AliasedColumn { name, alias } => format!("{name} AS {alias}"),
+            SelectItem::Expr { expr, alias } => {
+                let rendered = self.scalar_expr_display(expr);
+                alias
+                    .as_ref()
+                    .map_or(rendered.clone(), |alias| format!("{rendered} AS {alias}"))
+            }
+            SelectItem::Aggregate {
+                func, arg, alias, ..
+            } => {
+                let rendered = self.aggregate_output_name(*func, arg);
+                alias
+                    .as_ref()
+                    .map_or(rendered.clone(), |alias| format!("{rendered} AS {alias}"))
+            }
+        }
+    }
+
+    fn render_expr_sql(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Compare { column, op, value } => {
+                format!("{column} {} {}", compare_op_sql(*op), value)
+            }
+            Expr::CompareScalar { left, op, right } => format!(
+                "{} {} {}",
+                self.scalar_expr_display(left),
+                compare_op_sql(*op),
+                self.scalar_expr_display(right)
+            ),
+            Expr::And(left, right) => {
+                format!(
+                    "{} AND {}",
+                    self.render_expr_sql(left),
+                    self.render_expr_sql(right)
+                )
+            }
+            Expr::Or(left, right) => {
+                format!(
+                    "{} OR {}",
+                    self.render_expr_sql(left),
+                    self.render_expr_sql(right)
+                )
+            }
+            Expr::Not(expr) => format!("NOT {}", self.render_expr_sql(expr)),
+            other => format!("{other:?}"),
         }
     }
 
@@ -7259,6 +9212,7 @@ impl Planner {
             match func {
                 AggregateFunc::Count => "COUNT",
                 AggregateFunc::Sum => "SUM",
+                AggregateFunc::DecimalSum => "DECIMAL_SUM",
                 AggregateFunc::Avg => "AVG",
                 AggregateFunc::Total => "TOTAL",
                 AggregateFunc::Median => "MEDIAN",
@@ -7267,7 +9221,9 @@ impl Planner {
                 AggregateFunc::PercentileDisc => "PERCENTILE_DISC",
                 AggregateFunc::GroupConcat => "GROUP_CONCAT",
                 AggregateFunc::JsonGroupArray => "JSON_GROUP_ARRAY",
+                AggregateFunc::JsonbGroupArray => "JSONB_GROUP_ARRAY",
                 AggregateFunc::JsonGroupObject => "JSON_GROUP_OBJECT",
+                AggregateFunc::JsonbGroupObject => "JSONB_GROUP_OBJECT",
                 AggregateFunc::Min => "MIN",
                 AggregateFunc::Max => "MAX",
             },
@@ -7410,10 +9366,15 @@ impl Planner {
             | Expr::InSubquery { column, .. }
             | Expr::CompareSubquery { column, .. }
             | Expr::Like { column, .. }
-            | Expr::Glob { column, .. }
             | Expr::Between { column, .. } => self
                 .resolve_column_in_scope_chain(scope, outer_scope, column)
                 .map(|_| ()),
+            Expr::Glob {
+                column, pattern, ..
+            } => {
+                self.resolve_column_in_scope_chain(scope, outer_scope, column)?;
+                self.require_scalar_expr_scope_chain(scope, outer_scope, pattern)
+            }
             Expr::ExistsSubquery { .. } => Ok(()),
             Expr::InSubqueryScalar { expr, .. } => {
                 self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
@@ -7433,10 +9394,19 @@ impl Planner {
                 self.require_scalar_expr_scope_chain(scope, outer_scope, left)?;
                 self.require_scalar_expr_scope_chain(scope, outer_scope, right)
             }
-            Expr::IsBool { expr, .. }
-            | Expr::LikeScalar { expr, .. }
-            | Expr::GlobScalar { expr, .. } => {
+            Expr::IsBool { expr, .. } => {
                 self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
+            }
+            Expr::GlobScalar { expr, pattern, .. } => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)?;
+                self.require_scalar_expr_scope_chain(scope, outer_scope, pattern)
+            }
+            Expr::LikeScalar { expr, escape, .. } => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)?;
+                if let Some(escape) = escape {
+                    self.require_scalar_expr_scope_chain(scope, outer_scope, escape)?;
+                }
+                Ok(())
             }
             Expr::BetweenScalar {
                 expr, low, high, ..
@@ -7576,6 +9546,9 @@ impl Planner {
             ScalarExpr::Column(name) => self
                 .resolve_column_in_scope_chain(scope, outer_scope, name)
                 .map(|_| ()),
+            ScalarExpr::UnaryPlus(expr) => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
+            }
             ScalarExpr::UnaryMinus(expr) => {
                 self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
             }
@@ -7608,8 +9581,16 @@ impl Planner {
                 self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
             }
             ScalarExpr::Subquery { .. } => Ok(()),
-            ScalarExpr::Like { expr, .. } | ScalarExpr::Glob { expr, .. } => {
-                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)
+            ScalarExpr::Like { expr, escape, .. } => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)?;
+                if let Some(escape) = escape {
+                    self.require_scalar_expr_scope_chain(scope, outer_scope, escape)?;
+                }
+                Ok(())
+            }
+            ScalarExpr::Glob { expr, pattern, .. } => {
+                self.require_scalar_expr_scope_chain(scope, outer_scope, expr)?;
+                self.require_scalar_expr_scope_chain(scope, outer_scope, pattern)
             }
             ScalarExpr::Between {
                 expr, low, high, ..
@@ -7646,6 +9627,21 @@ impl Planner {
             ScalarExpr::Function { args, .. } => {
                 for arg in args {
                     self.require_scalar_expr_scope_chain(scope, outer_scope, arg)?;
+                }
+                Ok(())
+            }
+            ScalarExpr::WindowFunction {
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for expr in partition_by {
+                    self.require_scalar_expr_scope_chain(scope, outer_scope, expr)?;
+                }
+                for item in order_by {
+                    if let OrderByExpr::Expr(expr) = &item.expr {
+                        self.require_scalar_expr_scope_chain(scope, outer_scope, expr)?;
+                    }
                 }
                 Ok(())
             }
@@ -7807,41 +9803,76 @@ impl Planner {
     }
 }
 
+fn validate_strict_column_declared_type(table: &str, column: &ColumnDef) -> Result<()> {
+    let declared_type = column.pragma_declared_type();
+    let normalized = declared_type.trim().to_ascii_uppercase();
+    if matches!(
+        normalized.as_str(),
+        "INT" | "INTEGER" | "REAL" | "TEXT" | "BLOB" | "ANY"
+    ) {
+        Ok(())
+    } else {
+        Err(DbError::plan(format!(
+            "unknown datatype for {table}.{}: \"{}\"",
+            column.name, declared_type
+        )))
+    }
+}
+
 fn from_item_qualifier(from: &FromItem) -> Option<String> {
     match from {
-        FromItem::Table { name, alias }
+        FromItem::Table { name, alias, .. }
         | FromItem::TableIndexed { name, alias, .. }
-        | FromItem::TableNotIndexed { name, alias } => {
+        | FromItem::TableNotIndexed { name, alias, .. } => {
             Some(alias.clone().unwrap_or_else(|| name.clone()))
         }
         FromItem::Subquery { alias, .. } => (!alias.is_empty()).then(|| alias.clone()),
         FromItem::Values { alias, .. } => alias.clone(),
+        FromItem::PragmaTableFunction { name, alias, .. } => {
+            Some(alias.clone().unwrap_or_else(|| name.clone()))
+        }
     }
 }
 
-fn table_source_parts(from: &FromItem) -> Option<(&str, Option<&str>, TableIndexHintRef<'_>)> {
+fn table_source_parts(
+    from: &FromItem,
+) -> Option<(&str, Option<&str>, Option<&str>, TableIndexHintRef<'_>)> {
     match from {
-        FromItem::Table { name, alias } => {
-            Some((name.as_str(), alias.as_deref(), TableIndexHintRef::None))
-        }
-        FromItem::TableIndexed { name, alias, index } => Some((
+        FromItem::Table {
+            name,
+            schema,
+            alias,
+        } => Some((
             name.as_str(),
+            schema.as_deref(),
+            alias.as_deref(),
+            TableIndexHintRef::None,
+        )),
+        FromItem::TableIndexed {
+            name,
+            schema,
+            alias,
+            index,
+        } => Some((
+            name.as_str(),
+            schema.as_deref(),
             alias.as_deref(),
             TableIndexHintRef::IndexedBy(index.as_str()),
         )),
-        FromItem::TableNotIndexed { name, alias } => Some((
+        FromItem::TableNotIndexed {
+            name,
+            schema,
+            alias,
+        } => Some((
             name.as_str(),
+            schema.as_deref(),
             alias.as_deref(),
             TableIndexHintRef::NotIndexed,
         )),
-        FromItem::Subquery { .. } | FromItem::Values { .. } => None,
+        FromItem::Subquery { .. }
+        | FromItem::Values { .. }
+        | FromItem::PragmaTableFunction { .. } => None,
     }
-}
-
-fn table_index_hint(from: &FromItem) -> TableIndexHintRef<'_> {
-    table_source_parts(from)
-        .map(|(_, _, hint)| hint)
-        .unwrap_or(TableIndexHintRef::None)
 }
 
 fn join_output_using_columns(
@@ -7904,6 +9935,727 @@ fn select_item_group_expr(item: &SelectItem) -> Option<ScalarExpr> {
         }
         SelectItem::Expr { expr, .. } => Some(expr.clone()),
         SelectItem::Wildcard | SelectItem::Aggregate { .. } => None,
+    }
+}
+
+fn select_item_group_exprs(
+    columns: &[SelectItem],
+    source_columns: &[String],
+) -> Vec<Option<ScalarExpr>> {
+    let mut exprs = Vec::new();
+    for item in columns {
+        match item {
+            SelectItem::Wildcard => {
+                exprs.extend(
+                    source_columns
+                        .iter()
+                        .cloned()
+                        .map(ScalarExpr::Column)
+                        .map(Some),
+                );
+            }
+            item => exprs.push(select_item_group_expr(item)),
+        }
+    }
+    exprs
+}
+
+fn select_item_matches_expr(item: &SelectItem, expr: &ScalarExpr) -> bool {
+    match item {
+        SelectItem::Column(name) | SelectItem::AliasedColumn { name, .. } => {
+            matches!(expr, ScalarExpr::Column(expr_name) if expr_name == name)
+        }
+        SelectItem::Expr {
+            expr: select_expr, ..
+        } => select_expr == expr,
+        SelectItem::Wildcard | SelectItem::Aggregate { .. } => false,
+    }
+}
+
+fn select_item_output_name_matches(item: &SelectItem, name: &str) -> bool {
+    match item {
+        SelectItem::Column(column) => column
+            .rsplit('.')
+            .next()
+            .is_some_and(|column| column == name),
+        SelectItem::AliasedColumn {
+            name: column,
+            alias,
+        } => alias == name || column == name,
+        SelectItem::Expr { alias, .. } => alias.as_ref().is_some_and(|alias| alias == name),
+        SelectItem::Aggregate { alias, .. } => alias.as_ref().is_some_and(|alias| alias == name),
+        SelectItem::Wildcard => false,
+    }
+}
+
+fn rewrite_group_by_integer_position(
+    position: i64,
+    group_exprs: &[Option<ScalarExpr>],
+) -> Result<ScalarExpr> {
+    if position <= 0 {
+        return Err(DbError::plan(
+            "GROUP BY term out of range - should be between 1 and result column count",
+        ));
+    }
+    let Some(expr) = usize::try_from(position - 1)
+        .ok()
+        .and_then(|index| group_exprs.get(index))
+    else {
+        return Err(DbError::plan(
+            "GROUP BY term out of range - should be between 1 and result column count",
+        ));
+    };
+    expr.clone()
+        .ok_or_else(|| DbError::plan("aggregate functions are not allowed in the GROUP BY clause"))
+}
+
+fn select_item_alias_group_expr(item: &SelectItem, group_by_name: &str) -> Option<ScalarExpr> {
+    match item {
+        SelectItem::AliasedColumn { name, alias } if alias == group_by_name => {
+            Some(ScalarExpr::Column(name.clone()))
+        }
+        SelectItem::Expr {
+            expr,
+            alias: Some(alias),
+        } if alias == group_by_name => Some(expr.clone()),
+        _ => None,
+    }
+}
+
+fn select_alias_expr(columns: &[SelectItem], name: &str) -> Option<ScalarExpr> {
+    columns
+        .iter()
+        .find_map(|item| select_item_alias_group_expr(item, name))
+}
+
+fn scalar_expr_contains_expr(haystack: &ScalarExpr, needle: &ScalarExpr) -> bool {
+    if haystack == needle {
+        return true;
+    }
+    match haystack {
+        ScalarExpr::Tuple(values) => values
+            .iter()
+            .any(|value| scalar_expr_contains_expr(value, needle)),
+        ScalarExpr::UnaryPlus(expr)
+        | ScalarExpr::UnaryMinus(expr)
+        | ScalarExpr::BitNot(expr)
+        | ScalarExpr::Not(expr)
+        | ScalarExpr::Cast { expr, .. }
+        | ScalarExpr::Collate { expr, .. }
+        | ScalarExpr::IsBool { expr, .. } => scalar_expr_contains_expr(expr, needle),
+        ScalarExpr::Is { left, right, .. }
+        | ScalarExpr::Compare { left, right, .. }
+        | ScalarExpr::Binary { left, right, .. } => {
+            scalar_expr_contains_expr(left, needle) || scalar_expr_contains_expr(right, needle)
+        }
+        ScalarExpr::InList { expr, values, .. } => {
+            scalar_expr_contains_expr(expr, needle)
+                || values
+                    .iter()
+                    .any(|value| scalar_expr_contains_expr(value, needle))
+        }
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            scalar_expr_contains_expr(expr, needle)
+                || scalar_expr_contains_expr(pattern, needle)
+                || escape
+                    .as_deref()
+                    .is_some_and(|escape| scalar_expr_contains_expr(escape, needle))
+        }
+        ScalarExpr::Glob { expr, pattern, .. } => {
+            scalar_expr_contains_expr(expr, needle) || scalar_expr_contains_expr(pattern, needle)
+        }
+        ScalarExpr::Between {
+            expr, low, high, ..
+        } => {
+            scalar_expr_contains_expr(expr, needle)
+                || scalar_expr_contains_expr(low, needle)
+                || scalar_expr_contains_expr(high, needle)
+        }
+        ScalarExpr::Case {
+            base,
+            when_then_clauses,
+            else_expr,
+        } => {
+            base.as_deref()
+                .is_some_and(|expr| scalar_expr_contains_expr(expr, needle))
+                || when_then_clauses.iter().any(|(when_expr, then_expr)| {
+                    scalar_expr_contains_expr(when_expr, needle)
+                        || scalar_expr_contains_expr(then_expr, needle)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|expr| scalar_expr_contains_expr(expr, needle))
+        }
+        ScalarExpr::Function { args, .. } => args
+            .iter()
+            .any(|arg| scalar_expr_contains_expr(arg, needle)),
+        ScalarExpr::WindowFunction {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            partition_by
+                .iter()
+                .any(|expr| scalar_expr_contains_expr(expr, needle))
+                || order_by.iter().any(|item| {
+                    matches!(&item.expr, OrderByExpr::Expr(expr) if scalar_expr_contains_expr(expr, needle))
+                })
+        }
+        ScalarExpr::InSubquery { expr, .. } | ScalarExpr::CompareSubquery { left: expr, .. } => {
+            scalar_expr_contains_expr(expr, needle)
+        }
+        ScalarExpr::Literal(_)
+        | ScalarExpr::Column(_)
+        | ScalarExpr::Subquery { .. }
+        | ScalarExpr::Aggregate { .. } => false,
+    }
+}
+
+fn rewrite_expr_alias_refs(expr: &Expr, columns: &[SelectItem]) -> Expr {
+    match expr {
+        Expr::Compare { column, op, value } => {
+            if let Some(left) = select_alias_expr(columns, column) {
+                Expr::CompareScalar {
+                    left,
+                    op: *op,
+                    right: ScalarExpr::Literal(value.clone()),
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::CompareColumns { left, op, right } => {
+            let left = select_alias_expr(columns, left);
+            let right = select_alias_expr(columns, right);
+            if left.is_some() || right.is_some() {
+                Expr::CompareScalar {
+                    left: left.unwrap_or_else(|| {
+                        if let Expr::CompareColumns { left, .. } = expr {
+                            ScalarExpr::Column(left.clone())
+                        } else {
+                            unreachable!()
+                        }
+                    }),
+                    op: *op,
+                    right: right.unwrap_or_else(|| {
+                        if let Expr::CompareColumns { right, .. } = expr {
+                            ScalarExpr::Column(right.clone())
+                        } else {
+                            unreachable!()
+                        }
+                    }),
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::CompareScalar { left, op, right } => Expr::CompareScalar {
+            left: rewrite_scalar_alias_refs(left, columns),
+            op: *op,
+            right: rewrite_scalar_alias_refs(right, columns),
+        },
+        Expr::IsNull { column, negated } => {
+            if let Some(expr) = select_alias_expr(columns, column) {
+                Expr::IsNullScalar {
+                    expr,
+                    negated: *negated,
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::IsNullScalar { expr, negated } => Expr::IsNullScalar {
+            expr: rewrite_scalar_alias_refs(expr, columns),
+            negated: *negated,
+        },
+        Expr::Is {
+            left,
+            right,
+            negated,
+        } => Expr::Is {
+            left: rewrite_scalar_alias_refs(left, columns),
+            right: rewrite_scalar_alias_refs(right, columns),
+            negated: *negated,
+        },
+        Expr::IsBool {
+            expr,
+            value,
+            negated,
+            explicit,
+        } => Expr::IsBool {
+            expr: rewrite_scalar_alias_refs(expr, columns),
+            value: *value,
+            negated: *negated,
+            explicit: *explicit,
+        },
+        Expr::InSubquery {
+            column,
+            query,
+            negated,
+        } => {
+            if let Some(expr) = select_alias_expr(columns, column) {
+                Expr::InSubqueryScalar {
+                    expr,
+                    query: query.clone(),
+                    negated: *negated,
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::InList {
+            column,
+            values,
+            negated,
+        } => {
+            if let Some(expr) = select_alias_expr(columns, column) {
+                Expr::InListScalar {
+                    expr,
+                    values: values.iter().cloned().map(ScalarExpr::Literal).collect(),
+                    negated: *negated,
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::InSubqueryScalar {
+            expr,
+            query,
+            negated,
+        } => Expr::InSubqueryScalar {
+            expr: rewrite_scalar_alias_refs(expr, columns),
+            query: query.clone(),
+            negated: *negated,
+        },
+        Expr::InListScalar {
+            expr,
+            values,
+            negated,
+        } => Expr::InListScalar {
+            expr: rewrite_scalar_alias_refs(expr, columns),
+            values: values
+                .iter()
+                .map(|value| rewrite_scalar_alias_refs(value, columns))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::CompareSubquery { column, op, query } => {
+            if let Some(left) = select_alias_expr(columns, column) {
+                Expr::CompareSubqueryScalar {
+                    left,
+                    op: *op,
+                    query: query.clone(),
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::CompareSubqueryScalar { left, op, query } => Expr::CompareSubqueryScalar {
+            left: rewrite_scalar_alias_refs(left, columns),
+            op: *op,
+            query: query.clone(),
+        },
+        Expr::ExistsSubquery { .. } => expr.clone(),
+        Expr::Like {
+            column,
+            pattern,
+            escape,
+            negated,
+        } => {
+            if let Some(expr) = select_alias_expr(columns, column) {
+                Expr::LikeScalar {
+                    expr,
+                    pattern: Box::new(rewrite_scalar_alias_refs(pattern, columns)),
+                    escape: escape
+                        .as_deref()
+                        .map(|escape| Box::new(rewrite_scalar_alias_refs(escape, columns))),
+                    negated: *negated,
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::LikeScalar {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => Expr::LikeScalar {
+            expr: rewrite_scalar_alias_refs(expr, columns),
+            pattern: Box::new(rewrite_scalar_alias_refs(pattern, columns)),
+            escape: escape
+                .as_deref()
+                .map(|escape| Box::new(rewrite_scalar_alias_refs(escape, columns))),
+            negated: *negated,
+        },
+        Expr::Glob {
+            column,
+            pattern,
+            negated,
+        } => {
+            if let Some(expr) = select_alias_expr(columns, column) {
+                Expr::GlobScalar {
+                    expr,
+                    pattern: Box::new(rewrite_scalar_alias_refs(pattern, columns)),
+                    negated: *negated,
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::GlobScalar {
+            expr,
+            pattern,
+            negated,
+        } => Expr::GlobScalar {
+            expr: rewrite_scalar_alias_refs(expr, columns),
+            pattern: Box::new(rewrite_scalar_alias_refs(pattern, columns)),
+            negated: *negated,
+        },
+        Expr::Between {
+            column,
+            low,
+            high,
+            negated,
+        } => {
+            if let Some(expr) = select_alias_expr(columns, column) {
+                Expr::BetweenScalar {
+                    expr,
+                    low: ScalarExpr::Literal(low.clone()),
+                    high: ScalarExpr::Literal(high.clone()),
+                    negated: *negated,
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::BetweenScalar {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::BetweenScalar {
+            expr: rewrite_scalar_alias_refs(expr, columns),
+            low: rewrite_scalar_alias_refs(low, columns),
+            high: rewrite_scalar_alias_refs(high, columns),
+            negated: *negated,
+        },
+        Expr::Not(expr) => Expr::Not(Box::new(rewrite_expr_alias_refs(expr, columns))),
+        Expr::And(left, right) => Expr::And(
+            Box::new(rewrite_expr_alias_refs(left, columns)),
+            Box::new(rewrite_expr_alias_refs(right, columns)),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(rewrite_expr_alias_refs(left, columns)),
+            Box::new(rewrite_expr_alias_refs(right, columns)),
+        ),
+    }
+}
+
+fn rewrite_scalar_alias_refs(expr: &ScalarExpr, columns: &[SelectItem]) -> ScalarExpr {
+    match expr {
+        ScalarExpr::Column(name) => columns
+            .iter()
+            .find_map(|item| select_item_alias_group_expr(item, name))
+            .unwrap_or_else(|| expr.clone()),
+        ScalarExpr::Tuple(values) => ScalarExpr::Tuple(
+            values
+                .iter()
+                .map(|value| rewrite_scalar_alias_refs(value, columns))
+                .collect(),
+        ),
+        ScalarExpr::UnaryPlus(expr) => {
+            ScalarExpr::UnaryPlus(Box::new(rewrite_scalar_alias_refs(expr, columns)))
+        }
+        ScalarExpr::UnaryMinus(expr) => {
+            ScalarExpr::UnaryMinus(Box::new(rewrite_scalar_alias_refs(expr, columns)))
+        }
+        ScalarExpr::BitNot(expr) => {
+            ScalarExpr::BitNot(Box::new(rewrite_scalar_alias_refs(expr, columns)))
+        }
+        ScalarExpr::Not(expr) => {
+            ScalarExpr::Not(Box::new(rewrite_scalar_alias_refs(expr, columns)))
+        }
+        ScalarExpr::Cast { expr, ty } => ScalarExpr::Cast {
+            expr: Box::new(rewrite_scalar_alias_refs(expr, columns)),
+            ty: *ty,
+        },
+        ScalarExpr::Collate { expr, collation } => ScalarExpr::Collate {
+            expr: Box::new(rewrite_scalar_alias_refs(expr, columns)),
+            collation: collation.clone(),
+        },
+        ScalarExpr::Is {
+            left,
+            right,
+            negated,
+        } => ScalarExpr::Is {
+            left: Box::new(rewrite_scalar_alias_refs(left, columns)),
+            right: Box::new(rewrite_scalar_alias_refs(right, columns)),
+            negated: *negated,
+        },
+        ScalarExpr::IsBool {
+            expr,
+            value,
+            negated,
+        } => ScalarExpr::IsBool {
+            expr: Box::new(rewrite_scalar_alias_refs(expr, columns)),
+            value: *value,
+            negated: *negated,
+        },
+        ScalarExpr::InList {
+            expr,
+            values,
+            negated,
+        } => ScalarExpr::InList {
+            expr: Box::new(rewrite_scalar_alias_refs(expr, columns)),
+            values: values
+                .iter()
+                .map(|value| rewrite_scalar_alias_refs(value, columns))
+                .collect(),
+            negated: *negated,
+        },
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => ScalarExpr::Like {
+            expr: Box::new(rewrite_scalar_alias_refs(expr, columns)),
+            pattern: Box::new(rewrite_scalar_alias_refs(pattern, columns)),
+            escape: escape
+                .as_deref()
+                .map(|escape| Box::new(rewrite_scalar_alias_refs(escape, columns))),
+            negated: *negated,
+        },
+        ScalarExpr::Glob {
+            expr,
+            pattern,
+            negated,
+        } => ScalarExpr::Glob {
+            expr: Box::new(rewrite_scalar_alias_refs(expr, columns)),
+            pattern: Box::new(rewrite_scalar_alias_refs(pattern, columns)),
+            negated: *negated,
+        },
+        ScalarExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => ScalarExpr::Between {
+            expr: Box::new(rewrite_scalar_alias_refs(expr, columns)),
+            low: Box::new(rewrite_scalar_alias_refs(low, columns)),
+            high: Box::new(rewrite_scalar_alias_refs(high, columns)),
+            negated: *negated,
+        },
+        ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+            left: Box::new(rewrite_scalar_alias_refs(left, columns)),
+            op: *op,
+            right: Box::new(rewrite_scalar_alias_refs(right, columns)),
+        },
+        ScalarExpr::Case {
+            base,
+            when_then_clauses,
+            else_expr,
+        } => ScalarExpr::Case {
+            base: base
+                .as_deref()
+                .map(|expr| Box::new(rewrite_scalar_alias_refs(expr, columns))),
+            when_then_clauses: when_then_clauses
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    (
+                        rewrite_scalar_alias_refs(when_expr, columns),
+                        rewrite_scalar_alias_refs(then_expr, columns),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_deref()
+                .map(|expr| Box::new(rewrite_scalar_alias_refs(expr, columns))),
+        },
+        ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+            left: Box::new(rewrite_scalar_alias_refs(left, columns)),
+            op: *op,
+            right: Box::new(rewrite_scalar_alias_refs(right, columns)),
+        },
+        ScalarExpr::Function { func, args } => ScalarExpr::Function {
+            func: *func,
+            args: args
+                .iter()
+                .map(|arg| rewrite_scalar_alias_refs(arg, columns))
+                .collect(),
+        },
+        ScalarExpr::WindowFunction {
+            func,
+            args,
+            partition_by,
+            order_by,
+            frame,
+            exclude,
+            window_name,
+            filter,
+        } => ScalarExpr::WindowFunction {
+            func: *func,
+            args: args.clone(),
+            partition_by: partition_by.clone(),
+            order_by: order_by.clone(),
+            frame: *frame,
+            exclude: *exclude,
+            window_name: window_name.clone(),
+            filter: filter.clone(),
+        },
+        ScalarExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => ScalarExpr::InSubquery {
+            expr: Box::new(rewrite_scalar_alias_refs(expr, columns)),
+            query: query.clone(),
+            negated: *negated,
+        },
+        ScalarExpr::CompareSubquery { left, op, query } => ScalarExpr::CompareSubquery {
+            left: Box::new(rewrite_scalar_alias_refs(left, columns)),
+            op: *op,
+            query: query.clone(),
+        },
+        ScalarExpr::Subquery { .. } | ScalarExpr::Aggregate { .. } | ScalarExpr::Literal(_) => {
+            expr.clone()
+        }
+    }
+}
+
+fn render_from_item_sql(from: &FromItem, render_scalar: impl Fn(&ScalarExpr) -> String) -> String {
+    match from {
+        FromItem::Table { name, alias, .. } => alias
+            .as_ref()
+            .map_or_else(|| name.clone(), |alias| format!("{name} AS {alias}")),
+        FromItem::TableIndexed {
+            name, alias, index, ..
+        } => {
+            let alias = alias
+                .as_ref()
+                .map_or_else(String::new, |alias| format!(" AS {alias}"));
+            format!("{name}{alias} INDEXED BY {index}")
+        }
+        FromItem::TableNotIndexed { name, alias, .. } => {
+            let alias = alias
+                .as_ref()
+                .map_or_else(String::new, |alias| format!(" AS {alias}"));
+            format!("{name}{alias} NOT INDEXED")
+        }
+        FromItem::Subquery { alias, .. } => format!("(SELECT ...) AS {alias}"),
+        FromItem::Values { rows, alias, .. } => {
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    format!(
+                        "({})",
+                        row.iter()
+                            .map(&render_scalar)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            alias.as_ref().map_or_else(
+                || format!("(VALUES {rows})"),
+                |alias| format!("(VALUES {rows}) AS {alias}"),
+            )
+        }
+        FromItem::PragmaTableFunction {
+            name,
+            argument,
+            alias,
+        } => {
+            let rendered = argument.as_ref().map_or_else(
+                || name.clone(),
+                |argument| format!("{name}('{}')", argument.replace('\'', "''")),
+            );
+            alias
+                .as_ref()
+                .map_or(rendered.clone(), |alias| format!("{rendered} AS {alias}"))
+        }
+    }
+}
+
+fn window_function_display_name(func: WindowFunc) -> &'static str {
+    match func {
+        WindowFunc::RowNumber => "ROW_NUMBER()",
+        WindowFunc::Rank => "RANK()",
+        WindowFunc::DenseRank => "DENSE_RANK()",
+        WindowFunc::Lag => "LAG()",
+        WindowFunc::Lead => "LEAD()",
+        WindowFunc::Ntile => "NTILE()",
+        WindowFunc::PercentRank => "PERCENT_RANK()",
+        WindowFunc::CumeDist => "CUME_DIST()",
+        WindowFunc::FirstValue => "FIRST_VALUE()",
+        WindowFunc::LastValue => "LAST_VALUE()",
+        WindowFunc::NthValue => "NTH_VALUE()",
+        WindowFunc::Count => "COUNT()",
+        WindowFunc::Sum => "SUM()",
+        WindowFunc::Avg => "AVG()",
+        WindowFunc::Total => "TOTAL()",
+        WindowFunc::Min => "MIN()",
+        WindowFunc::Max => "MAX()",
+        WindowFunc::GroupConcat => "GROUP_CONCAT()",
+        WindowFunc::JsonGroupArray => "JSON_GROUP_ARRAY()",
+        WindowFunc::JsonGroupObject => "JSON_GROUP_OBJECT()",
+    }
+}
+
+fn compare_op_sql(op: CompareOp) -> &'static str {
+    match op {
+        CompareOp::Eq => "=",
+        CompareOp::Ne => "!=",
+        CompareOp::Gt => ">",
+        CompareOp::Gte => ">=",
+        CompareOp::Lt => "<",
+        CompareOp::Lte => "<=",
+    }
+}
+
+fn render_literal_sql(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(true) => "TRUE".to_string(),
+        Value::Boolean(false) => "FALSE".to_string(),
+        Value::Integer(value) => value.to_string(),
+        Value::Real(value) => value.to_string(),
+        Value::Blob(value) => {
+            let hex = value
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            format!("X'{hex}'")
+        }
+        Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
+    }
+}
+
+fn sqlite_view_declared_type_for_column(column: &ColumnDef) -> String {
+    let declared_type = column.pragma_declared_type();
+    if matches!(column.column_type, ColumnType::Any) && column.declared_type.is_some() {
+        return declared_type.to_string();
+    }
+    if !declared_type.is_empty() {
+        return declared_type.to_string();
+    }
+    "BLOB".to_string()
+}
+
+fn sqlite_view_declared_type_for_column_type(column_type: ColumnType) -> Option<String> {
+    match column_type {
+        ColumnType::Integer => Some("INT".to_string()),
+        ColumnType::Text => Some("TEXT".to_string()),
+        ColumnType::Real => Some("REAL".to_string()),
+        ColumnType::Numeric | ColumnType::Boolean | ColumnType::Any => Some("NUM".to_string()),
+        ColumnType::Blob => Some("BLOB".to_string()),
     }
 }
 

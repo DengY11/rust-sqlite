@@ -15,6 +15,7 @@ fn select_statement(columns: Vec<SelectItem>, table: &str, filter: Option<Expr>)
         columns,
         from: FromItem::Table {
             name: table.to_string(),
+            schema: None,
             alias: None,
         },
         joins: vec![],
@@ -48,32 +49,102 @@ fn test_executor<'a>(
     current_txn: &'a Cell<Option<rustsql::engine::TransactionId>>,
     last_insert_rowid: &'a Cell<i64>,
 ) -> Executor<'a, MemoryStorage> {
+    let savepoint_transaction = Box::leak(Box::new(Cell::new(false)));
+    let savepoint_stack = Box::leak(Box::new(std::cell::RefCell::new(Vec::new())));
     let changes = Box::leak(Box::new(Cell::new(0)));
     let total_changes = Box::leak(Box::new(Cell::new(0)));
+    let temp_database_used = Box::leak(Box::new(Cell::new(false)));
+    let deferred_foreign_keys_pending = Box::leak(Box::new(Cell::new(false)));
+    let defer_foreign_keys = Box::leak(Box::new(Cell::new(false)));
     let foreign_keys = Box::leak(Box::new(Cell::new(false)));
     let read_uncommitted = Box::leak(Box::new(Cell::new(false)));
     let query_only = Box::leak(Box::new(Cell::new(false)));
+    let count_changes = Box::leak(Box::new(Cell::new(false)));
     let recursive_triggers = Box::leak(Box::new(Cell::new(false)));
     let trusted_schema = Box::leak(Box::new(Cell::new(false)));
     let threads = Box::leak(Box::new(Cell::new(0_u32)));
+    let synchronous = Box::leak(Box::new(Cell::new(2_i64)));
+    let temp_synchronous = Box::leak(Box::new(Cell::new(0_i64)));
+    let temp_store = Box::leak(Box::new(Cell::new(0_i64)));
+    let journal_mode = Box::leak(Box::new(std::cell::RefCell::new("memory".to_string())));
+    let temp_journal_mode = Box::leak(Box::new(std::cell::RefCell::new("delete".to_string())));
+    let locking_mode = Box::leak(Box::new(std::cell::RefCell::new("normal".to_string())));
+    let temp_locking_mode = Box::leak(Box::new(std::cell::RefCell::new("exclusive".to_string())));
     let cache_size = Box::leak(Box::new(Cell::new(2000_i64)));
+    let temp_cache_size = Box::leak(Box::new(Cell::new(0_i64)));
+    let cache_spill = Box::leak(Box::new(Cell::new(2000_i64)));
     let busy_timeout = Box::leak(Box::new(Cell::new(0_i64)));
+    let secure_delete = Box::leak(Box::new(Cell::new(2_i64)));
+    let temp_secure_delete = Box::leak(Box::new(Cell::new(2_i64)));
+    let wal_autocheckpoint = Box::leak(Box::new(Cell::new(1000_i64)));
+    let auto_vacuum = Box::leak(Box::new(Cell::new(0_i64)));
+    let max_page_count = Box::leak(Box::new(Cell::new(1_073_741_823_i64)));
+    let temp_user_version = Box::leak(Box::new(Cell::new(0_u32)));
+    let temp_application_id = Box::leak(Box::new(Cell::new(0_u32)));
+    let temp_schema_version = Box::leak(Box::new(Cell::new(0_u32)));
+    let mmap_size = Box::leak(Box::new(Cell::new(0_i64)));
+    let analysis_limit = Box::leak(Box::new(Cell::new(0_u32)));
+    let journal_size_limit = Box::leak(Box::new(Cell::new(-1_i64)));
+    let soft_heap_limit = Box::leak(Box::new(Cell::new(0_i64)));
+    let automatic_index = Box::leak(Box::new(Cell::new(true)));
+    let cell_size_check = Box::leak(Box::new(Cell::new(false)));
+    let full_column_names = Box::leak(Box::new(Cell::new(false)));
+    let short_column_names = Box::leak(Box::new(Cell::new(true)));
+    let fullfsync = Box::leak(Box::new(Cell::new(false)));
+    let checkpoint_fullfsync = Box::leak(Box::new(Cell::new(true)));
+    let empty_result_callbacks = Box::leak(Box::new(Cell::new(false)));
     let reverse_unordered_selects = Box::leak(Box::new(Cell::new(false)));
+    let temp_page_size = Box::leak(Box::new(Cell::new(4096_u32)));
     Executor::new(
         storage,
         current_txn,
+        savepoint_transaction,
+        savepoint_stack,
         last_insert_rowid,
         changes,
         total_changes,
+        temp_database_used,
+        deferred_foreign_keys_pending,
+        defer_foreign_keys,
         foreign_keys,
         read_uncommitted,
         query_only,
+        count_changes,
         recursive_triggers,
         trusted_schema,
         threads,
+        synchronous,
+        temp_synchronous,
+        temp_store,
+        journal_mode,
+        temp_journal_mode,
+        locking_mode,
+        temp_locking_mode,
         cache_size,
+        temp_cache_size,
+        cache_spill,
         busy_timeout,
+        secure_delete,
+        temp_secure_delete,
+        wal_autocheckpoint,
+        auto_vacuum,
+        max_page_count,
+        temp_user_version,
+        temp_application_id,
+        temp_schema_version,
+        mmap_size,
+        analysis_limit,
+        journal_size_limit,
+        soft_heap_limit,
+        automatic_index,
+        cell_size_check,
+        full_column_names,
+        short_column_names,
+        fullfsync,
+        checkpoint_fullfsync,
+        empty_result_callbacks,
         reverse_unordered_selects,
+        temp_page_size,
     )
 }
 
@@ -92,6 +163,7 @@ fn executor_runs_seq_scan_with_wildcard_projection_and_filter() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -158,6 +230,7 @@ fn executor_supports_generated_columns_on_create_insert_and_update() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
 
@@ -189,6 +262,7 @@ fn executor_supports_generated_columns_on_create_insert_and_update() {
     executor
         .execute(Plan::Update {
             table: "metrics".to_string(),
+            or_conflict: None,
             assignments: vec![rustsql::sql::ast::Assignment {
                 column: "base".to_string(),
                 value: rustsql::sql::ast::ScalarExpr::Literal(Value::Integer(5)),
@@ -233,6 +307,7 @@ fn executor_rejects_explicit_values_for_generated_columns() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
 
@@ -273,6 +348,7 @@ fn executor_allows_without_rowid_in_create_table() {
             strict: false,
             without_rowid: true,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
 
@@ -311,6 +387,7 @@ fn executor_allows_desc_integer_primary_key_in_create_table() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
 
@@ -344,6 +421,7 @@ fn executor_runs_index_scan_selected_by_optimizer() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -429,6 +507,7 @@ fn executor_rechecks_full_filter_after_prefix_index_scan() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -538,6 +617,7 @@ fn executor_rejects_qualified_duplicate_output_from_joined_wildcard_derived_sour
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -551,6 +631,7 @@ fn executor_rejects_qualified_duplicate_output_from_joined_wildcard_derived_sour
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -649,6 +730,7 @@ fn executor_uses_eq_prefix_index_scan_even_with_range_term_in_filter() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -765,6 +847,7 @@ fn executor_uses_leading_column_range_scan() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -871,6 +954,7 @@ fn executor_uses_two_sided_range_scan_after_eq_prefix() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -1014,6 +1098,7 @@ fn executor_evaluates_not_is_null_and_inclusive_range_filters() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -1106,6 +1191,7 @@ fn executor_merges_or_index_scans_and_deduplicates_rows() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor
@@ -1239,6 +1325,7 @@ fn executor_projects_selected_columns_in_schema_order() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         })
         .unwrap();
     executor

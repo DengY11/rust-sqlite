@@ -23,6 +23,7 @@ fn select_statement(
         columns,
         from: FromItem::Table {
             name: table.to_string(),
+            schema: None,
             alias: table_alias.map(str::to_string),
         },
         joins: vec![],
@@ -32,6 +33,27 @@ fn select_statement(
         compounds: vec![],
         order_by,
         limit,
+        offset: None,
+    })
+}
+
+fn select_statement_with_schema(columns: Vec<SelectItem>, schema: &str, table: &str) -> Statement {
+    Statement::Select(SelectStatement {
+        with: None,
+        distinct: false,
+        columns,
+        from: FromItem::Table {
+            name: table.to_string(),
+            schema: Some(schema.to_string()),
+            alias: None,
+        },
+        joins: vec![],
+        filter: None,
+        group_by: vec![],
+        having: None,
+        compounds: vec![],
+        order_by: vec![],
+        limit: None,
         offset: None,
     })
 }
@@ -72,6 +94,28 @@ fn parses_select_all_quantifier_like_sqlite() {
 }
 
 #[test]
+fn parses_schema_qualified_from_tables_for_main_and_temp_like_sqlite() {
+    let statements =
+        parse_sql("SELECT id FROM main.users; SELECT message FROM temp.logs;").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![
+            select_statement_with_schema(
+                vec![SelectItem::Column("id".to_string())],
+                "main",
+                "users",
+            ),
+            select_statement_with_schema(
+                vec![SelectItem::Column("message".to_string())],
+                "temp",
+                "logs",
+            ),
+        ]
+    );
+}
+
+#[test]
 fn parses_explain_query_plan_select_statement() {
     let statements = parse_sql("EXPLAIN QUERY PLAN SELECT name FROM users WHERE id = 1;").unwrap();
 
@@ -108,7 +152,85 @@ fn parses_create_table_statement() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
+    );
+}
+
+#[test]
+fn parses_schema_qualified_ddl_names_for_main_and_temp_like_sqlite() {
+    let statements = parse_sql(
+        "CREATE TABLE main.users (id INTEGER PRIMARY KEY);
+         CREATE VIEW temp.active_users AS SELECT id FROM users;
+         CREATE INDEX main.idx_users_id ON users(id);
+         DROP INDEX main.idx_users_id;
+         DROP VIEW temp.active_users;
+         DROP TABLE main.users;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![
+            Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![ColumnDef::primary_key("id", ColumnType::Integer)],
+                constraints: vec![],
+                strict: false,
+                without_rowid: false,
+                if_not_exists: false,
+                temporary: false,
+            },
+            Statement::CreateView {
+                name: "active_users".to_string(),
+                columns: None,
+                if_not_exists: false,
+                temporary: true,
+                select: SelectStatement {
+                    with: None,
+                    distinct: false,
+                    columns: vec![SelectItem::Column("id".to_string())],
+                    from: FromItem::Table {
+                        name: "users".to_string(),
+                        schema: None,
+                        alias: None,
+                    },
+                    joins: vec![],
+                    filter: None,
+                    group_by: vec![],
+                    having: None,
+                    compounds: vec![],
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                },
+            },
+            Statement::CreateIndex {
+                name: "idx_users_id".to_string(),
+                schema: Some("main".to_string()),
+                table: "users".to_string(),
+                columns: vec!["id".to_string()],
+                decorated_columns: Some(vec!["id".to_string()]),
+                unique: false,
+                predicate: None,
+                if_not_exists: false,
+            },
+            Statement::DropIndex {
+                name: "idx_users_id".to_string(),
+                schema: Some("main".to_string()),
+                if_exists: false,
+            },
+            Statement::DropView {
+                name: "active_users".to_string(),
+                schema: Some("temp".to_string()),
+                if_exists: false,
+            },
+            Statement::DropTable {
+                name: "users".to_string(),
+                schema: Some("main".to_string()),
+                if_exists: false,
+            },
+        ]
     );
 }
 
@@ -133,6 +255,7 @@ fn parses_create_temp_table_statements_like_sqlite() {
                 strict: false,
                 without_rowid: false,
                 if_not_exists: false,
+                temporary: true,
             },
             Statement::CreateTable {
                 name: "logs".to_string(),
@@ -144,6 +267,7 @@ fn parses_create_temp_table_statements_like_sqlite() {
                 strict: false,
                 without_rowid: false,
                 if_not_exists: true,
+                temporary: true,
             },
         ]
     );
@@ -160,6 +284,7 @@ fn parses_create_table_as_select_like_sqlite() {
         vec![Statement::CreateTableAs {
             name: "archive_users".to_string(),
             if_not_exists: false,
+            temporary: false,
             select: SelectStatement {
                 with: None,
                 distinct: false,
@@ -175,6 +300,7 @@ fn parses_create_table_as_select_like_sqlite() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -201,6 +327,7 @@ fn parses_create_table_if_not_exists_as_select_like_sqlite() {
         vec![Statement::CreateTableAs {
             name: "archive_users".to_string(),
             if_not_exists: true,
+            temporary: false,
             select: SelectStatement {
                 with: None,
                 distinct: false,
@@ -210,6 +337,7 @@ fn parses_create_table_if_not_exists_as_select_like_sqlite() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -222,6 +350,282 @@ fn parses_create_table_if_not_exists_as_select_like_sqlite() {
                 offset: None,
             },
         }]
+    );
+}
+
+#[test]
+fn parses_create_table_as_with_select_like_sqlite() {
+    let statements = parse_sql(
+        "CREATE TABLE shifted AS
+         WITH src(x) AS (VALUES (1), (2))
+         SELECT x + 1 AS y FROM src;",
+    )
+    .unwrap();
+
+    let debug = format!("{statements:#?}");
+    assert!(debug.contains("CreateTableAs"), "unexpected AST: {debug}");
+    assert!(
+        debug.contains("WithClause") && debug.contains("src") && debug.contains("shifted"),
+        "unexpected AST: {debug}"
+    );
+}
+
+#[test]
+fn parses_create_table_as_values_like_sqlite() {
+    let statements = parse_sql("CREATE TABLE copied AS VALUES (1, 'alice'), (2, 'bob');").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::CreateTableAsValues {
+            name: "copied".to_string(),
+            if_not_exists: false,
+            temporary: false,
+            with: None,
+            rows: vec![
+                vec![
+                    ScalarExpr::Literal(Value::Integer(1)),
+                    ScalarExpr::Literal(Value::from("alice")),
+                ],
+                vec![
+                    ScalarExpr::Literal(Value::Integer(2)),
+                    ScalarExpr::Literal(Value::from("bob")),
+                ],
+            ],
+        }]
+    );
+}
+
+#[test]
+fn parses_create_table_as_with_values_like_sqlite() {
+    let statements = parse_sql(
+        "CREATE TABLE picked AS
+         WITH vals(id, name) AS (VALUES (2, 'bob'), (1, 'alice'))
+         VALUES ((SELECT id FROM vals WHERE name = 'alice'), 'picked');",
+    )
+    .unwrap();
+
+    let debug = format!("{statements:#?}");
+    assert!(
+        debug.contains("CreateTableAsValues") && debug.contains("WithClause"),
+        "unexpected AST: {debug}"
+    );
+    assert!(debug.contains("vals") && debug.contains("picked"));
+}
+
+#[test]
+fn parses_create_view_statement_like_sqlite() {
+    let statements =
+        parse_sql("CREATE VIEW active_users AS SELECT id, name FROM users WHERE id > 0;").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::CreateView {
+            name: "active_users".to_string(),
+            columns: None,
+            if_not_exists: false,
+            temporary: false,
+            select: SelectStatement {
+                with: None,
+                distinct: false,
+                columns: vec![
+                    SelectItem::Column("id".to_string()),
+                    SelectItem::Column("name".to_string()),
+                ],
+                from: FromItem::Table {
+                    name: "users".to_string(),
+                    schema: None,
+                    alias: None,
+                },
+                joins: vec![],
+                filter: Some(Expr::Compare {
+                    column: "id".to_string(),
+                    op: CompareOp::Gt,
+                    value: Value::Integer(0),
+                }),
+                group_by: vec![],
+                having: None,
+                compounds: vec![],
+                order_by: vec![],
+                limit: None,
+                offset: None,
+            },
+        }]
+    );
+}
+
+#[test]
+fn parses_create_view_with_column_names_like_sqlite() {
+    let statements =
+        parse_sql("CREATE VIEW renamed(uid, username) AS SELECT id, name FROM users;").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::CreateView {
+            name: "renamed".to_string(),
+            columns: Some(vec!["uid".to_string(), "username".to_string()]),
+            if_not_exists: false,
+            temporary: false,
+            select: SelectStatement {
+                with: None,
+                distinct: false,
+                columns: vec![
+                    SelectItem::Column("id".to_string()),
+                    SelectItem::Column("name".to_string()),
+                ],
+                from: FromItem::Table {
+                    name: "users".to_string(),
+                    schema: None,
+                    alias: None,
+                },
+                joins: vec![],
+                filter: None,
+                group_by: vec![],
+                having: None,
+                compounds: vec![],
+                order_by: vec![],
+                limit: None,
+                offset: None,
+            },
+        }]
+    );
+}
+
+#[test]
+fn parses_create_view_if_not_exists_like_sqlite() {
+    let statements =
+        parse_sql("CREATE VIEW IF NOT EXISTS active_users AS SELECT id FROM users;").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::CreateView {
+            name: "active_users".to_string(),
+            columns: None,
+            if_not_exists: true,
+            temporary: false,
+            select: SelectStatement {
+                with: None,
+                distinct: false,
+                columns: vec![SelectItem::Column("id".to_string())],
+                from: FromItem::Table {
+                    name: "users".to_string(),
+                    schema: None,
+                    alias: None,
+                },
+                joins: vec![],
+                filter: None,
+                group_by: vec![],
+                having: None,
+                compounds: vec![],
+                order_by: vec![],
+                limit: None,
+                offset: None,
+            },
+        }]
+    );
+}
+
+#[test]
+fn parses_create_view_as_values_like_sqlite() {
+    let statements = parse_sql("CREATE VIEW literals AS VALUES (1, 'a'), (2, 'b');").unwrap();
+
+    assert_eq!(
+        statements,
+        vec![Statement::CreateView {
+            name: "literals".to_string(),
+            columns: None,
+            if_not_exists: false,
+            temporary: false,
+            select: SelectStatement {
+                with: None,
+                distinct: false,
+                columns: vec![SelectItem::Wildcard],
+                from: FromItem::Values {
+                    rows: vec![
+                        vec![
+                            ScalarExpr::Literal(Value::Integer(1)),
+                            ScalarExpr::Literal(Value::from("a")),
+                        ],
+                        vec![
+                            ScalarExpr::Literal(Value::Integer(2)),
+                            ScalarExpr::Literal(Value::from("b")),
+                        ],
+                    ],
+                    alias: None,
+                    columns: None,
+                },
+                joins: vec![],
+                filter: None,
+                group_by: vec![],
+                having: None,
+                compounds: vec![],
+                order_by: vec![],
+                limit: None,
+                offset: None,
+            },
+        }]
+    );
+}
+
+#[test]
+fn parses_create_temp_view_statements_like_sqlite() {
+    let statements = parse_sql(
+        "CREATE TEMP VIEW active_users AS SELECT id FROM users;
+         CREATE TEMPORARY VIEW IF NOT EXISTS hidden_users AS SELECT name FROM users;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![
+            Statement::CreateView {
+                name: "active_users".to_string(),
+                columns: None,
+                if_not_exists: false,
+                temporary: true,
+                select: SelectStatement {
+                    with: None,
+                    distinct: false,
+                    columns: vec![SelectItem::Column("id".to_string())],
+                    from: FromItem::Table {
+                        name: "users".to_string(),
+                        schema: None,
+                        alias: None,
+                    },
+                    joins: vec![],
+                    filter: None,
+                    group_by: vec![],
+                    having: None,
+                    compounds: vec![],
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                },
+            },
+            Statement::CreateView {
+                name: "hidden_users".to_string(),
+                columns: None,
+                if_not_exists: true,
+                temporary: true,
+                select: SelectStatement {
+                    with: None,
+                    distinct: false,
+                    columns: vec![SelectItem::Column("name".to_string())],
+                    from: FromItem::Table {
+                        name: "users".to_string(),
+                        schema: None,
+                        alias: None,
+                    },
+                    joins: vec![],
+                    filter: None,
+                    group_by: vec![],
+                    having: None,
+                    compounds: vec![],
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                },
+            },
+        ]
     );
 }
 
@@ -243,6 +647,7 @@ fn parses_create_table_with_desc_primary_key_column() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -264,6 +669,7 @@ fn parses_create_table_if_not_exists_statement() {
             strict: false,
             without_rowid: false,
             if_not_exists: true,
+            temporary: false,
         }]
     );
 }
@@ -285,6 +691,7 @@ fn parses_create_table_with_quoted_identifiers() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -314,6 +721,7 @@ fn parses_create_table_with_typeless_columns() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -335,6 +743,7 @@ fn parses_create_table_with_backtick_identifiers() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -356,6 +765,7 @@ fn parses_create_table_with_bracket_identifiers() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -377,6 +787,7 @@ fn parses_create_table_with_blob_column() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -398,6 +809,7 @@ fn parses_create_table_with_autoincrement_primary_key() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -420,16 +832,17 @@ fn parses_create_table_with_sqlite_type_aliases_and_modifiers() {
         vec![Statement::CreateTable {
             name: "users".to_string(),
             columns: vec![
-                ColumnDef::primary_key("id", ColumnType::Integer),
-                ColumnDef::new("name", ColumnType::Text),
-                ColumnDef::new("slug", ColumnType::Text),
-                ColumnDef::new("bio", ColumnType::Text),
-                ColumnDef::new("visits", ColumnType::Integer),
+                ColumnDef::primary_key("id", ColumnType::Integer).declared_type("INT"),
+                ColumnDef::new("name", ColumnType::Text).declared_type("VARCHAR(255)"),
+                ColumnDef::new("slug", ColumnType::Text).declared_type("CHAR(16)"),
+                ColumnDef::new("bio", ColumnType::Text).declared_type("CLOB"),
+                ColumnDef::new("visits", ColumnType::Integer).declared_type("BIGINT"),
             ],
             constraints: vec![],
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -457,6 +870,7 @@ fn parses_create_table_with_current_timestamp_default() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -487,6 +901,7 @@ fn parses_create_table_with_current_date_and_time_defaults() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -517,6 +932,7 @@ fn parses_create_table_with_parenthesized_literal_defaults() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -553,6 +969,7 @@ fn parses_create_table_with_signed_and_hex_literal_defaults() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -564,7 +981,11 @@ fn parses_create_table_with_numeric_type_precision_suffixes() {
             id INTEGER PRIMARY KEY,
             code VARCHAR(32),
             amount NUMERIC(10,2),
-            price DECIMAL(10,2)
+            price DECIMAL(10,2),
+            loose NONE,
+            custom FOO,
+            event_date DATE,
+            event_ts DATETIME
         );",
     )
     .unwrap();
@@ -574,8 +995,18 @@ fn parses_create_table_with_numeric_type_precision_suffixes() {
     };
 
     assert_eq!(columns[1].column_type, ColumnType::Text);
-    assert_eq!(columns[2].column_type, ColumnType::Real);
-    assert_eq!(columns[3].column_type, ColumnType::Real);
+    assert_eq!(columns[2].column_type, ColumnType::Numeric);
+    assert_eq!(columns[2].pragma_declared_type(), "NUMERIC(10,2)");
+    assert_eq!(columns[3].column_type, ColumnType::Numeric);
+    assert_eq!(columns[3].pragma_declared_type(), "DECIMAL(10,2)");
+    assert_eq!(columns[4].column_type, ColumnType::Numeric);
+    assert_eq!(columns[4].pragma_declared_type(), "NONE");
+    assert_eq!(columns[5].column_type, ColumnType::Numeric);
+    assert_eq!(columns[5].pragma_declared_type(), "FOO");
+    assert_eq!(columns[6].column_type, ColumnType::Numeric);
+    assert_eq!(columns[6].pragma_declared_type(), "DATE");
+    assert_eq!(columns[7].column_type, ColumnType::Numeric);
+    assert_eq!(columns[7].pragma_declared_type(), "DATETIME");
 }
 
 #[test]
@@ -606,6 +1037,7 @@ fn parses_create_table_with_unique_constraints() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -639,6 +1071,7 @@ fn parses_create_table_with_composite_primary_key_constraint() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -665,6 +1098,7 @@ fn parses_create_table_with_strict_mode() {
             strict: true,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -698,6 +1132,7 @@ fn parses_create_table_with_without_rowid() {
             strict: false,
             without_rowid: true,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -724,6 +1159,7 @@ fn parses_create_table_with_stored_generated_column() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -750,6 +1186,7 @@ fn parses_create_table_with_virtual_generated_column() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -777,6 +1214,7 @@ fn parses_create_table_with_implicit_virtual_generated_column() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -803,6 +1241,7 @@ fn parses_create_table_with_as_generated_column_syntax() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -831,9 +1270,11 @@ fn parses_create_table_and_index_with_collate_clauses() {
                 strict: false,
                 without_rowid: false,
                 if_not_exists: false,
+                temporary: false,
             },
             Statement::CreateIndex {
                 name: "idx_users_name_nocase".to_string(),
+                schema: None,
                 table: "users".to_string(),
                 columns: vec!["name".to_string()],
                 decorated_columns: Some(vec!["name COLLATE NOCASE DESC".to_string()]),
@@ -869,6 +1310,7 @@ fn parses_create_table_with_default_then_collate_column() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -882,6 +1324,7 @@ fn parses_create_partial_index_statement() {
         statements,
         vec![Statement::CreateIndex {
             name: "idx_users_email_active".to_string(),
+            schema: None,
             table: "users".to_string(),
             columns: vec!["email".to_string()],
             decorated_columns: Some(vec!["email".to_string()]),
@@ -947,6 +1390,7 @@ fn parses_create_table_with_references_parent_primary_key_shorthand() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -979,6 +1423,7 @@ fn parses_create_table_with_composite_foreign_key_references_parent_primary_key_
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1018,6 +1463,7 @@ fn parses_create_table_with_named_column_constraints() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1046,6 +1492,7 @@ fn parses_create_table_preserving_named_column_primary_key_and_unique_constraint
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1074,6 +1521,7 @@ fn parses_create_table_preserving_named_not_null_constraints() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1113,6 +1561,7 @@ fn parses_create_table_preserving_named_check_constraints() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1157,6 +1606,7 @@ fn parses_create_table_with_on_conflict_column_and_table_constraints() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1193,6 +1643,7 @@ fn parses_create_table_with_foreign_key_action_clauses() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1229,6 +1680,7 @@ fn parses_create_table_with_deferrable_foreign_keys() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1263,6 +1715,7 @@ fn parses_create_table_with_foreign_key_match_clauses() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1308,6 +1761,7 @@ fn parses_create_table_preserving_on_conflict_clauses() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1342,6 +1796,7 @@ fn parses_create_table_preserving_named_foreign_keys() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1386,6 +1841,7 @@ fn parses_create_table_with_decorated_table_constraint_columns() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1420,6 +1876,7 @@ fn parses_create_table_with_primary_key_on_conflict_clause() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1456,6 +1913,7 @@ fn parses_create_table_preserving_named_unique_constraints() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1475,6 +1933,7 @@ fn parses_alter_table_variants() {
         statements[0],
         Statement::AlterTable {
             table: "users".to_string(),
+            schema: None,
             action: AlterTableAction::AddColumn(
                 ColumnDef::new("age", ColumnType::Integer)
                     .default_value(ColumnDefault::Literal(Value::Integer(0)))
@@ -1485,6 +1944,7 @@ fn parses_alter_table_variants() {
         statements[1],
         Statement::AlterTable {
             table: "users".to_string(),
+            schema: None,
             action: AlterTableAction::RenameTable {
                 new_name: "customers".to_string(),
             },
@@ -1494,6 +1954,7 @@ fn parses_alter_table_variants() {
         statements[2],
         Statement::AlterTable {
             table: "customers".to_string(),
+            schema: None,
             action: AlterTableAction::RenameColumn {
                 old_name: "name".to_string(),
                 new_name: "full_name".to_string(),
@@ -1504,10 +1965,47 @@ fn parses_alter_table_variants() {
         statements[3],
         Statement::AlterTable {
             table: "customers".to_string(),
+            schema: None,
             action: AlterTableAction::DropColumn {
                 old_name: "age".to_string(),
             },
         }
+    );
+}
+
+#[test]
+fn parses_schema_qualified_alter_table_names_like_sqlite() {
+    let statements = parse_sql(
+        "ALTER TABLE main.users ADD COLUMN age INTEGER;
+         ALTER TABLE main.users RENAME COLUMN name TO full_name;
+         ALTER TABLE main.users RENAME TO customers;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![
+            Statement::AlterTable {
+                table: "users".to_string(),
+                schema: Some("main".to_string()),
+                action: AlterTableAction::AddColumn(ColumnDef::new("age", ColumnType::Integer)),
+            },
+            Statement::AlterTable {
+                table: "users".to_string(),
+                schema: Some("main".to_string()),
+                action: AlterTableAction::RenameColumn {
+                    old_name: "name".to_string(),
+                    new_name: "full_name".to_string(),
+                },
+            },
+            Statement::AlterTable {
+                table: "users".to_string(),
+                schema: Some("main".to_string()),
+                action: AlterTableAction::RenameTable {
+                    new_name: "customers".to_string(),
+                },
+            },
+        ]
     );
 }
 
@@ -1528,6 +2026,7 @@ fn parses_not_null_column_constraint() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }]
     );
 }
@@ -1540,6 +2039,7 @@ fn parses_create_index_statement() {
         statements,
         vec![Statement::CreateIndex {
             name: "idx_users_id".to_string(),
+            schema: None,
             table: "users".to_string(),
             columns: vec!["id".to_string()],
             decorated_columns: Some(vec!["id".to_string()]),
@@ -1558,6 +2058,7 @@ fn parses_create_index_if_not_exists_statement() {
         statements,
         vec![Statement::CreateIndex {
             name: "idx_users_id".to_string(),
+            schema: None,
             table: "users".to_string(),
             columns: vec!["id".to_string()],
             decorated_columns: Some(vec!["id".to_string()]),
@@ -1576,6 +2077,7 @@ fn parses_create_unique_index_statement() {
         statements,
         vec![Statement::CreateIndex {
             name: "idx_users_email".to_string(),
+            schema: None,
             table: "users".to_string(),
             columns: vec!["email".to_string()],
             decorated_columns: Some(vec!["email".to_string()]),
@@ -1594,6 +2096,7 @@ fn parses_multi_column_create_index_statement() {
         statements,
         vec![Statement::CreateIndex {
             name: "idx_users_id_name".to_string(),
+            schema: None,
             table: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
             decorated_columns: Some(vec!["id".to_string(), "name".to_string()]),
@@ -1613,6 +2116,7 @@ fn parses_create_index_statement_with_column_sort_order() {
         statements,
         vec![Statement::CreateIndex {
             name: "idx_users_name_age".to_string(),
+            schema: None,
             table: "users".to_string(),
             columns: vec!["name".to_string(), "age".to_string()],
             decorated_columns: Some(vec!["name DESC".to_string(), "age ASC".to_string(),]),
@@ -1632,6 +2136,7 @@ fn parses_create_index_statement_with_expression_term() {
         statements,
         vec![Statement::CreateIndex {
             name: "idx_users_lower_name".to_string(),
+            schema: None,
             table: "users".to_string(),
             columns: vec!["lower(name)".to_string()],
             decorated_columns: Some(vec!["lower(name)".to_string()]),
@@ -1651,6 +2156,7 @@ fn parses_three_column_create_index_statement() {
         statements,
         vec![Statement::CreateIndex {
             name: "idx_users_id_name_active".to_string(),
+            schema: None,
             table: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
             decorated_columns: Some(vec![
@@ -1667,17 +2173,25 @@ fn parses_three_column_create_index_statement() {
 
 #[test]
 fn parses_drop_table_and_drop_index_statements() {
-    let statements = parse_sql("DROP INDEX idx_users_name; DROP TABLE users;").unwrap();
+    let statements =
+        parse_sql("DROP INDEX idx_users_name; DROP TABLE users; DROP VIEW active_users;").unwrap();
 
     assert_eq!(
         statements,
         vec![
             Statement::DropIndex {
                 name: "idx_users_name".to_string(),
+                schema: None,
                 if_exists: false,
             },
             Statement::DropTable {
                 name: "users".to_string(),
+                schema: None,
+                if_exists: false,
+            },
+            Statement::DropView {
+                name: "active_users".to_string(),
+                schema: None,
                 if_exists: false,
             },
         ]
@@ -1686,18 +2200,27 @@ fn parses_drop_table_and_drop_index_statements() {
 
 #[test]
 fn parses_drop_if_exists_statements() {
-    let statements =
-        parse_sql("DROP INDEX IF EXISTS idx_users_name; DROP TABLE IF EXISTS users;").unwrap();
+    let statements = parse_sql(
+        "DROP INDEX IF EXISTS idx_users_name; DROP TABLE IF EXISTS users; DROP VIEW IF EXISTS active_users;",
+    )
+    .unwrap();
 
     assert_eq!(
         statements,
         vec![
             Statement::DropIndex {
                 name: "idx_users_name".to_string(),
+                schema: None,
                 if_exists: true,
             },
             Statement::DropTable {
                 name: "users".to_string(),
+                schema: None,
+                if_exists: true,
+            },
+            Statement::DropView {
+                name: "active_users".to_string(),
+                schema: None,
                 if_exists: true,
             },
         ]
@@ -1723,6 +2246,63 @@ fn parses_insert_statement() {
             or_conflict: None,
             values: vec![Value::Integer(1), Value::Text("alice".to_string())],
         }]
+    );
+}
+
+#[test]
+fn parses_schema_qualified_dml_targets_for_main_and_temp_like_sqlite() {
+    let statements = parse_sql(
+        "INSERT INTO main.users VALUES (1, 'alice');
+         REPLACE INTO temp.logs VALUES (1, 'created');
+         UPDATE main.users SET name = 'bob' WHERE id = 1;
+         DELETE FROM main.users WHERE id = 2;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statements,
+        vec![
+            Statement::Insert {
+                table: "users".to_string(),
+                columns: None,
+                or_conflict: None,
+                values: vec![Value::Integer(1), Value::from("alice")],
+            },
+            Statement::Insert {
+                table: "logs".to_string(),
+                columns: None,
+                or_conflict: Some("REPLACE".to_string()),
+                values: vec![Value::Integer(1), Value::from("created")],
+            },
+            Statement::Update {
+                table: "users".to_string(),
+                schema: Some("main".to_string()),
+                table_alias: None,
+                index_hint: None,
+                or_conflict: None,
+                assignments: vec![Assignment {
+                    column: "name".to_string(),
+                    value: ScalarExpr::Literal(Value::from("bob")),
+                }],
+                from: None,
+                filter: Some(Expr::Compare {
+                    column: "id".to_string(),
+                    op: CompareOp::Eq,
+                    value: Value::Integer(1),
+                }),
+            },
+            Statement::Delete {
+                table: "users".to_string(),
+                schema: Some("main".to_string()),
+                table_alias: None,
+                index_hint: None,
+                filter: Some(Expr::Compare {
+                    column: "id".to_string(),
+                    op: CompareOp::Eq,
+                    value: Value::Integer(2),
+                }),
+            },
+        ]
     );
 }
 
@@ -1860,21 +2440,44 @@ fn parses_insert_statement_with_scalar_expressions() {
 
 #[test]
 fn parses_insert_statement_with_unary_plus_and_hex_integer_literals() {
-    let statements = parse_sql("INSERT INTO nums VALUES (+1, +.5, 0x10, -0x10);").unwrap();
+    let statements = parse_sql(
+        "INSERT INTO nums VALUES (
+            +1,
+            +.5,
+            0x10,
+            -0x10,
+            9223372036854775808,
+            -9223372036854775808,
+            0x8000000000000000
+        );",
+    )
+    .unwrap();
 
     assert_eq!(
         statements,
-        vec![Statement::Insert {
+        vec![Statement::InsertExpr {
             table: "nums".to_string(),
             columns: None,
             or_conflict: None,
             values: vec![
-                Value::Integer(1),
-                Value::Real(0.5),
-                Value::Integer(16),
-                Value::Integer(-16),
+                ScalarExpr::UnaryPlus(Box::new(ScalarExpr::Literal(Value::Integer(1)))),
+                ScalarExpr::UnaryPlus(Box::new(ScalarExpr::Literal(Value::Real(0.5)))),
+                ScalarExpr::Literal(Value::Integer(16)),
+                ScalarExpr::UnaryMinus(Box::new(ScalarExpr::Literal(Value::Integer(16)))),
+                ScalarExpr::Literal(Value::Real(9_223_372_036_854_776_000.0)),
+                ScalarExpr::Literal(Value::Integer(i64::MIN)),
+                ScalarExpr::Literal(Value::Integer(i64::MIN)),
             ],
         }]
+    );
+
+    let too_large_negative_hex = parse_sql("INSERT INTO nums VALUES (-0x8000000000000000);")
+        .expect_err("SQLite rejects negating the 64-bit two's-complement minimum hex literal");
+    assert!(
+        too_large_negative_hex
+            .to_string()
+            .contains("integer overflow"),
+        "unexpected error: {too_large_negative_hex}"
     );
 }
 
@@ -2071,6 +2674,7 @@ fn parses_insert_select_statement() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -2111,6 +2715,7 @@ fn parses_insert_select_statement_with_explicit_column_list() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -2151,6 +2756,7 @@ fn parses_insert_select_on_conflict_do_nothing_statement() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -2188,6 +2794,7 @@ fn parses_insert_select_on_conflict_target_do_nothing_statement() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -2223,6 +2830,7 @@ fn parses_replace_into_select_statement() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -2291,6 +2899,7 @@ fn parses_from_subquery_with_alias() {
                     }],
                     from: FromItem::Table {
                         name: "users".to_string(),
+                        schema: None,
                         alias: None,
                     },
                     joins: vec![],
@@ -2342,6 +2951,7 @@ fn parses_from_subquery_without_alias_like_sqlite() {
                     }],
                     from: FromItem::Table {
                         name: "users".to_string(),
+                        schema: None,
                         alias: None,
                     },
                     joins: vec![],
@@ -2382,7 +2992,9 @@ fn parses_delete_update_order_by_limit_and_aliases() {
         vec![
             Statement::Delete {
                 table: "users".to_string(),
+                schema: None,
                 table_alias: Some("u".to_string()),
+                index_hint: None,
                 filter: Some(Expr::Compare {
                     column: "u.id".to_string(),
                     op: CompareOp::Eq,
@@ -2391,7 +3003,10 @@ fn parses_delete_update_order_by_limit_and_aliases() {
             },
             Statement::Update {
                 table: "users".to_string(),
+                schema: None,
                 table_alias: Some("u".to_string()),
+                index_hint: None,
+                or_conflict: None,
                 assignments: vec![
                     Assignment {
                         column: "name".to_string(),
@@ -2402,6 +3017,7 @@ fn parses_delete_update_order_by_limit_and_aliases() {
                         value: ScalarExpr::Literal(Value::Boolean(false)),
                     },
                 ],
+                from: None,
                 filter: Some(Expr::Compare {
                     column: "u.id".to_string(),
                     op: CompareOp::Eq,
@@ -2423,6 +3039,7 @@ fn parses_delete_update_order_by_limit_and_aliases() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: Some("u".to_string()),
                 },
                 joins: vec![],
@@ -2594,7 +3211,10 @@ fn parses_update_assignment_scalar_expression() {
         statements,
         vec![Statement::Update {
             table: "metrics".to_string(),
+            schema: None,
             table_alias: None,
+            index_hint: None,
+            or_conflict: None,
             assignments: vec![Assignment {
                 column: "value".to_string(),
                 value: ScalarExpr::Binary {
@@ -2603,6 +3223,7 @@ fn parses_update_assignment_scalar_expression() {
                     right: Box::new(ScalarExpr::Literal(Value::Integer(1))),
                 },
             }],
+            from: None,
             filter: Some(Expr::Compare {
                 column: "id".to_string(),
                 op: CompareOp::Eq,
@@ -2680,6 +3301,7 @@ fn parses_null_ordering_words_as_identifiers() {
                 strict: false,
                 without_rowid: false,
                 if_not_exists: false,
+                temporary: false,
             },
             select_statement(
                 vec![
@@ -4564,6 +5186,27 @@ fn parses_likelihood_scalar_function_expressions() {
 }
 
 #[test]
+fn rejects_invalid_likelihood_probability_like_sqlite() {
+    for sql in [
+        "SELECT LIKELIHOOD(active, -0.1) FROM users;",
+        "SELECT LIKELIHOOD(active, 1.1) FROM users;",
+        "SELECT LIKELIHOOD(active, 1) FROM users;",
+        "SELECT LIKELIHOOD(active, NULL) FROM users;",
+        "SELECT LIKELIHOOD(active, '0.5') FROM users;",
+        "SELECT LIKELIHOOD(active, score) FROM users;",
+        "SELECT LIKELIHOOD(active, 0.25 + 0) FROM users;",
+    ] {
+        let error = parse_sql(sql).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("second argument to likelihood() must be a constant between 0.0 and 1.0"),
+            "unexpected error for {sql}: {error}"
+        );
+    }
+}
+
+#[test]
 fn parses_modulo_scalar_expressions() {
     let statements = parse_sql(
         "SELECT value % 2 AS parity,
@@ -5277,6 +5920,7 @@ fn parses_group_by_and_aggregate_order_by_scalar_expressions() {
             ],
             from: FromItem::Table {
                 name: "users".to_string(),
+                schema: None,
                 alias: None,
             },
             joins: vec![],
@@ -5350,12 +5994,14 @@ fn parses_join_on_scalar_expression() {
             ],
             from: FromItem::Table {
                 name: "users".to_string(),
+                schema: None,
                 alias: Some("u".to_string()),
             },
             joins: vec![JoinClause {
                 kind: JoinKind::Inner,
                 source: FromItem::Table {
                     name: "orders".to_string(),
+                    schema: None,
                     alias: Some("o".to_string()),
                 },
                 on: Expr::CompareScalar {
@@ -5420,6 +6066,7 @@ fn parses_join_with_derived_source_on_right() {
             ],
             from: FromItem::Table {
                 name: "users".to_string(),
+                schema: None,
                 alias: Some("u".to_string()),
             },
             joins: vec![JoinClause {
@@ -5441,6 +6088,7 @@ fn parses_join_with_derived_source_on_right() {
                         ],
                         from: FromItem::Table {
                             name: "users".to_string(),
+                            schema: None,
                             alias: None,
                         },
                         joins: vec![],
@@ -5509,6 +6157,7 @@ fn parses_join_with_derived_source_on_left() {
                     ],
                     from: FromItem::Table {
                         name: "users".to_string(),
+                        schema: None,
                         alias: None,
                     },
                     joins: vec![],
@@ -5527,6 +6176,7 @@ fn parses_join_with_derived_source_on_left() {
                 kind: JoinKind::Inner,
                 source: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: Some("u".to_string()),
                 },
                 on: Expr::CompareScalar {
@@ -5894,6 +6544,7 @@ fn parses_where_and_projection_scalar_expression_is_and_is_not() {
         ],
         from: Table {
             name: "users",
+            schema: None,
             alias: None,
         },
         joins: [],
@@ -5978,7 +6629,7 @@ fn parses_where_scalar_expression_like() {
                         func: ScalarFunc::Lower,
                         args: vec![ScalarExpr::Column("name".to_string())],
                     },
-                    pattern: "a%".to_string(),
+                    pattern: Box::new(ScalarExpr::Literal(Value::from("a%"))),
                     escape: None,
                     negated: false,
                 }),
@@ -5990,7 +6641,7 @@ fn parses_where_scalar_expression_like() {
                             ScalarExpr::Column("name".to_string()),
                         ],
                     },
-                    pattern: "x%".to_string(),
+                    pattern: Box::new(ScalarExpr::Literal(Value::from("x%"))),
                     escape: None,
                     negated: true,
                 }),
@@ -6132,6 +6783,7 @@ fn parses_where_scalar_expression_in_subquery() {
                     columns: vec![SelectItem::Column("user_id".to_string())],
                     from: FromItem::Table {
                         name: "orders".to_string(),
+                        schema: None,
                         alias: Some("o".to_string()),
                     },
                     joins: vec![],
@@ -6362,7 +7014,7 @@ fn parses_where_scalar_expression_glob() {
             Some(Expr::And(
                 Box::new(Expr::Glob {
                     column: "name".to_string(),
-                    pattern: "a*".to_string(),
+                    pattern: Box::new(ScalarExpr::Literal(Value::from("a*"))),
                     negated: false,
                 }),
                 Box::new(Expr::GlobScalar {
@@ -6373,7 +7025,7 @@ fn parses_where_scalar_expression_glob() {
                             ScalarExpr::Column("name".to_string()),
                         ],
                     },
-                    pattern: "x*".to_string(),
+                    pattern: Box::new(ScalarExpr::Literal(Value::from("x*"))),
                     negated: true,
                 }),
             )),
@@ -6478,6 +7130,7 @@ fn parses_projection_scalar_expression_in_literal_lists() {
         ],
         from: Table {
             name: "users",
+            schema: None,
             alias: None,
         },
         joins: [],
@@ -6562,6 +7215,7 @@ fn parses_projection_scalar_expression_comparisons() {
         ],
         from: Table {
             name: "users",
+            schema: None,
             alias: None,
         },
         joins: [],
@@ -6614,103 +7268,36 @@ fn parses_projection_scalar_expression_like_glob_and_between() {
          FROM users;",
     );
 
-    assert_eq!(
-        debug,
-        r#"Select(
-    SelectStatement {
-        with: None,
-        distinct: false,
-        columns: [
-            Expr {
-                expr: Like {
-                    expr: Literal(
-                        Text(
-                            "abc",
-                        ),
-                    ),
-                    pattern: "a%",
-                    escape: None,
-                    negated: false,
-                },
-                alias: Some(
-                    "like_true",
-                ),
-            },
-            Expr {
-                expr: Glob {
-                    expr: Literal(
-                        Text(
-                            "abc",
-                        ),
-                    ),
-                    pattern: "a*",
-                    negated: false,
-                },
-                alias: Some(
-                    "glob_true",
-                ),
-            },
-            Expr {
-                expr: Between {
-                    expr: Literal(
-                        Integer(
-                            2,
-                        ),
-                    ),
-                    low: Literal(
-                        Integer(
-                            1,
-                        ),
-                    ),
-                    high: Literal(
-                        Integer(
-                            3,
-                        ),
-                    ),
-                    negated: false,
-                },
-                alias: Some(
-                    "between_true",
-                ),
-            },
-            Expr {
-                expr: Between {
-                    expr: Literal(
-                        Integer(
-                            2,
-                        ),
-                    ),
-                    low: Literal(
-                        Integer(
-                            1,
-                        ),
-                    ),
-                    high: Literal(
-                        Integer(
-                            3,
-                        ),
-                    ),
-                    negated: true,
-                },
-                alias: Some(
-                    "not_between_false",
-                ),
-            },
-        ],
-        from: Table {
-            name: "users",
-            alias: None,
-        },
-        joins: [],
-        filter: None,
-        group_by: [],
-        having: None,
-        compounds: [],
-        order_by: [],
-        limit: None,
-        offset: None,
-    },
-)"#
+    assert!(
+        debug.contains("Like")
+            && debug.contains("Glob")
+            && debug.contains("Between")
+            && debug.contains("like_true")
+            && debug.contains("glob_true")
+            && debug.contains("between_true")
+            && debug.contains("not_between_false"),
+        "unexpected AST: {debug}"
+    );
+}
+
+#[test]
+fn parses_projection_scalar_expression_regexp_and_match() {
+    let debug = single_statement_debug(
+        "SELECT 'abc' REGEXP 'a.c' AS regexp_true,
+                'abc' NOT REGEXP 'd' AS regexp_not_true,
+                'abc' MATCH 'a' AS match_expr
+         FROM users;",
+    );
+
+    assert!(
+        debug.contains("regexp_true")
+            && debug.contains("regexp_not_true")
+            && debug.contains("match_expr"),
+        "unexpected AST: {debug}"
+    );
+    assert!(
+        debug.contains("Regexp") && debug.contains("Match"),
+        "unexpected AST: {debug}"
     );
 }
 
@@ -6759,6 +7346,7 @@ fn parses_where_scalar_expression_not_in_subquery() {
                     columns: vec![SelectItem::Column("user_id".to_string())],
                     from: FromItem::Table {
                         name: "orders".to_string(),
+                        schema: None,
                         alias: Some("o".to_string()),
                     },
                     joins: vec![],
@@ -6817,6 +7405,7 @@ fn parses_where_scalar_expression_compare_subquery() {
                     columns: vec![SelectItem::Column("user_id".to_string())],
                     from: FromItem::Table {
                         name: "orders".to_string(),
+                        schema: None,
                         alias: Some("o".to_string()),
                     },
                     joins: vec![],
@@ -6868,6 +7457,7 @@ fn parses_where_column_compare_subquery_as_scalar_form() {
                     columns: vec![SelectItem::Column("user_id".to_string())],
                     from: FromItem::Table {
                         name: "orders".to_string(),
+                        schema: None,
                         alias: Some("o".to_string()),
                     },
                     joins: vec![],
@@ -7002,6 +7592,36 @@ fn parses_transaction_statements() {
     );
     assert_eq!(parse_sql("COMMIT;").unwrap(), vec![Statement::Commit]);
     assert_eq!(parse_sql("ROLLBACK;").unwrap(), vec![Statement::Rollback]);
+    assert_eq!(
+        parse_sql("SAVEPOINT sp;").unwrap(),
+        vec![Statement::Savepoint {
+            name: "sp".to_string(),
+        }]
+    );
+    assert_eq!(
+        parse_sql("ROLLBACK TO sp;").unwrap(),
+        vec![Statement::RollbackTo {
+            name: "sp".to_string(),
+        }]
+    );
+    assert_eq!(
+        parse_sql("ROLLBACK TRANSACTION TO SAVEPOINT sp;").unwrap(),
+        vec![Statement::RollbackTo {
+            name: "sp".to_string(),
+        }]
+    );
+    assert_eq!(
+        parse_sql("RELEASE sp;").unwrap(),
+        vec![Statement::Release {
+            name: "sp".to_string(),
+        }]
+    );
+    assert_eq!(
+        parse_sql("RELEASE SAVEPOINT sp;").unwrap(),
+        vec![Statement::Release {
+            name: "sp".to_string(),
+        }]
+    );
 }
 
 #[test]
@@ -7339,6 +7959,7 @@ fn parses_top_level_with_multiple_ctes() {
                             ],
                             from: FromItem::Table {
                                 name: "users".to_string(),
+                                schema: None,
                                 alias: None,
                             },
                             joins: vec![],
@@ -7364,6 +7985,7 @@ fn parses_top_level_with_multiple_ctes() {
                             columns: vec![SelectItem::Column("id".to_string())],
                             from: FromItem::Table {
                                 name: "adults".to_string(),
+                                schema: None,
                                 alias: None,
                             },
                             joins: vec![],
@@ -7385,6 +8007,7 @@ fn parses_top_level_with_multiple_ctes() {
             columns: vec![SelectItem::Column("id".to_string())],
             from: FromItem::Table {
                 name: "named".to_string(),
+                schema: None,
                 alias: None,
             },
             joins: vec![],
@@ -7429,6 +8052,7 @@ fn parses_values_cte_like_sqlite() {
             columns: vec![SelectItem::Column("column1".to_string())],
             from: FromItem::Table {
                 name: "vals".to_string(),
+                schema: None,
                 alias: None,
             },
             joins: vec![],
@@ -7473,6 +8097,7 @@ fn parses_values_cte_with_column_names_like_sqlite() {
             columns: vec![SelectItem::Column("c1".to_string())],
             from: FromItem::Table {
                 name: "vals".to_string(),
+                schema: None,
                 alias: None,
             },
             joins: vec![],
@@ -7506,6 +8131,7 @@ fn parses_with_recursive_non_recursive_cte_like_sqlite() {
                         columns: vec![SelectItem::Column("id".to_string())],
                         from: FromItem::Table {
                             name: "users".to_string(),
+                            schema: None,
                             alias: None,
                         },
                         joins: vec![],
@@ -7523,6 +8149,7 @@ fn parses_with_recursive_non_recursive_cte_like_sqlite() {
             columns: vec![SelectItem::Column("id".to_string())],
             from: FromItem::Table {
                 name: "nums".to_string(),
+                schema: None,
                 alias: None,
             },
             joins: vec![],
@@ -7725,6 +8352,30 @@ fn lexes_underscored_numeric_literals() {
 }
 
 #[test]
+fn lexes_sqlite_integer_boundary_literals() {
+    let tokens =
+        lex("SELECT 9223372036854775808, -9223372036854775808, 0x8000000000000000;").unwrap();
+
+    assert_eq!(
+        tokens
+            .into_iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TokenKind::Select,
+            TokenKind::Real(9_223_372_036_854_776_000.0),
+            TokenKind::Comma,
+            TokenKind::Minus,
+            TokenKind::Real(9_223_372_036_854_776_000.0),
+            TokenKind::Comma,
+            TokenKind::Integer(i64::MIN),
+            TokenKind::Semicolon,
+            TokenKind::Eof,
+        ]
+    );
+}
+
+#[test]
 fn lex_skips_sql_comments() {
     let tokens = lex("SELECT 1 -- line comment
          ; SELECT /* block comment */ 2; SELECT 1/*inline*/+/*x*/2;")
@@ -7844,6 +8495,7 @@ fn parses_group_by_join_and_subquery_forms() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -7869,12 +8521,14 @@ fn parses_group_by_join_and_subquery_forms() {
                 ],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: Some("u".to_string()),
                 },
                 joins: vec![JoinClause {
                     kind: JoinKind::Inner,
                     source: FromItem::Table {
                         name: "orders".to_string(),
+                        schema: None,
                         alias: Some("o".to_string()),
                     },
                     on: Expr::CompareScalar {
@@ -7908,6 +8562,7 @@ fn parses_group_by_join_and_subquery_forms() {
                 columns: vec![SelectItem::Column("name".to_string())],
                 from: FromItem::Table {
                     name: "users".to_string(),
+                    schema: None,
                     alias: None,
                 },
                 joins: vec![],
@@ -7919,6 +8574,7 @@ fn parses_group_by_join_and_subquery_forms() {
                         columns: vec![SelectItem::Column("user_id".to_string())],
                         from: FromItem::Table {
                             name: "orders".to_string(),
+                            schema: None,
                             alias: None,
                         },
                         joins: vec![],

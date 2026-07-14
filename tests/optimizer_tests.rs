@@ -26,6 +26,7 @@ fn optimizer_accepts_all_top_level_statement_plans() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         },
         Plan::CreateIndex {
             name: "idx_users_name".to_string(),
@@ -61,6 +62,7 @@ fn optimizer_accepts_all_top_level_statement_plans() {
         },
         Plan::Update {
             table: "users".to_string(),
+            or_conflict: None,
             assignments: vec![Assignment {
                 column: "name".to_string(),
                 value: rustsql::sql::ast::ScalarExpr::Literal(Value::from("alice")),
@@ -313,7 +315,7 @@ fn optimizer_does_not_rewrite_scalar_like_filter_to_index_scan() {
                 func: rustsql::sql::ast::ScalarFunc::Lower,
                 args: vec![ScalarExpr::Column("name".to_string())],
             },
-            pattern: "a%".to_string(),
+            pattern: Box::new(ScalarExpr::Literal(Value::from("a%"))),
             escape: None,
             negated: false,
         }),
@@ -425,6 +427,7 @@ fn optimizer_does_not_rewrite_scalar_in_subquery_filter_to_index_scan() {
                 columns: vec![SelectItem::Column("user_id".to_string())],
                 from: FromItem::Table {
                     name: "orders".to_string(),
+                    schema: None,
                     alias: Some("o".to_string()),
                 },
                 joins: vec![],
@@ -498,6 +501,7 @@ fn optimizer_does_not_rewrite_scalar_not_in_subquery_filter_to_index_scan() {
                 columns: vec![SelectItem::Column("user_id".to_string())],
                 from: FromItem::Table {
                     name: "orders".to_string(),
+                    schema: None,
                     alias: Some("o".to_string()),
                 },
                 joins: vec![],
@@ -572,6 +576,7 @@ fn optimizer_does_not_rewrite_scalar_compare_subquery_filter_to_index_scan() {
                 columns: vec![SelectItem::Column("user_id".to_string())],
                 from: FromItem::Table {
                     name: "orders".to_string(),
+                    schema: None,
                     alias: Some("o".to_string()),
                 },
                 joins: vec![],
@@ -709,7 +714,7 @@ fn optimizer_does_not_rewrite_prefix_like_filter_to_binary_index_range_scan() {
         columns: vec![SelectItem::Column("id".to_string())],
         filter: Some(Expr::Like {
             column: "name".to_string(),
-            pattern: "ali%".to_string(),
+            pattern: Box::new(ScalarExpr::Literal(Value::from("ali%"))),
             escape: None,
             negated: false,
         }),

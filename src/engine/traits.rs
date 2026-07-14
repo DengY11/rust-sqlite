@@ -11,7 +11,23 @@ use crate::sql::planner::PlanningContext;
 
 pub trait CatalogStore {
     fn create_schema(&self, transaction_id: TransactionId, schema: Schema) -> Result<()>;
+    fn create_trigger(
+        &self,
+        _transaction_id: TransactionId,
+        name: &str,
+        _table: &str,
+        _sql: &str,
+    ) -> Result<()> {
+        Err(crate::common::error::DbError::storage(format!(
+            "triggers are not supported by this storage engine: {name}"
+        )))
+    }
     fn drop_schema(&self, transaction_id: TransactionId, name: &str) -> Result<()>;
+    fn drop_trigger(&self, _transaction_id: TransactionId, name: &str) -> Result<()> {
+        Err(crate::common::error::DbError::storage(format!(
+            "unknown trigger: {name}"
+        )))
+    }
     fn replace_schema(&self, transaction_id: TransactionId, schema: Schema) -> Result<()>;
     fn rename_schema(
         &self,
@@ -73,6 +89,16 @@ pub trait TableStore {
         row_id: RowId,
         row: Row,
     ) -> Result<()>;
+    fn update_row_with_columns(
+        &self,
+        transaction_id: TransactionId,
+        schema_name: &str,
+        row_id: RowId,
+        row: Row,
+        _updated_columns: &[String],
+    ) -> Result<()> {
+        self.update_row(transaction_id, schema_name, row_id, row)
+    }
 }
 
 pub trait IndexStore {
@@ -138,6 +164,21 @@ pub trait TransactionManager {
     }
     fn commit(&self, transaction_id: TransactionId) -> Result<()>;
     fn rollback(&self, transaction_id: TransactionId) -> Result<()>;
+    fn savepoint(&self, _transaction_id: TransactionId, _name: &str) -> Result<()> {
+        Err(crate::common::error::DbError::txn(
+            "savepoints are not supported by this storage engine",
+        ))
+    }
+    fn rollback_to_savepoint(&self, _transaction_id: TransactionId, _name: &str) -> Result<()> {
+        Err(crate::common::error::DbError::txn(
+            "savepoints are not supported by this storage engine",
+        ))
+    }
+    fn release_savepoint(&self, _transaction_id: TransactionId, _name: &str) -> Result<()> {
+        Err(crate::common::error::DbError::txn(
+            "savepoints are not supported by this storage engine",
+        ))
+    }
 }
 
 pub trait StorageEngine: CatalogStore + TableStore + IndexStore + TransactionManager {}

@@ -1,7 +1,7 @@
 use crate::common::types::{ColumnDef, Value};
 use crate::sql::ast::{
-    AlterTableAction, Assignment, CompareOp, CompoundOperator, Expr, IsolationLevel, JoinKind,
-    OrderBy, ScalarExpr, SelectItem, TableConstraint, UpsertClause,
+    AlterTableAction, Assignment, CompareOp, CompoundOperator, Expr, FromItem, IsolationLevel,
+    JoinKind, OrderBy, ScalarExpr, SelectItem, TableConstraint, UpsertClause,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,11 +49,21 @@ pub enum Plan {
         strict: bool,
         without_rowid: bool,
         if_not_exists: bool,
+        temporary: bool,
     },
     CreateTableAs {
         name: String,
         if_not_exists: bool,
         source: Box<Plan>,
+        temporary: bool,
+    },
+    CreateView {
+        name: String,
+        columns: Vec<ColumnDef>,
+        view_columns: Option<Vec<String>>,
+        select: crate::sql::ast::SelectStatement,
+        create_sql: String,
+        temporary: bool,
     },
     CreateIndex {
         name: String,
@@ -64,12 +74,26 @@ pub enum Plan {
         predicate: Option<String>,
         if_not_exists: bool,
     },
+    CreateTrigger {
+        name: String,
+        table: String,
+        sql: String,
+        if_not_exists: bool,
+    },
     DropTable {
+        name: String,
+        if_exists: bool,
+    },
+    DropView {
         name: String,
         if_exists: bool,
     },
     DropIndex {
         table: String,
+        name: String,
+        if_exists: bool,
+    },
+    DropTrigger {
         name: String,
         if_exists: bool,
     },
@@ -275,11 +299,25 @@ pub enum Plan {
     },
     Update {
         table: String,
+        or_conflict: Option<String>,
         assignments: Vec<Assignment>,
         filter: Option<Expr>,
     },
+    UpdateFrom {
+        table: String,
+        table_alias: Option<String>,
+        source: FromItem,
+        or_conflict: Option<String>,
+        assignments: Vec<Assignment>,
+        filter: Option<Expr>,
+        returning: Option<Vec<SelectItem>>,
+        order_by: Vec<OrderBy>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
     UpdateLimited {
         table: String,
+        or_conflict: Option<String>,
         assignments: Vec<Assignment>,
         filter: Option<Expr>,
         order_by: Vec<OrderBy>,
@@ -288,12 +326,14 @@ pub enum Plan {
     },
     UpdateReturning {
         table: String,
+        or_conflict: Option<String>,
         assignments: Vec<Assignment>,
         filter: Option<Expr>,
         returning: Vec<SelectItem>,
     },
     UpdateReturningLimited {
         table: String,
+        or_conflict: Option<String>,
         assignments: Vec<Assignment>,
         filter: Option<Expr>,
         returning: Vec<SelectItem>,
@@ -388,14 +428,20 @@ pub enum Plan {
     Values {
         rows: Vec<Vec<ScalarExpr>>,
     },
+    PragmaTableFunction {
+        name: String,
+        argument: Option<String>,
+    },
     ExplainQueryPlan {
         plan: Box<Plan>,
     },
     PragmaTableInfo {
         table: String,
+        schema: Option<String>,
     },
     PragmaTableXInfo {
         table: String,
+        schema: Option<String>,
     },
     PragmaTableList {
         table: Option<String>,
@@ -403,21 +449,30 @@ pub enum Plan {
     },
     PragmaIndexList {
         table: String,
+        schema: Option<String>,
     },
     PragmaIndexInfo {
         index: String,
+        schema: Option<String>,
     },
     PragmaIndexXInfo {
         index: String,
+        schema: Option<String>,
     },
     PragmaForeignKeyList {
         table: String,
+        schema: Option<String>,
     },
     PragmaForeignKeyCheck {
         table: Option<String>,
+        schema: Option<String>,
     },
     PragmaForeignKeys,
     SetPragmaForeignKeys {
+        enabled: bool,
+    },
+    PragmaDeferForeignKeys,
+    SetPragmaDeferForeignKeys {
         enabled: bool,
     },
     PragmaReadUncommitted,
@@ -426,6 +481,10 @@ pub enum Plan {
     },
     PragmaQueryOnly,
     SetPragmaQueryOnly {
+        enabled: bool,
+    },
+    PragmaCountChanges,
+    SetPragmaCountChanges {
         enabled: bool,
     },
     PragmaRecursiveTriggers,
@@ -441,27 +500,123 @@ pub enum Plan {
         enabled: bool,
     },
     PragmaEncoding,
+    SetPragmaEncoding,
     PragmaCollationList,
     PragmaDataVersion,
     PragmaQuickCheck,
     PragmaIntegrityCheck,
     PragmaFunctionList,
     PragmaCompileOptions,
-    PragmaJournalMode,
-    PragmaSynchronous,
-    PragmaCacheSize,
+    PragmaPragmaList,
+    PragmaModuleList,
+    PragmaStats,
+    PragmaJournalMode {
+        schema: Option<String>,
+    },
+    SetPragmaJournalMode {
+        mode: String,
+        schema: Option<String>,
+    },
+    PragmaSynchronous {
+        schema: Option<String>,
+    },
+    SetPragmaSynchronous {
+        value: i64,
+        schema: Option<String>,
+    },
+    PragmaCacheSize {
+        schema: Option<String>,
+    },
     SetPragmaCacheSize {
         value: i64,
+        schema: Option<String>,
+    },
+    PragmaCacheSpill,
+    SetPragmaCacheSpill {
+        value: Option<i64>,
     },
     PragmaTempStore,
-    PragmaLockingMode,
+    SetPragmaTempStore {
+        value: i64,
+    },
+    PragmaLockingMode {
+        schema: Option<String>,
+    },
+    SetPragmaLockingMode {
+        mode: String,
+        schema: Option<String>,
+    },
+    PragmaMmapSize,
+    SetPragmaMmapSize {
+        value: i64,
+    },
+    PragmaAutoVacuum,
+    SetPragmaAutoVacuum {
+        value: Option<i64>,
+    },
+    PragmaSecureDelete {
+        schema: Option<String>,
+    },
+    SetPragmaSecureDelete {
+        value: Option<i64>,
+        schema: Option<String>,
+    },
+    PragmaWalAutocheckpoint,
+    SetPragmaWalAutocheckpoint {
+        value: Option<i64>,
+    },
+    PragmaWalCheckpoint,
     PragmaBusyTimeout,
     SetPragmaBusyTimeout {
         value: i64,
     },
+    PragmaAnalysisLimit,
+    SetPragmaAnalysisLimit {
+        value: Option<u32>,
+    },
+    PragmaJournalSizeLimit,
+    SetPragmaJournalSizeLimit {
+        value: i64,
+    },
+    PragmaSoftHeapLimit,
+    SetPragmaSoftHeapLimit {
+        value: i64,
+    },
+    PragmaHardHeapLimit,
+    SetPragmaHardHeapLimit {
+        value: i64,
+    },
     PragmaThreads,
     SetPragmaThreads {
-        value: u32,
+        value: Option<u32>,
+    },
+    PragmaAutomaticIndex,
+    SetPragmaAutomaticIndex {
+        enabled: bool,
+    },
+    PragmaCellSizeCheck,
+    SetPragmaCellSizeCheck {
+        enabled: bool,
+    },
+    PragmaFullColumnNames,
+    SetPragmaFullColumnNames {
+        enabled: bool,
+    },
+    PragmaShortColumnNames,
+    SetPragmaShortColumnNames {
+        enabled: bool,
+    },
+    PragmaFullFsync,
+    SetPragmaFullFsync {
+        enabled: bool,
+    },
+    PragmaCheckpointFullFsync,
+    SetPragmaCheckpointFullFsync {
+        enabled: bool,
+    },
+    PragmaEmptyResultCallbacks,
+    SetPragmaEmptyResultCallbacks {
+        enabled: bool,
     },
     PragmaCaseSensitiveLike,
     SetPragmaCaseSensitiveLike {
@@ -472,26 +627,58 @@ pub enum Plan {
         enabled: bool,
     },
     PragmaDatabaseList,
-    PragmaPageSize,
-    PragmaPageCount,
-    PragmaFreelistCount,
-    PragmaUserVersion,
+    PragmaPageSize {
+        schema: Option<String>,
+    },
+    SetPragmaPageSize {
+        value: u32,
+        schema: Option<String>,
+    },
+    PragmaPageCount {
+        schema: Option<String>,
+    },
+    PragmaMaxPageCount,
+    SetPragmaMaxPageCount {
+        value: Option<i64>,
+    },
+    PragmaFreelistCount {
+        schema: Option<String>,
+    },
+    PragmaUserVersion {
+        schema: Option<String>,
+    },
     SetPragmaUserVersion {
         value: u32,
+        schema: Option<String>,
     },
-    PragmaApplicationId,
+    PragmaApplicationId {
+        schema: Option<String>,
+    },
     SetPragmaApplicationId {
         value: u32,
+        schema: Option<String>,
     },
-    PragmaSchemaVersion,
+    PragmaSchemaVersion {
+        schema: Option<String>,
+    },
     SetPragmaSchemaVersion {
         value: u32,
+        schema: Option<String>,
     },
     BeginTxn {
         isolation_level: IsolationLevel,
     },
     CommitTxn,
     RollbackTxn,
+    Savepoint {
+        name: String,
+    },
+    RollbackTo {
+        name: String,
+    },
+    Release {
+        name: String,
+    },
 }
 
 #[cfg(test)]
@@ -510,6 +697,7 @@ mod tests {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         };
         assert_eq!(
             plan,
@@ -520,6 +708,7 @@ mod tests {
                 strict: false,
                 without_rowid: false,
                 if_not_exists: false,
+                temporary: false,
             }
         );
     }

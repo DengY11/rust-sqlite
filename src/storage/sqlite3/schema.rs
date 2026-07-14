@@ -8,6 +8,7 @@ use crate::sql::parse_sql;
 use super::page::{BtreePageHeader, PageType};
 use super::pager::Pager;
 use super::varint::decode_varint;
+use super::writer::WritableSchemaObject;
 
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
@@ -15,6 +16,7 @@ pub struct Catalog {
     table_root_pages: BTreeMap<String, u32>,
     indexes: BTreeMap<String, BTreeMap<String, IndexMeta>>,
     index_root_pages: BTreeMap<String, BTreeMap<String, u32>>,
+    extra_schema_objects: Vec<WritableSchemaObject>,
     sqlite_sequence_root_page: Option<u32>,
 }
 
@@ -45,6 +47,11 @@ impl Catalog {
     #[must_use]
     pub fn sqlite_sequence_root_page(&self) -> Option<u32> {
         self.sqlite_sequence_root_page
+    }
+
+    #[must_use]
+    pub(crate) fn extra_schema_objects(&self) -> &[WritableSchemaObject] {
+        &self.extra_schema_objects
     }
 }
 
@@ -92,6 +99,13 @@ pub fn load_catalog(pager: &Pager) -> Result<Catalog> {
                     .insert(schema.name.clone(), row.root_page);
                 catalog.schemas.insert(schema.name.clone(), schema);
             }
+            "view" => {
+                let Some(sql) = row.sql.as_deref() else {
+                    continue;
+                };
+                let schema = parse_view(sql, &row.name)?;
+                catalog.schemas.insert(schema.name.clone(), schema);
+            }
             "index" => {
                 let index = match row.sql.as_deref() {
                     Some(sql) => parse_index(sql, &row.name, &row.table_name)?,
@@ -113,6 +127,15 @@ pub fn load_catalog(pager: &Pager) -> Result<Catalog> {
                     .entry(row.table_name)
                     .or_default()
                     .insert(index.name.clone(), index);
+            }
+            "trigger" => {
+                catalog.extra_schema_objects.push(WritableSchemaObject {
+                    entry_type: row.entry_type,
+                    name: row.name,
+                    table_name: row.table_name,
+                    root_page: row.root_page,
+                    sql: row.sql,
+                });
             }
             _ => {}
         }
@@ -681,6 +704,68 @@ fn parse_schema(sql: &str, expected_name: &str) -> Result<Schema> {
         _ => Err(DbError::storage(
             "sqlite schema row did not parse as CREATE TABLE",
         )),
+    }
+}
+
+fn parse_view(sql: &str, expected_name: &str) -> Result<Schema> {
+    let statements = parse_sql(sql)?;
+    let [statement] = statements.as_slice() else {
+        return Err(DbError::storage(
+            "sqlite schema CREATE VIEW SQL must contain exactly one statement",
+        ));
+    };
+
+    match statement {
+        Statement::CreateView {
+            name,
+            columns: view_columns,
+            select,
+            ..
+        } => {
+            if name != expected_name {
+                return Err(DbError::storage(format!(
+                    "sqlite schema view name mismatch: expected {expected_name}, parsed {name}",
+                )));
+            }
+            let columns = select
+                .columns
+                .iter()
+                .filter_map(view_select_item_output_name)
+                .map(|name| {
+                    crate::common::types::ColumnDef::new(
+                        name,
+                        crate::common::types::ColumnType::Any,
+                    )
+                })
+                .collect();
+            Ok(Schema::view(
+                name.clone(),
+                columns,
+                view_columns.clone(),
+                select.clone(),
+                sql.to_string(),
+            ))
+        }
+        _ => Err(DbError::storage(
+            "sqlite schema row did not parse as CREATE VIEW",
+        )),
+    }
+}
+
+fn view_select_item_output_name(item: &crate::sql::ast::SelectItem) -> Option<String> {
+    match item {
+        crate::sql::ast::SelectItem::Wildcard => None,
+        crate::sql::ast::SelectItem::Column(name) => Some(
+            name.rsplit('.')
+                .next()
+                .expect("column names should never be empty")
+                .to_string(),
+        ),
+        crate::sql::ast::SelectItem::AliasedColumn { alias, .. } => Some(alias.clone()),
+        crate::sql::ast::SelectItem::Expr { expr, alias } => {
+            Some(alias.clone().unwrap_or_else(|| format!("{expr:?}")))
+        }
+        crate::sql::ast::SelectItem::Aggregate { alias, .. } => alias.clone(),
     }
 }
 

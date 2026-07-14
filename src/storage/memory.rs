@@ -35,6 +35,13 @@ struct MemoryStorageInner {
 struct ActiveTransaction {
     id: TransactionId,
     undo_log: Vec<UndoOp>,
+    savepoints: Vec<Savepoint>,
+}
+
+#[derive(Debug, Clone)]
+struct Savepoint {
+    name: String,
+    undo_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -650,12 +657,15 @@ impl CatalogStore for MemoryStorage {
         let mut updated_schema = schema;
         updated_schema.columns.push(column);
         updated_schema.validate_constraints_metadata()?;
-        for row in rows.values() {
+        let mut normalized_rows = Vec::with_capacity(rows.len());
+        for (row_id, row) in &rows {
             let mut candidate = row.clone();
             candidate.push(default_value.clone());
+            let candidate = updated_schema.normalize_strict_row_values(candidate)?;
             updated_schema.validate_row_values(&candidate)?;
             updated_schema
                 .validate_check_constraints_with_like_mode(&candidate, inner.case_sensitive_like)?;
+            normalized_rows.push((*row_id, candidate));
         }
 
         inner.record_undo(UndoOp::RestoreTable {
@@ -668,8 +678,8 @@ impl CatalogStore for MemoryStorage {
             .schemas
             .insert(schema_name.to_string(), updated_schema);
         if let Some(rows) = inner.rows.get_mut(schema_name) {
-            for row in rows.values_mut() {
-                row.push(default_value.clone());
+            for (row_id, row) in normalized_rows {
+                rows.insert(row_id, row);
             }
         }
         Ok(())
@@ -1343,6 +1353,7 @@ impl TransactionManager for MemoryStorage {
         inner.active_txn = Some(ActiveTransaction {
             id: transaction_id,
             undo_log: Vec::new(),
+            savepoints: Vec::new(),
         });
         Ok(transaction_id)
     }
@@ -1373,6 +1384,79 @@ impl TransactionManager for MemoryStorage {
             inner.apply_undo(undo)?;
         }
 
+        Ok(())
+    }
+
+    fn savepoint(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let undo_len = inner
+            .active_txn
+            .as_ref()
+            .map(|active| active.undo_log.len())
+            .ok_or_else(|| DbError::txn("no active transaction"))?;
+        inner
+            .active_txn
+            .as_mut()
+            .expect("validated active transaction")
+            .savepoints
+            .push(Savepoint {
+                name: name.to_string(),
+                undo_len,
+            });
+        Ok(())
+    }
+
+    fn rollback_to_savepoint(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let savepoint_index = inner
+            .active_txn
+            .as_ref()
+            .and_then(|active| {
+                active
+                    .savepoints
+                    .iter()
+                    .rposition(|savepoint| savepoint.name.eq_ignore_ascii_case(name))
+            })
+            .ok_or_else(|| DbError::txn(format!("no such savepoint: {name}")))?;
+        let undo_len = inner
+            .active_txn
+            .as_ref()
+            .expect("validated active transaction")
+            .savepoints[savepoint_index]
+            .undo_len;
+
+        let undo_records = {
+            let active = inner
+                .active_txn
+                .as_mut()
+                .expect("validated active transaction");
+            let undo_records = active.undo_log.split_off(undo_len);
+            active.savepoints.truncate(savepoint_index + 1);
+            undo_records
+        };
+
+        for undo in undo_records.into_iter().rev() {
+            inner.apply_undo(undo)?;
+        }
+
+        Ok(())
+    }
+
+    fn release_savepoint(&self, transaction_id: TransactionId, name: &str) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_transaction(transaction_id)?;
+        let active = inner
+            .active_txn
+            .as_mut()
+            .ok_or_else(|| DbError::txn("no active transaction"))?;
+        let savepoint_index = active
+            .savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| DbError::txn(format!("no such savepoint: {name}")))?;
+        active.savepoints.truncate(savepoint_index);
         Ok(())
     }
 }

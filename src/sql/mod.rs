@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod executor;
+pub(crate) mod jsonb;
 pub mod lexer;
 pub mod optimizer;
 pub mod parser;

@@ -494,11 +494,11 @@ fn sqlite3_engine_loads_sqlite_type_aliases_and_modifiers() {
     );
     assert_eq!(
         users.columns[5].column_type,
-        rustsql::common::types::ColumnType::Real
+        rustsql::common::types::ColumnType::Numeric
     );
     assert_eq!(
         users.columns[6].column_type,
-        rustsql::common::types::ColumnType::Real
+        rustsql::common::types::ColumnType::Numeric
     );
 }
 

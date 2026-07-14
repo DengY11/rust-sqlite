@@ -7,12 +7,14 @@ fn sqlite_header_parses_valid_database_header() {
     bytes[16..18].copy_from_slice(&4096_u16.to_be_bytes());
     bytes[28..32].copy_from_slice(&1_u32.to_be_bytes());
     bytes[44..48].copy_from_slice(&4_u32.to_be_bytes());
+    bytes[56..60].copy_from_slice(&1_u32.to_be_bytes());
 
     let header = DatabaseHeader::decode(&bytes).unwrap();
 
     assert_eq!(header.page_size, 4096);
     assert_eq!(header.reserved_bytes, 0);
     assert_eq!(header.schema_format, 4);
+    assert_eq!(header.text_encoding, 1);
     assert_eq!(header.page_count_hint, 1);
     assert_eq!(header.usable_size().unwrap(), 4096);
 }
@@ -24,6 +26,7 @@ fn sqlite_header_decodes_64kib_page_size_from_special_case_encoding() {
     bytes[16..18].copy_from_slice(&1_u16.to_be_bytes());
     bytes[28..32].copy_from_slice(&1_u32.to_be_bytes());
     bytes[44..48].copy_from_slice(&4_u32.to_be_bytes());
+    bytes[56..60].copy_from_slice(&1_u32.to_be_bytes());
 
     let header = DatabaseHeader::decode(&bytes).unwrap();
 

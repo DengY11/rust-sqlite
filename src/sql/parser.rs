@@ -1,13 +1,15 @@
 use crate::common::error::{DbError, Result};
 use crate::common::types::{
-    CheckConstraint, CheckExpr, CheckOp, ColumnDef, ColumnDefault, ColumnType, ForeignKey,
-    PrimaryKeyConstraint, SortOrder, UniqueConstraint, Value,
+    BinaryMathFunc, CheckConstraint, CheckExpr, CheckOp, ColumnDef, ColumnDefault, ColumnType,
+    ForeignKey, PrimaryKeyConstraint, RoundingFunc, SortOrder, TrimSide, UnaryMathFunc,
+    UniqueConstraint, Value,
 };
 use crate::sql::ast::{
     AggregateArg, AggregateFunc, AlterTableAction, Assignment, CommonTableExpr, CompareOp,
     CompoundOperator, CompoundSelect, CteBody, Expr, FromItem, IsolationLevel, JoinClause,
     JoinKind, NullOrder, OrderBy, OrderByExpr, SINGLE_ROW_SOURCE_TABLE, ScalarBinaryOp, ScalarExpr,
-    ScalarFunc, SelectItem, SelectStatement, Statement, TableConstraint, UpsertClause, WithClause,
+    ScalarFunc, SelectItem, SelectStatement, Statement, TableConstraint, TableIndexHint,
+    UpsertClause, WindowExclude, WindowFrame, WindowFunc, WindowRangeOffset, WithClause,
 };
 use crate::sql::lexer::{Token, TokenKind, lex};
 
@@ -22,6 +24,23 @@ enum InsertConflictSuffix {
 enum ParsedTableIndexHint {
     IndexedBy(String),
     NotIndexed,
+}
+
+#[derive(Debug, Clone)]
+struct NamedWindowSpec {
+    name: String,
+    base_name: Option<String>,
+    partition_by: Vec<ScalarExpr>,
+    order_by: Vec<OrderBy>,
+    frame: WindowFrame,
+    exclude: WindowExclude,
+}
+
+fn table_index_hint_from_parsed(hint: ParsedTableIndexHint) -> TableIndexHint {
+    match hint {
+        ParsedTableIndexHint::IndexedBy(index) => TableIndexHint::IndexedBy(index),
+        ParsedTableIndexHint::NotIndexed => TableIndexHint::NotIndexed,
+    }
 }
 
 pub fn parse_sql(input: &str) -> Result<Vec<Statement>> {
@@ -117,14 +136,14 @@ impl Parser {
             TokenKind::Delete => self.parse_delete(),
             TokenKind::Update => self.parse_update(),
             TokenKind::Begin | TokenKind::Start => self.parse_begin_or_start_transaction(),
-            TokenKind::Commit => {
+            TokenKind::Commit | TokenKind::End => {
                 self.advance();
+                let _ = self.matches(&TokenKind::Transaction);
                 Ok(Statement::Commit)
             }
-            TokenKind::Rollback => {
-                self.advance();
-                Ok(Statement::Rollback)
-            }
+            TokenKind::Rollback => self.parse_rollback_statement(),
+            TokenKind::Savepoint => self.parse_savepoint_statement(),
+            TokenKind::Release => self.parse_release_statement(),
             TokenKind::Eof => Err(DbError::sql("empty SQL input")),
             token => {
                 Err(self.error_expected(&format!("statement, found {}", display_token(token))))
@@ -146,13 +165,14 @@ impl Parser {
     fn parse_alter(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Alter)?;
         self.expect_keyword(TokenKind::Table)?;
-        let table = self.parse_simple_identifier()?;
+        let (table, schema) = self.parse_schema_qualified_name_with_schema()?;
 
         if self.matches(&TokenKind::Add) {
             let _ = self.matches(&TokenKind::Column);
             let column = self.parse_column_def(Some(&table))?;
             return Ok(Statement::AlterTable {
                 table,
+                schema,
                 action: AlterTableAction::AddColumn(column),
             });
         }
@@ -162,6 +182,7 @@ impl Parser {
             let old_name = self.parse_simple_identifier()?;
             return Ok(Statement::AlterTable {
                 table,
+                schema,
                 action: AlterTableAction::DropColumn { old_name },
             });
         }
@@ -173,6 +194,7 @@ impl Parser {
             let new_name = self.parse_simple_identifier()?;
             return Ok(Statement::AlterTable {
                 table,
+                schema,
                 action: AlterTableAction::RenameColumn { old_name, new_name },
             });
         }
@@ -181,6 +203,7 @@ impl Parser {
             let new_name = self.parse_simple_identifier()?;
             return Ok(Statement::AlterTable {
                 table,
+                schema,
                 action: AlterTableAction::RenameTable { new_name },
             });
         }
@@ -223,257 +246,111 @@ impl Parser {
             return Ok(Statement::PragmaDatabaseList);
         }
         if name.eq_ignore_ascii_case("page_size") {
-            return Ok(Statement::PragmaPageSize);
+            if let Some(value) =
+                self.parse_optional_unsigned_pragma_integer_assignment("page_size")?
+            {
+                return Ok(Statement::SetPragmaPageSize { value, schema });
+            }
+            return Ok(Statement::PragmaPageSize { schema });
         }
         if name.eq_ignore_ascii_case("page_count") {
-            return Ok(Statement::PragmaPageCount);
+            return Ok(Statement::PragmaPageCount { schema });
+        }
+        if name.eq_ignore_ascii_case("max_page_count") {
+            if let Some(value) = self.parse_optional_pragma_max_page_count_assignment()? {
+                return Ok(Statement::SetPragmaMaxPageCount { value });
+            }
+            return Ok(Statement::PragmaMaxPageCount);
         }
         if name.eq_ignore_ascii_case("freelist_count") {
-            return Ok(Statement::PragmaFreelistCount);
+            return Ok(Statement::PragmaFreelistCount { schema });
         }
         if name.eq_ignore_ascii_case("user_version") {
-            if self.matches(&TokenKind::Eq) {
-                let value = match self.peek_kind() {
-                    TokenKind::Integer(value) if *value >= 0 => {
-                        let value = u32::try_from(*value)
-                            .map_err(|_| DbError::sql("PRAGMA user_version value is too large"))?;
-                        self.advance();
-                        value
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "non-negative integer user_version, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
-                return Ok(Statement::SetPragmaUserVersion { value });
+            if let Some(value) =
+                self.parse_optional_signed_pragma_i32_bits_assignment("user_version")?
+            {
+                return Ok(Statement::SetPragmaUserVersion { value, schema });
             }
-            return Ok(Statement::PragmaUserVersion);
+            return Ok(Statement::PragmaUserVersion { schema });
         }
         if name.eq_ignore_ascii_case("application_id") {
-            if self.matches(&TokenKind::Eq) {
-                let value = match self.peek_kind() {
-                    TokenKind::Integer(value) if *value >= 0 => {
-                        let value = u32::try_from(*value).map_err(|_| {
-                            DbError::sql("PRAGMA application_id value is too large")
-                        })?;
-                        self.advance();
-                        value
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "non-negative integer application_id, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
-                return Ok(Statement::SetPragmaApplicationId { value });
+            if let Some(value) =
+                self.parse_optional_signed_pragma_i32_bits_assignment("application_id")?
+            {
+                return Ok(Statement::SetPragmaApplicationId { value, schema });
             }
-            return Ok(Statement::PragmaApplicationId);
+            return Ok(Statement::PragmaApplicationId { schema });
         }
         if name.eq_ignore_ascii_case("schema_version") {
-            if self.matches(&TokenKind::Eq) {
-                let value = match self.peek_kind() {
-                    TokenKind::Integer(value) if *value >= 0 => {
-                        let value = u32::try_from(*value).map_err(|_| {
-                            DbError::sql("PRAGMA schema_version value is too large")
-                        })?;
-                        self.advance();
-                        value
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "non-negative integer schema_version, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
-                return Ok(Statement::SetPragmaSchemaVersion { value });
+            if let Some(value) =
+                self.parse_optional_signed_pragma_i32_bits_assignment("schema_version")?
+            {
+                return Ok(Statement::SetPragmaSchemaVersion { value, schema });
             }
-            return Ok(Statement::PragmaSchemaVersion);
+            return Ok(Statement::PragmaSchemaVersion { schema });
         }
         if name.eq_ignore_ascii_case("foreign_keys") {
-            if self.matches(&TokenKind::Eq) {
-                let enabled = match self.peek_kind() {
-                    TokenKind::On | TokenKind::True => {
-                        self.advance();
-                        true
-                    }
-                    TokenKind::Off | TokenKind::False => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(0) => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(1) => {
-                        self.advance();
-                        true
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "ON, OFF, 1, or 0 for foreign_keys, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
+            if let Some(enabled) = self.parse_optional_pragma_boolean_assignment("foreign_keys")? {
                 return Ok(Statement::SetPragmaForeignKeys { enabled });
             }
             return Ok(Statement::PragmaForeignKeys);
         }
+        if name.eq_ignore_ascii_case("defer_foreign_keys") {
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("defer_foreign_keys")?
+            {
+                return Ok(Statement::SetPragmaDeferForeignKeys { enabled });
+            }
+            return Ok(Statement::PragmaDeferForeignKeys);
+        }
         if name.eq_ignore_ascii_case("read_uncommitted") {
-            if self.matches(&TokenKind::Eq) {
-                let enabled = match self.peek_kind() {
-                    TokenKind::On | TokenKind::True => {
-                        self.advance();
-                        true
-                    }
-                    TokenKind::Off | TokenKind::False => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(0) => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(1) => {
-                        self.advance();
-                        true
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "ON, OFF, 1, or 0 for read_uncommitted, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("read_uncommitted")?
+            {
                 return Ok(Statement::SetPragmaReadUncommitted { enabled });
             }
             return Ok(Statement::PragmaReadUncommitted);
         }
         if name.eq_ignore_ascii_case("query_only") {
-            if self.matches(&TokenKind::Eq) {
-                let enabled = match self.peek_kind() {
-                    TokenKind::On | TokenKind::True => {
-                        self.advance();
-                        true
-                    }
-                    TokenKind::Off | TokenKind::False => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(0) => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(1) => {
-                        self.advance();
-                        true
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "ON, OFF, 1, or 0 for query_only, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
+            if let Some(enabled) = self.parse_optional_pragma_boolean_assignment("query_only")? {
                 return Ok(Statement::SetPragmaQueryOnly { enabled });
             }
             return Ok(Statement::PragmaQueryOnly);
         }
+        if name.eq_ignore_ascii_case("count_changes") {
+            if let Some(enabled) = self.parse_optional_pragma_boolean_assignment("count_changes")? {
+                return Ok(Statement::SetPragmaCountChanges { enabled });
+            }
+            return Ok(Statement::PragmaCountChanges);
+        }
         if name.eq_ignore_ascii_case("recursive_triggers") {
-            if self.matches(&TokenKind::Eq) {
-                let enabled = match self.peek_kind() {
-                    TokenKind::On | TokenKind::True => {
-                        self.advance();
-                        true
-                    }
-                    TokenKind::Off | TokenKind::False => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(0) => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(1) => {
-                        self.advance();
-                        true
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "ON, OFF, 1, or 0 for recursive_triggers, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("recursive_triggers")?
+            {
                 return Ok(Statement::SetPragmaRecursiveTriggers { enabled });
             }
             return Ok(Statement::PragmaRecursiveTriggers);
         }
         if name.eq_ignore_ascii_case("trusted_schema") {
-            if self.matches(&TokenKind::Eq) {
-                let enabled = match self.peek_kind() {
-                    TokenKind::On | TokenKind::True => {
-                        self.advance();
-                        true
-                    }
-                    TokenKind::Off | TokenKind::False => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(0) => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(1) => {
-                        self.advance();
-                        true
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "ON, OFF, 1, or 0 for trusted_schema, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("trusted_schema")?
+            {
                 return Ok(Statement::SetPragmaTrustedSchema { enabled });
             }
             return Ok(Statement::PragmaTrustedSchema);
         }
         if name.eq_ignore_ascii_case("ignore_check_constraints") {
-            if self.matches(&TokenKind::Eq) {
-                let enabled = match self.peek_kind() {
-                    TokenKind::On | TokenKind::True => {
-                        self.advance();
-                        true
-                    }
-                    TokenKind::Off | TokenKind::False => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(0) => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(1) => {
-                        self.advance();
-                        true
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "ON, OFF, 1, or 0 for ignore_check_constraints, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("ignore_check_constraints")?
+            {
                 return Ok(Statement::SetPragmaIgnoreCheckConstraints { enabled });
             }
             return Ok(Statement::PragmaIgnoreCheckConstraints);
         }
         if name.eq_ignore_ascii_case("encoding") {
+            if self.parse_optional_pragma_encoding_assignment()? {
+                return Ok(Statement::SetPragmaEncoding);
+            }
             return Ok(Statement::PragmaEncoding);
         }
         if name.eq_ignore_ascii_case("collation_list") {
@@ -496,108 +373,193 @@ impl Parser {
         if name.eq_ignore_ascii_case("compile_options") {
             return Ok(Statement::PragmaCompileOptions);
         }
+        if name.eq_ignore_ascii_case("pragma_list") {
+            return Ok(Statement::PragmaPragmaList);
+        }
+        if name.eq_ignore_ascii_case("module_list") {
+            return Ok(Statement::PragmaModuleList);
+        }
+        if name.eq_ignore_ascii_case("stats") {
+            return Ok(Statement::PragmaStats);
+        }
         if name.eq_ignore_ascii_case("journal_mode") {
-            return Ok(Statement::PragmaJournalMode);
+            if let Some(mode) = self.parse_optional_pragma_journal_mode_assignment()? {
+                return Ok(Statement::SetPragmaJournalMode { mode, schema });
+            }
+            return Ok(Statement::PragmaJournalMode { schema });
         }
         if name.eq_ignore_ascii_case("synchronous") {
-            return Ok(Statement::PragmaSynchronous);
+            if let Some(value) = self.parse_optional_pragma_synchronous_assignment()? {
+                return Ok(Statement::SetPragmaSynchronous { value, schema });
+            }
+            return Ok(Statement::PragmaSynchronous { schema });
         }
         if name.eq_ignore_ascii_case("cache_size") {
-            if self.matches(&TokenKind::Eq) {
-                let value = self.parse_signed_pragma_integer("cache_size")?;
-                return Ok(Statement::SetPragmaCacheSize { value });
+            if let Some(value) = self.parse_optional_pragma_cache_size_assignment()? {
+                return Ok(Statement::SetPragmaCacheSize { value, schema });
             }
-            return Ok(Statement::PragmaCacheSize);
+            return Ok(Statement::PragmaCacheSize { schema });
+        }
+        if name.eq_ignore_ascii_case("cache_spill") {
+            if let Some(value) = self.parse_optional_pragma_cache_spill_assignment()? {
+                return Ok(Statement::SetPragmaCacheSpill { value });
+            }
+            return Ok(Statement::PragmaCacheSpill);
         }
         if name.eq_ignore_ascii_case("temp_store") {
+            if let Some(value) = self.parse_optional_pragma_temp_store_assignment()? {
+                return Ok(Statement::SetPragmaTempStore { value });
+            }
             return Ok(Statement::PragmaTempStore);
         }
         if name.eq_ignore_ascii_case("locking_mode") {
-            return Ok(Statement::PragmaLockingMode);
+            if let Some(mode) = self.parse_optional_pragma_locking_mode_assignment()? {
+                return Ok(Statement::SetPragmaLockingMode { mode, schema });
+            }
+            return Ok(Statement::PragmaLockingMode { schema });
+        }
+        if name.eq_ignore_ascii_case("secure_delete") {
+            if let Some(value) = self.parse_optional_pragma_secure_delete_assignment()? {
+                return Ok(Statement::SetPragmaSecureDelete { value, schema });
+            }
+            return Ok(Statement::PragmaSecureDelete { schema });
+        }
+        if name.eq_ignore_ascii_case("wal_autocheckpoint") {
+            if let Some(value) = self.parse_optional_pragma_wal_autocheckpoint_assignment()? {
+                return Ok(Statement::SetPragmaWalAutocheckpoint { value });
+            }
+            return Ok(Statement::PragmaWalAutocheckpoint);
+        }
+        if name.eq_ignore_ascii_case("wal_checkpoint") {
+            self.parse_optional_pragma_scalar_argument()?;
+            return Ok(Statement::PragmaWalCheckpoint);
+        }
+        if name.eq_ignore_ascii_case("mmap_size") {
+            if let Some(value) =
+                self.parse_optional_signed_pragma_integer_assignment("mmap_size")?
+            {
+                return Ok(Statement::SetPragmaMmapSize { value });
+            }
+            return Ok(Statement::PragmaMmapSize);
+        }
+        if name.eq_ignore_ascii_case("auto_vacuum") {
+            if let Some(value) = self.parse_optional_pragma_auto_vacuum_assignment()? {
+                return Ok(Statement::SetPragmaAutoVacuum { value });
+            }
+            return Ok(Statement::PragmaAutoVacuum);
         }
         if name.eq_ignore_ascii_case("busy_timeout") {
-            if self.matches(&TokenKind::Eq) {
-                let value = self.parse_signed_pragma_integer("busy_timeout")?;
+            if let Some(value) = self.parse_optional_pragma_busy_timeout_assignment()? {
                 return Ok(Statement::SetPragmaBusyTimeout { value });
             }
             return Ok(Statement::PragmaBusyTimeout);
         }
+        if name.eq_ignore_ascii_case("analysis_limit") {
+            if let Some(value) =
+                self.parse_optional_lenient_unsigned_pragma_integer_assignment("analysis_limit")?
+            {
+                return Ok(Statement::SetPragmaAnalysisLimit { value });
+            }
+            return Ok(Statement::PragmaAnalysisLimit);
+        }
+        if name.eq_ignore_ascii_case("journal_size_limit") {
+            if let Some(value) =
+                self.parse_optional_signed_pragma_integer_assignment("journal_size_limit")?
+            {
+                return Ok(Statement::SetPragmaJournalSizeLimit { value });
+            }
+            return Ok(Statement::PragmaJournalSizeLimit);
+        }
+        if name.eq_ignore_ascii_case("soft_heap_limit") {
+            if let Some(value) =
+                self.parse_optional_signed_pragma_integer_assignment("soft_heap_limit")?
+            {
+                return Ok(Statement::SetPragmaSoftHeapLimit { value });
+            }
+            return Ok(Statement::PragmaSoftHeapLimit);
+        }
+        if name.eq_ignore_ascii_case("hard_heap_limit") {
+            if let Some(value) =
+                self.parse_optional_signed_pragma_integer_assignment("hard_heap_limit")?
+            {
+                return Ok(Statement::SetPragmaHardHeapLimit { value });
+            }
+            return Ok(Statement::PragmaHardHeapLimit);
+        }
         if name.eq_ignore_ascii_case("threads") {
-            if self.matches(&TokenKind::Eq) {
-                let value = match self.peek_kind() {
-                    TokenKind::Integer(value) if *value >= 0 => {
-                        let value = u32::try_from(*value)
-                            .map_err(|_| DbError::sql("PRAGMA threads value is too large"))?;
-                        self.advance();
-                        value
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "non-negative integer threads value, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
+            if let Some(value) =
+                self.parse_optional_lenient_unsigned_pragma_integer_assignment("threads")?
+            {
                 return Ok(Statement::SetPragmaThreads { value });
             }
             return Ok(Statement::PragmaThreads);
         }
+        if name.eq_ignore_ascii_case("automatic_index") {
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("automatic_index")?
+            {
+                return Ok(Statement::SetPragmaAutomaticIndex { enabled });
+            }
+            return Ok(Statement::PragmaAutomaticIndex);
+        }
+        if name.eq_ignore_ascii_case("cell_size_check") {
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("cell_size_check")?
+            {
+                return Ok(Statement::SetPragmaCellSizeCheck { enabled });
+            }
+            return Ok(Statement::PragmaCellSizeCheck);
+        }
+        if name.eq_ignore_ascii_case("full_column_names") {
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("full_column_names")?
+            {
+                return Ok(Statement::SetPragmaFullColumnNames { enabled });
+            }
+            return Ok(Statement::PragmaFullColumnNames);
+        }
+        if name.eq_ignore_ascii_case("short_column_names") {
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("short_column_names")?
+            {
+                return Ok(Statement::SetPragmaShortColumnNames { enabled });
+            }
+            return Ok(Statement::PragmaShortColumnNames);
+        }
+        if name.eq_ignore_ascii_case("fullfsync") {
+            if let Some(enabled) = self.parse_optional_pragma_boolean_assignment("fullfsync")? {
+                return Ok(Statement::SetPragmaFullFsync { enabled });
+            }
+            return Ok(Statement::PragmaFullFsync);
+        }
+        if name.eq_ignore_ascii_case("checkpoint_fullfsync") {
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("checkpoint_fullfsync")?
+            {
+                return Ok(Statement::SetPragmaCheckpointFullFsync { enabled });
+            }
+            return Ok(Statement::PragmaCheckpointFullFsync);
+        }
+        if name.eq_ignore_ascii_case("empty_result_callbacks") {
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("empty_result_callbacks")?
+            {
+                return Ok(Statement::SetPragmaEmptyResultCallbacks { enabled });
+            }
+            return Ok(Statement::PragmaEmptyResultCallbacks);
+        }
         if name.eq_ignore_ascii_case("case_sensitive_like") {
-            if self.matches(&TokenKind::Eq) {
-                let enabled = match self.peek_kind() {
-                    TokenKind::On | TokenKind::True => {
-                        self.advance();
-                        true
-                    }
-                    TokenKind::Off | TokenKind::False => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(0) => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(1) => {
-                        self.advance();
-                        true
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "ON, OFF, 1, or 0 for case_sensitive_like, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("case_sensitive_like")?
+            {
                 return Ok(Statement::SetPragmaCaseSensitiveLike { enabled });
             }
             return Ok(Statement::PragmaCaseSensitiveLike);
         }
         if name.eq_ignore_ascii_case("reverse_unordered_selects") {
-            if self.matches(&TokenKind::Eq) {
-                let enabled = match self.peek_kind() {
-                    TokenKind::On | TokenKind::True => {
-                        self.advance();
-                        true
-                    }
-                    TokenKind::Off | TokenKind::False => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(0) => {
-                        self.advance();
-                        false
-                    }
-                    TokenKind::Integer(1) => {
-                        self.advance();
-                        true
-                    }
-                    token => {
-                        return Err(self.error_expected(&format!(
-                            "ON, OFF, 1, or 0 for reverse_unordered_selects, found {}",
-                            display_token(token)
-                        )));
-                    }
-                };
+            if let Some(enabled) =
+                self.parse_optional_pragma_boolean_assignment("reverse_unordered_selects")?
+            {
                 return Ok(Statement::SetPragmaReverseUnorderedSelects { enabled });
             }
             return Ok(Statement::PragmaReverseUnorderedSelects);
@@ -612,42 +574,54 @@ impl Parser {
                         display_token(self.peek_kind())
                     )));
                 }
+            } else if self.matches(&TokenKind::LParen) {
+                if is_scalar_expr_start(self.peek_kind()) {
+                    let _ = self.parse_scalar_expr()?;
+                    self.expect_symbol(TokenKind::RParen)?;
+                } else {
+                    return Err(self.error_expected(&format!(
+                        "PRAGMA optimize argument, found {}",
+                        display_token(self.peek_kind())
+                    )));
+                }
             }
             return Ok(Statement::PragmaOptimize);
         }
+        if name.eq_ignore_ascii_case("shrink_memory") {
+            self.parse_optional_pragma_scalar_argument()?;
+            return Ok(Statement::PragmaShrinkMemory);
+        }
+        if name.eq_ignore_ascii_case("incremental_vacuum") {
+            self.parse_optional_pragma_scalar_argument()?;
+            return Ok(Statement::PragmaIncrementalVacuum);
+        }
         if name.eq_ignore_ascii_case("table_list") {
-            let table = if self.matches(&TokenKind::LParen) {
-                let table = self.parse_pragma_name_argument()?;
-                self.expect_symbol(TokenKind::RParen)?;
-                Some(table)
-            } else {
-                None
-            };
+            let table = self.parse_optional_pragma_name_argument_in_parens_or_equals()?;
             return Ok(Statement::PragmaTableList { table, schema });
         }
         if name.eq_ignore_ascii_case("foreign_key_check") {
-            let table = if self.matches(&TokenKind::LParen) {
-                let table = self.parse_pragma_name_argument()?;
-                self.expect_symbol(TokenKind::RParen)?;
-                Some(table)
-            } else {
-                None
-            };
-            return Ok(Statement::PragmaForeignKeyCheck { table });
+            let table = self.parse_optional_pragma_name_argument_in_parens_or_equals()?;
+            return Ok(Statement::PragmaForeignKeyCheck { table, schema });
         }
         let table = self.parse_pragma_name_argument_in_parens_or_equals()?;
         if name.eq_ignore_ascii_case("table_info") {
-            Ok(Statement::PragmaTableInfo { table })
+            Ok(Statement::PragmaTableInfo { table, schema })
         } else if name.eq_ignore_ascii_case("table_xinfo") {
-            Ok(Statement::PragmaTableXInfo { table })
+            Ok(Statement::PragmaTableXInfo { table, schema })
         } else if name.eq_ignore_ascii_case("index_list") {
-            Ok(Statement::PragmaIndexList { table })
+            Ok(Statement::PragmaIndexList { table, schema })
         } else if name.eq_ignore_ascii_case("index_info") {
-            Ok(Statement::PragmaIndexInfo { index: table })
+            Ok(Statement::PragmaIndexInfo {
+                index: table,
+                schema,
+            })
         } else if name.eq_ignore_ascii_case("index_xinfo") {
-            Ok(Statement::PragmaIndexXInfo { index: table })
+            Ok(Statement::PragmaIndexXInfo {
+                index: table,
+                schema,
+            })
         } else if name.eq_ignore_ascii_case("foreign_key_list") {
-            Ok(Statement::PragmaForeignKeyList { table })
+            Ok(Statement::PragmaForeignKeyList { table, schema })
         } else {
             Err(DbError::sql(format!("unsupported PRAGMA: {name}")))
         }
@@ -674,18 +648,758 @@ impl Parser {
         Ok(value)
     }
 
-    fn parse_optional_pragma_scalar_argument(&mut self) -> Result<()> {
+    fn parse_optional_pragma_name_argument_in_parens_or_equals(
+        &mut self,
+    ) -> Result<Option<String>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_name_argument().map(Some);
+        }
         if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_name_argument()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_pragma_scalar_argument(&mut self) -> Result<()> {
+        if self.matches(&TokenKind::Eq) {
+            let _ = self.parse_scalar_expr()?;
+        } else if self.matches(&TokenKind::LParen) {
             let _ = self.parse_scalar_expr()?;
             self.expect_symbol(TokenKind::RParen)?;
         }
         Ok(())
     }
 
+    fn parse_optional_pragma_encoding_assignment(&mut self) -> Result<bool> {
+        if self.matches(&TokenKind::Eq) {
+            self.parse_pragma_encoding()?;
+            return Ok(true);
+        }
+        if self.matches(&TokenKind::LParen) {
+            self.parse_pragma_encoding()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn parse_pragma_encoding(&mut self) -> Result<()> {
+        let encoding = self.parse_pragma_name_argument()?;
+        let normalized = encoding.replace('-', "");
+        if normalized.eq_ignore_ascii_case("utf8") {
+            Ok(())
+        } else {
+            Err(DbError::sql(format!("unsupported encoding: {encoding}")))
+        }
+    }
+
+    fn parse_optional_pragma_temp_store_assignment(&mut self) -> Result<Option<i64>> {
+        if self.matches(&TokenKind::Eq) {
+            return Ok(Some(self.parse_pragma_temp_store()?));
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_temp_store()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_pragma_busy_timeout_assignment(&mut self) -> Result<Option<i64>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_busy_timeout().map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_busy_timeout()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_busy_timeout(&mut self) -> Result<i64> {
+        if self.matches(&TokenKind::Default) {
+            Ok(0)
+        } else {
+            self.parse_signed_pragma_integer("busy_timeout")
+        }
+    }
+
+    fn parse_optional_pragma_auto_vacuum_assignment(&mut self) -> Result<Option<Option<i64>>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_auto_vacuum().map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_auto_vacuum()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_auto_vacuum(&mut self) -> Result<Option<i64>> {
+        match self.peek_kind() {
+            TokenKind::Integer(value @ 0..=2) => {
+                let value = *value;
+                self.advance();
+                Ok(Some(value))
+            }
+            TokenKind::Default | TokenKind::Off | TokenKind::False => {
+                self.advance();
+                Ok(Some(0))
+            }
+            TokenKind::On | TokenKind::True | TokenKind::Full => {
+                self.advance();
+                Ok(Some(1))
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("NONE") => {
+                self.advance();
+                Ok(Some(0))
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("FULL") => {
+                self.advance();
+                Ok(Some(1))
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("INCREMENTAL") => {
+                self.advance();
+                Ok(Some(2))
+            }
+            TokenKind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                if value.eq_ignore_ascii_case("NONE") {
+                    Ok(Some(0))
+                } else if value.eq_ignore_ascii_case("FULL") {
+                    Ok(Some(1))
+                } else if value.eq_ignore_ascii_case("INCREMENTAL") {
+                    Ok(Some(2))
+                } else {
+                    let value = sqlite_pragma_string_integer_prefix(&value);
+                    Ok((0..=2).contains(&value).then_some(value))
+                }
+            }
+            TokenKind::Integer(_) | TokenKind::Identifier(_) => {
+                let _ = self.parse_pragma_name_argument()?;
+                Ok(None)
+            }
+            token => Err(self.error_expected(&format!(
+                "NONE, FULL, INCREMENTAL, 0, 1, or 2 for auto_vacuum, found {}",
+                display_token(token)
+            ))),
+        }
+    }
+
+    fn parse_optional_pragma_cache_size_assignment(&mut self) -> Result<Option<i64>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_cache_size().map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_cache_size()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_cache_size(&mut self) -> Result<i64> {
+        if self.matches(&TokenKind::Default) {
+            Ok(0)
+        } else {
+            self.parse_signed_pragma_integer("cache_size")
+        }
+    }
+
+    fn parse_optional_pragma_cache_spill_assignment(&mut self) -> Result<Option<Option<i64>>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_cache_spill().map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_cache_spill()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_cache_spill(&mut self) -> Result<Option<i64>> {
+        match self.peek_kind() {
+            TokenKind::On | TokenKind::True | TokenKind::Default => {
+                self.advance();
+                Ok(Some(2000))
+            }
+            TokenKind::Off | TokenKind::False => {
+                self.advance();
+                Ok(Some(0))
+            }
+            TokenKind::Integer(value) => {
+                let value = *value;
+                self.advance();
+                Ok(Some(if value > 0 { value.max(2000) } else { 0 }))
+            }
+            TokenKind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                if value.eq_ignore_ascii_case("ON") {
+                    Ok(Some(2000))
+                } else if value.eq_ignore_ascii_case("OFF") {
+                    Ok(Some(0))
+                } else {
+                    let value = sqlite_pragma_string_integer_prefix(&value);
+                    Ok(Some(if value > 0 { value.max(2000) } else { 0 }))
+                }
+            }
+            _ => {
+                self.parse_pragma_name_argument()?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn parse_pragma_temp_store(&mut self) -> Result<i64> {
+        match self.peek_kind() {
+            TokenKind::Integer(value @ 0..=3) => {
+                let value = *value;
+                self.advance();
+                Ok(value)
+            }
+            TokenKind::Default => {
+                self.advance();
+                Ok(0)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("DEFAULT") => {
+                self.advance();
+                Ok(0)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("FILE") => {
+                self.advance();
+                Ok(1)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("MEMORY") => {
+                self.advance();
+                Ok(2)
+            }
+            TokenKind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                if value.eq_ignore_ascii_case("DEFAULT") {
+                    Ok(0)
+                } else if value.eq_ignore_ascii_case("FILE") {
+                    Ok(1)
+                } else if value.eq_ignore_ascii_case("MEMORY") {
+                    Ok(2)
+                } else {
+                    let value = sqlite_pragma_string_integer_prefix(&value);
+                    if (0..=3).contains(&value) {
+                        Ok(value)
+                    } else {
+                        Err(DbError::sql(format!("unsupported temp_store: {value}")))
+                    }
+                }
+            }
+            TokenKind::Integer(value) => {
+                let value = *value;
+                self.advance();
+                Err(DbError::sql(format!("unsupported temp_store: {value}")))
+            }
+            TokenKind::Identifier(_) => {
+                let value = self.parse_pragma_name_argument()?;
+                Err(DbError::sql(format!("unsupported temp_store: {value}")))
+            }
+            token => Err(self.error_expected(&format!(
+                "DEFAULT, FILE, MEMORY, 0, 1, or 2 for temp_store, found {}",
+                display_token(token)
+            ))),
+        }
+    }
+
+    fn parse_optional_pragma_synchronous_assignment(&mut self) -> Result<Option<i64>> {
+        if self.matches(&TokenKind::Eq) {
+            return Ok(Some(self.parse_pragma_synchronous()?));
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_synchronous()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_synchronous(&mut self) -> Result<i64> {
+        match self.peek_kind() {
+            TokenKind::Integer(value @ 0..=3) => {
+                let value = *value;
+                self.advance();
+                Ok(value)
+            }
+            TokenKind::Full => {
+                self.advance();
+                Ok(2)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("FULL") => {
+                self.advance();
+                Ok(2)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("EXTRA") => {
+                self.advance();
+                Ok(3)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("NORMAL") => {
+                self.advance();
+                Ok(1)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("OFF") => {
+                self.advance();
+                Ok(0)
+            }
+            TokenKind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                if value.eq_ignore_ascii_case("FULL") {
+                    Ok(2)
+                } else if value.eq_ignore_ascii_case("EXTRA") {
+                    Ok(3)
+                } else if value.eq_ignore_ascii_case("NORMAL") {
+                    Ok(1)
+                } else if value.eq_ignore_ascii_case("OFF") {
+                    Ok(0)
+                } else {
+                    let value = sqlite_pragma_string_integer_prefix(&value);
+                    if (0..=3).contains(&value) {
+                        Ok(value)
+                    } else {
+                        Err(DbError::sql(format!("unsupported synchronous: {value}")))
+                    }
+                }
+            }
+            TokenKind::Integer(value) => {
+                let value = *value;
+                self.advance();
+                Err(DbError::sql(format!("unsupported synchronous: {value}")))
+            }
+            TokenKind::Off => {
+                self.advance();
+                Ok(0)
+            }
+            TokenKind::Identifier(_) => {
+                let value = self.parse_pragma_name_argument()?;
+                Err(DbError::sql(format!("unsupported synchronous: {value}")))
+            }
+            token => Err(self.error_expected(&format!(
+                "OFF, NORMAL, FULL, EXTRA, 0, 1, 2, or 3 for synchronous, found {}",
+                display_token(token)
+            ))),
+        }
+    }
+
+    fn parse_optional_pragma_journal_mode_assignment(&mut self) -> Result<Option<String>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_journal_mode().map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let mode = self.parse_pragma_journal_mode()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(mode));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_journal_mode(&mut self) -> Result<String> {
+        match self.peek_kind() {
+            TokenKind::Delete => {
+                self.advance();
+                Ok("delete".to_string())
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("memory") => {
+                self.advance();
+                Ok("memory".to_string())
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("truncate") => {
+                self.advance();
+                Ok("truncate".to_string())
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("persist") => {
+                self.advance();
+                Ok("persist".to_string())
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("off") => {
+                self.advance();
+                Ok("off".to_string())
+            }
+            TokenKind::Off => {
+                self.advance();
+                Ok("off".to_string())
+            }
+            TokenKind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                if value.eq_ignore_ascii_case("delete") {
+                    Ok("delete".to_string())
+                } else if value.eq_ignore_ascii_case("memory") {
+                    Ok("memory".to_string())
+                } else if value.eq_ignore_ascii_case("truncate") {
+                    Ok("truncate".to_string())
+                } else if value.eq_ignore_ascii_case("persist") {
+                    Ok("persist".to_string())
+                } else if value.eq_ignore_ascii_case("off") {
+                    Ok("off".to_string())
+                } else {
+                    Err(DbError::sql(format!(
+                        "changing journal_mode is not supported: {value}"
+                    )))
+                }
+            }
+            TokenKind::Identifier(_) => {
+                let value = self.parse_pragma_name_argument()?;
+                Err(DbError::sql(format!(
+                    "changing journal_mode is not supported: {value}"
+                )))
+            }
+            token => {
+                let value = display_token(token);
+                self.advance();
+                Err(DbError::sql(format!(
+                    "changing journal_mode is not supported: {value}"
+                )))
+            }
+        }
+    }
+
+    fn parse_optional_pragma_locking_mode_assignment(&mut self) -> Result<Option<String>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_name_argument().map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let mode = self.parse_pragma_name_argument()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(mode));
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_pragma_secure_delete_assignment(&mut self) -> Result<Option<Option<i64>>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_secure_delete().map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_secure_delete()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_secure_delete(&mut self) -> Result<Option<i64>> {
+        match self.peek_kind() {
+            TokenKind::On | TokenKind::True => {
+                self.advance();
+                Ok(Some(1))
+            }
+            TokenKind::Off | TokenKind::False => {
+                self.advance();
+                Ok(Some(0))
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("FAST") => {
+                self.advance();
+                Ok(Some(2))
+            }
+            TokenKind::Integer(value) if (0..=2).contains(value) => {
+                let value = *value;
+                self.advance();
+                Ok(Some(value))
+            }
+            TokenKind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                if value.eq_ignore_ascii_case("ON") {
+                    Ok(Some(1))
+                } else if value.eq_ignore_ascii_case("OFF") {
+                    Ok(Some(0))
+                } else if value.eq_ignore_ascii_case("FAST") {
+                    Ok(Some(2))
+                } else {
+                    let value = sqlite_pragma_string_integer_prefix(&value);
+                    Ok((0..=2).contains(&value).then_some(value))
+                }
+            }
+            _ => {
+                self.parse_pragma_name_argument()?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn parse_optional_pragma_wal_autocheckpoint_assignment(
+        &mut self,
+    ) -> Result<Option<Option<i64>>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_wal_autocheckpoint().map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_wal_autocheckpoint()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_wal_autocheckpoint(&mut self) -> Result<Option<i64>> {
+        match self.peek_kind() {
+            TokenKind::Integer(value) => {
+                let value = *value;
+                self.advance();
+                Ok(Some(value.max(0)))
+            }
+            TokenKind::Minus => {
+                self.advance();
+                self.expect_keyword(TokenKind::Integer(1))?;
+                Ok(Some(0))
+            }
+            _ => {
+                self.parse_pragma_name_argument()?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn parse_optional_pragma_max_page_count_assignment(&mut self) -> Result<Option<Option<i64>>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_max_page_count().map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_pragma_max_page_count()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_max_page_count(&mut self) -> Result<Option<i64>> {
+        match self.peek_kind() {
+            TokenKind::Integer(value) => {
+                let value = *value;
+                self.advance();
+                Ok((value > 0).then_some(value))
+            }
+            TokenKind::Minus => {
+                self.advance();
+                self.expect_keyword(TokenKind::Integer(1))?;
+                Ok(None)
+            }
+            _ => {
+                self.parse_pragma_name_argument()?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn parse_optional_pragma_boolean_assignment(
+        &mut self,
+        pragma_name: &str,
+    ) -> Result<Option<bool>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_pragma_boolean(pragma_name).map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let enabled = self.parse_pragma_boolean(pragma_name)?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(enabled));
+        }
+        Ok(None)
+    }
+
+    fn parse_pragma_boolean(&mut self, pragma_name: &str) -> Result<bool> {
+        match self.peek_kind() {
+            TokenKind::On | TokenKind::True => {
+                self.advance();
+                Ok(true)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("YES") => {
+                self.advance();
+                Ok(true)
+            }
+            TokenKind::Off | TokenKind::False => {
+                self.advance();
+                Ok(false)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("NO") => {
+                self.advance();
+                Ok(false)
+            }
+            TokenKind::Default => {
+                self.advance();
+                Ok(false)
+            }
+            TokenKind::Integer(value) => {
+                let enabled = *value > 0;
+                self.advance();
+                Ok(enabled)
+            }
+            TokenKind::Minus => {
+                self.advance();
+                self.expect_keyword(TokenKind::Integer(1))?;
+                Ok(false)
+            }
+            TokenKind::String(value) => {
+                let enabled = sqlite_pragma_boolean_string(value);
+                self.advance();
+                Ok(enabled)
+            }
+            token => Err(self.error_expected(&format!(
+                "ON, OFF, 1, or 0 for {pragma_name}, found {}",
+                display_token(token)
+            ))),
+        }
+    }
+
+    fn parse_optional_signed_pragma_integer_assignment(
+        &mut self,
+        pragma_name: &str,
+    ) -> Result<Option<i64>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_signed_pragma_integer(pragma_name).map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_signed_pragma_integer(pragma_name)?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_unsigned_pragma_integer_assignment(
+        &mut self,
+        pragma_name: &str,
+    ) -> Result<Option<u32>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_unsigned_pragma_integer(pragma_name).map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_unsigned_pragma_integer(pragma_name)?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_lenient_unsigned_pragma_integer_assignment(
+        &mut self,
+        pragma_name: &str,
+    ) -> Result<Option<Option<u32>>> {
+        if self.matches(&TokenKind::Eq) {
+            return self
+                .parse_lenient_unsigned_pragma_integer(pragma_name)
+                .map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_lenient_unsigned_pragma_integer(pragma_name)?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_signed_pragma_i32_bits_assignment(
+        &mut self,
+        pragma_name: &str,
+    ) -> Result<Option<u32>> {
+        if self.matches(&TokenKind::Eq) {
+            return self.parse_signed_pragma_i32_bits(pragma_name).map(Some);
+        }
+        if self.matches(&TokenKind::LParen) {
+            let value = self.parse_signed_pragma_i32_bits(pragma_name)?;
+            self.expect_symbol(TokenKind::RParen)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    fn parse_signed_pragma_i32_bits(&mut self, pragma_name: &str) -> Result<u32> {
+        let value = self.parse_signed_pragma_integer(pragma_name)?;
+        let value = i32::try_from(value)
+            .map_err(|_| DbError::sql(format!("PRAGMA {pragma_name} value is too large")))?;
+        Ok(u32::from_ne_bytes(value.to_ne_bytes()))
+    }
+
+    fn parse_unsigned_pragma_integer(&mut self, pragma_name: &str) -> Result<u32> {
+        match self.peek_kind() {
+            TokenKind::Integer(value) if *value >= 0 => {
+                let value = u32::try_from(*value).map_err(|_| {
+                    DbError::sql(format!("PRAGMA {pragma_name} value is too large"))
+                })?;
+                self.advance();
+                Ok(value)
+            }
+            TokenKind::String(value) => {
+                let value = sqlite_pragma_string_integer_prefix(value).max(0);
+                let value = u32::try_from(value).map_err(|_| {
+                    DbError::sql(format!("PRAGMA {pragma_name} value is too large"))
+                })?;
+                self.advance();
+                Ok(value)
+            }
+            token => Err(self.error_expected(&format!(
+                "non-negative integer {pragma_name} value, found {}",
+                display_token(token)
+            ))),
+        }
+    }
+
+    fn parse_lenient_unsigned_pragma_integer(&mut self, pragma_name: &str) -> Result<Option<u32>> {
+        match self.peek_kind() {
+            TokenKind::Integer(value) if *value >= 0 => {
+                let value = u32::try_from(*value).map_err(|_| {
+                    DbError::sql(format!("PRAGMA {pragma_name} value is too large"))
+                })?;
+                self.advance();
+                Ok(Some(value))
+            }
+            TokenKind::String(value) => {
+                let value = sqlite_pragma_string_integer_prefix(value);
+                self.advance();
+                if value >= 0 {
+                    let value = u32::try_from(value).map_err(|_| {
+                        DbError::sql(format!("PRAGMA {pragma_name} value is too large"))
+                    })?;
+                    Ok(Some(value))
+                } else {
+                    Ok(None)
+                }
+            }
+            TokenKind::Minus => {
+                self.advance();
+                if matches!(self.peek_kind(), TokenKind::Integer(_)) {
+                    self.advance();
+                } else if is_identifier_token(self.peek_kind()) {
+                    let _ = self.parse_simple_identifier()?;
+                }
+                Ok(None)
+            }
+            TokenKind::Default => {
+                self.advance();
+                Ok(None)
+            }
+            TokenKind::Identifier(_) => {
+                let _ = self.parse_pragma_name_argument()?;
+                Ok(None)
+            }
+            token => Err(self.error_expected(&format!(
+                "integer {pragma_name} value, found {}",
+                display_token(token)
+            ))),
+        }
+    }
+
     fn parse_signed_pragma_integer(&mut self, pragma_name: &str) -> Result<i64> {
         match self.peek_kind() {
             TokenKind::Integer(value) => {
                 let value = *value;
+                self.advance();
+                Ok(value)
+            }
+            TokenKind::String(value) => {
+                let value = sqlite_pragma_string_integer_prefix(value);
                 self.advance();
                 Ok(value)
             }
@@ -717,31 +1431,158 @@ impl Parser {
         if self.parse_optional_identifier_keyword_if("TEMP")
             || self.parse_optional_identifier_keyword_if("TEMPORARY")
         {
-            return self.parse_create_table();
+            return match self.peek_kind() {
+                TokenKind::Table => self.parse_create_table(true),
+                TokenKind::Identifier(name) if name.eq_ignore_ascii_case("VIEW") => {
+                    self.parse_create_view(true)
+                }
+                token => {
+                    Err(self
+                        .error_expected(&format!("TABLE or VIEW, found {}", display_token(token))))
+                }
+            };
         }
         match self.peek_kind() {
-            TokenKind::Table => self.parse_create_table(),
+            TokenKind::Table => self.parse_create_table(false),
+            TokenKind::Identifier(name) if name.eq_ignore_ascii_case("VIEW") => {
+                self.parse_create_view(false)
+            }
             TokenKind::Index => self.parse_create_index(false),
             TokenKind::Unique => {
                 self.advance();
                 self.parse_create_index(true)
             }
+            TokenKind::Identifier(name) if name.eq_ignore_ascii_case("TRIGGER") => {
+                self.parse_create_trigger()
+            }
             token => Err(self.error_expected(&format!(
-                "TABLE, INDEX, or UNIQUE INDEX, found {}",
+                "TABLE, VIEW, INDEX, UNIQUE INDEX, or TRIGGER, found {}",
                 display_token(token)
             ))),
         }
     }
 
-    fn parse_create_table(&mut self) -> Result<Statement> {
+    fn parse_create_trigger(&mut self) -> Result<Statement> {
+        let start = self.index.saturating_sub(1);
+        self.expect_identifier_keyword("TRIGGER")?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (name, schema) = self.parse_schema_qualified_name_with_schema()?;
+
+        while !matches!(self.peek_kind(), TokenKind::On | TokenKind::Eof) {
+            self.advance();
+        }
+        self.expect_keyword(TokenKind::On)?;
+        let (table, _table_schema) = self.parse_schema_qualified_name_with_schema()?;
+
+        while !matches!(self.peek_kind(), TokenKind::Begin | TokenKind::Eof) {
+            self.advance();
+        }
+        self.expect_keyword(TokenKind::Begin)?;
+
+        let mut case_depth = 0usize;
+        loop {
+            match self.peek_kind() {
+                TokenKind::Case => {
+                    case_depth += 1;
+                    self.advance();
+                }
+                TokenKind::End if case_depth > 0 => {
+                    case_depth -= 1;
+                    self.advance();
+                }
+                TokenKind::End => {
+                    self.advance();
+                    break;
+                }
+                TokenKind::Eof => break,
+                _ => self.advance(),
+            }
+        }
+
+        let fragments = self.tokens[start..self.index]
+            .iter()
+            .map(token_sql_fragment)
+            .collect::<Vec<_>>();
+        let sql = join_sql_fragments(&fragments).replace("VALUES(", "VALUES (");
+        Ok(Statement::CreateTrigger {
+            name,
+            schema,
+            table,
+            sql,
+            if_not_exists,
+        })
+    }
+
+    fn parse_create_view(&mut self, temporary: bool) -> Result<Statement> {
+        self.expect_identifier_keyword("VIEW")?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (name, schema) = self.parse_schema_qualified_name_with_schema()?;
+        let temporary =
+            temporary || schema.is_some_and(|schema| schema.eq_ignore_ascii_case("temp"));
+        let columns = if matches!(self.peek_kind(), TokenKind::LParen) {
+            Some(self.parse_parenthesized_identifier_list()?)
+        } else {
+            None
+        };
+        self.expect_keyword(TokenKind::As)?;
+        let select = if matches!(self.peek_kind(), TokenKind::Values) {
+            self.parse_values_as_select_statement()?
+        } else if matches!(self.peek_kind(), TokenKind::With) {
+            self.parse_with_select_statement()?
+        } else {
+            self.parse_select_statement()?
+        };
+        Ok(Statement::CreateView {
+            name,
+            columns,
+            if_not_exists,
+            select,
+            temporary,
+        })
+    }
+
+    fn parse_create_table(&mut self, temporary: bool) -> Result<Statement> {
         self.expect_keyword(TokenKind::Table)?;
         let if_not_exists = self.parse_if_not_exists()?;
-        let name = self.parse_identifier()?;
+        let (name, schema) = self.parse_schema_qualified_name_with_schema()?;
+        let temporary =
+            temporary || schema.is_some_and(|schema| schema.eq_ignore_ascii_case("temp"));
         if self.matches(&TokenKind::As) {
+            if matches!(self.peek_kind(), TokenKind::With) {
+                return match self.parse_with_statement()? {
+                    Statement::Select(select) => Ok(Statement::CreateTableAs {
+                        name,
+                        if_not_exists,
+                        select,
+                        temporary,
+                    }),
+                    Statement::ValuesWith { with, rows } => Ok(Statement::CreateTableAsValues {
+                        name,
+                        if_not_exists,
+                        with: Some(with),
+                        rows,
+                        temporary,
+                    }),
+                    _ => Err(DbError::sql(
+                        "CREATE TABLE AS WITH only supports SELECT or VALUES",
+                    )),
+                };
+            }
+            if matches!(self.peek_kind(), TokenKind::Values) {
+                return Ok(Statement::CreateTableAsValues {
+                    name,
+                    if_not_exists,
+                    with: None,
+                    rows: self.parse_values_rows()?,
+                    temporary,
+                });
+            }
+            let select = self.parse_select_statement()?;
             return Ok(Statement::CreateTableAs {
                 name,
                 if_not_exists,
-                select: self.parse_select_statement()?,
+                select,
+                temporary,
             });
         }
         self.expect_symbol(TokenKind::LParen)?;
@@ -764,6 +1605,9 @@ impl Parser {
 
         self.expect_symbol(TokenKind::RParen)?;
         let (strict, without_rowid) = self.parse_table_options()?;
+        if strict {
+            validate_strict_table_declared_types(&name, &columns)?;
+        }
         Ok(Statement::CreateTable {
             name,
             columns,
@@ -771,13 +1615,14 @@ impl Parser {
             strict,
             without_rowid,
             if_not_exists,
+            temporary,
         })
     }
 
     fn parse_create_index(&mut self, unique: bool) -> Result<Statement> {
         self.expect_keyword(TokenKind::Index)?;
         let if_not_exists = self.parse_if_not_exists()?;
-        let name = self.parse_identifier()?;
+        let (name, schema) = self.parse_schema_qualified_name_with_schema()?;
         self.expect_keyword(TokenKind::On)?;
         let table = self.parse_identifier()?;
         let (columns, decorated_columns) = self.parse_parenthesized_index_column_list()?;
@@ -789,6 +1634,7 @@ impl Parser {
 
         Ok(Statement::CreateIndex {
             name,
+            schema,
             table,
             columns,
             decorated_columns: Some(decorated_columns),
@@ -855,22 +1701,47 @@ impl Parser {
             TokenKind::Table => {
                 self.advance();
                 let if_exists = self.parse_if_exists()?;
+                let (name, schema) = self.parse_schema_qualified_name_with_schema()?;
                 Ok(Statement::DropTable {
-                    name: self.parse_simple_identifier()?,
+                    name,
+                    schema,
                     if_exists,
                 })
             }
             TokenKind::Index => {
                 self.advance();
                 let if_exists = self.parse_if_exists()?;
+                let (name, schema) = self.parse_schema_qualified_name_with_schema()?;
                 Ok(Statement::DropIndex {
-                    name: self.parse_simple_identifier()?,
+                    name,
+                    schema,
                     if_exists,
                 })
             }
-            token => {
-                Err(self.error_expected(&format!("TABLE or INDEX, found {}", display_token(token))))
+            TokenKind::Identifier(name) if name.eq_ignore_ascii_case("VIEW") => {
+                self.advance();
+                let if_exists = self.parse_if_exists()?;
+                let (name, schema) = self.parse_schema_qualified_name_with_schema()?;
+                Ok(Statement::DropView {
+                    name,
+                    schema,
+                    if_exists,
+                })
             }
+            TokenKind::Identifier(name) if name.eq_ignore_ascii_case("TRIGGER") => {
+                self.advance();
+                let if_exists = self.parse_if_exists()?;
+                let (name, schema) = self.parse_schema_qualified_name_with_schema()?;
+                Ok(Statement::DropTrigger {
+                    name,
+                    schema,
+                    if_exists,
+                })
+            }
+            token => Err(self.error_expected(&format!(
+                "TABLE, VIEW, INDEX, or TRIGGER, found {}",
+                display_token(token)
+            ))),
         }
     }
 
@@ -924,7 +1795,8 @@ impl Parser {
             None
         };
         self.expect_keyword(TokenKind::Into)?;
-        let table = self.parse_simple_identifier()?;
+        let table = self.parse_schema_qualified_name()?;
+        let _ = self.parse_optional_insert_target_alias()?;
         let columns = if matches!(self.peek_kind(), TokenKind::LParen) {
             Some(self.parse_parenthesized_identifier_list()?)
         } else {
@@ -1381,7 +2253,7 @@ impl Parser {
     fn parse_replace(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Replace)?;
         self.expect_keyword(TokenKind::Into)?;
-        let table = self.parse_simple_identifier()?;
+        let table = self.parse_schema_qualified_name()?;
         let columns = if matches!(self.peek_kind(), TokenKind::LParen) {
             Some(self.parse_parenthesized_identifier_list()?)
         } else {
@@ -1457,8 +2329,11 @@ impl Parser {
     fn parse_delete(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Delete)?;
         self.expect_keyword(TokenKind::From)?;
-        let table = self.parse_simple_identifier()?;
+        let (table, schema) = self.parse_schema_qualified_name_with_schema()?;
         let table_alias = self.parse_optional_table_alias()?;
+        let index_hint = self
+            .parse_optional_table_index_hint()?
+            .map(table_index_hint_from_parsed);
         let filter = if self.matches(&TokenKind::Where) {
             Some(self.parse_where_expr()?)
         } else {
@@ -1466,7 +2341,7 @@ impl Parser {
         };
         let order_by = if self.matches(&TokenKind::Order) {
             self.expect_keyword(TokenKind::By)?;
-            self.parse_order_by_items()?
+            self.parse_order_by_items(false)?
         } else {
             Vec::new()
         };
@@ -1474,7 +2349,7 @@ impl Parser {
         let returning = self.parse_optional_returning_clause()?;
         let returning_order_by = if returning.is_some() && self.matches(&TokenKind::Order) {
             self.expect_keyword(TokenKind::By)?;
-            self.parse_order_by_items()?
+            self.parse_order_by_items(false)?
         } else {
             Vec::new()
         };
@@ -1496,7 +2371,9 @@ impl Parser {
             {
                 Ok(Statement::DeleteReturningLimited {
                     table,
+                    schema,
                     table_alias,
+                    index_hint,
                     filter,
                     returning,
                     order_by: returning_order_by,
@@ -1506,7 +2383,9 @@ impl Parser {
             } else {
                 Ok(Statement::DeleteReturning {
                     table,
+                    schema,
                     table_alias,
+                    index_hint,
                     filter,
                     returning,
                 })
@@ -1514,7 +2393,9 @@ impl Parser {
         } else if !order_by.is_empty() || limit.is_some() || offset.is_some() {
             Ok(Statement::DeleteLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
                 order_by,
                 limit,
@@ -1523,7 +2404,9 @@ impl Parser {
         } else {
             Ok(Statement::Delete {
                 table,
+                schema,
                 table_alias,
+                index_hint,
                 filter,
             })
         }
@@ -1551,10 +2434,23 @@ impl Parser {
 
     fn parse_update(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Update)?;
-        let table = self.parse_simple_identifier()?;
+        let or_conflict = if self.matches(&TokenKind::Or) {
+            Some(self.parse_insert_or_conflict_resolution()?)
+        } else {
+            None
+        };
+        let (table, schema) = self.parse_schema_qualified_name_with_schema()?;
         let table_alias = self.parse_optional_table_alias()?;
+        let index_hint = self
+            .parse_optional_table_index_hint()?
+            .map(table_index_hint_from_parsed);
         self.expect_keyword(TokenKind::Set)?;
         let assignments = self.parse_assignments()?;
+        let from = if self.matches(&TokenKind::From) {
+            Some(self.parse_from_item()?)
+        } else {
+            None
+        };
         let filter = if self.matches(&TokenKind::Where) {
             Some(self.parse_where_expr()?)
         } else {
@@ -1562,7 +2458,7 @@ impl Parser {
         };
         let order_by = if self.matches(&TokenKind::Order) {
             self.expect_keyword(TokenKind::By)?;
-            self.parse_order_by_items()?
+            self.parse_order_by_items(false)?
         } else {
             Vec::new()
         };
@@ -1570,7 +2466,7 @@ impl Parser {
         let returning = self.parse_optional_returning_clause()?;
         let returning_order_by = if returning.is_some() && self.matches(&TokenKind::Order) {
             self.expect_keyword(TokenKind::By)?;
-            self.parse_order_by_items()?
+            self.parse_order_by_items(false)?
         } else {
             Vec::new()
         };
@@ -1592,8 +2488,12 @@ impl Parser {
             {
                 Ok(Statement::UpdateReturningLimited {
                     table,
+                    schema,
                     table_alias,
+                    index_hint,
+                    or_conflict,
                     assignments,
+                    from,
                     filter,
                     returning,
                     order_by: returning_order_by,
@@ -1603,8 +2503,12 @@ impl Parser {
             } else {
                 Ok(Statement::UpdateReturning {
                     table,
+                    schema,
                     table_alias,
+                    index_hint,
+                    or_conflict,
                     assignments,
+                    from,
                     filter,
                     returning,
                 })
@@ -1612,8 +2516,12 @@ impl Parser {
         } else if !order_by.is_empty() || limit.is_some() || offset.is_some() {
             Ok(Statement::UpdateLimited {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from,
                 filter,
                 order_by,
                 limit,
@@ -1622,8 +2530,12 @@ impl Parser {
         } else {
             Ok(Statement::Update {
                 table,
+                schema,
                 table_alias,
+                index_hint,
+                or_conflict,
                 assignments,
+                from,
                 filter,
             })
         }
@@ -1631,6 +2543,8 @@ impl Parser {
 
     fn parse_begin_or_start_transaction(&mut self) -> Result<Statement> {
         if self.matches(&TokenKind::Begin) {
+            self.parse_optional_sqlite_begin_mode();
+            let _ = self.matches(&TokenKind::Transaction);
             return Ok(Statement::Begin {
                 isolation_level: self.parse_optional_isolation_level()?,
             });
@@ -1641,6 +2555,42 @@ impl Parser {
         Ok(Statement::Begin {
             isolation_level: self.parse_optional_isolation_level()?,
         })
+    }
+
+    fn parse_savepoint_statement(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Savepoint)?;
+        Ok(Statement::Savepoint {
+            name: self.parse_simple_identifier()?,
+        })
+    }
+
+    fn parse_rollback_statement(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Rollback)?;
+        let _ = self.matches(&TokenKind::Transaction);
+        if self.matches(&TokenKind::To) {
+            let _ = self.matches(&TokenKind::Savepoint);
+            return Ok(Statement::RollbackTo {
+                name: self.parse_simple_identifier()?,
+            });
+        }
+        Ok(Statement::Rollback)
+    }
+
+    fn parse_release_statement(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Release)?;
+        let _ = self.matches(&TokenKind::Savepoint);
+        Ok(Statement::Release {
+            name: self.parse_simple_identifier()?,
+        })
+    }
+
+    fn parse_optional_sqlite_begin_mode(&mut self) {
+        if self.parse_optional_identifier_keyword_if("DEFERRED")
+            || self.parse_optional_identifier_keyword_if("IMMEDIATE")
+            || self.parse_optional_identifier_keyword_if("EXCLUSIVE")
+        {
+            return;
+        }
     }
 
     fn parse_optional_isolation_level(&mut self) -> Result<Option<IsolationLevel>> {
@@ -1665,6 +2615,27 @@ impl Parser {
 
     fn parse_select_statement(&mut self) -> Result<SelectStatement> {
         self.parse_compound_select_statement(None)
+    }
+
+    fn parse_values_as_select_statement(&mut self) -> Result<SelectStatement> {
+        Ok(SelectStatement {
+            with: None,
+            distinct: false,
+            columns: vec![SelectItem::Wildcard],
+            from: FromItem::Values {
+                rows: self.parse_values_rows()?,
+                alias: None,
+                columns: None,
+            },
+            joins: vec![],
+            filter: None,
+            group_by: vec![],
+            having: None,
+            compounds: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        })
     }
 
     fn parse_with_statement(&mut self) -> Result<Statement> {
@@ -1778,7 +2749,7 @@ impl Parser {
 
         select.order_by = if self.matches(&TokenKind::Order) {
             self.expect_keyword(TokenKind::By)?;
-            self.parse_order_by_items()?
+            self.parse_order_by_items(true)?
         } else {
             Vec::new()
         };
@@ -1808,7 +2779,7 @@ impl Parser {
             self.matches(&TokenKind::All);
             false
         };
-        let columns = self.parse_select_list()?;
+        let mut columns = self.parse_select_list()?;
         let from = if self.matches(&TokenKind::From) {
             self.parse_from_item()?
         } else {
@@ -1823,6 +2794,7 @@ impl Parser {
             }
             FromItem::Table {
                 name: SINGLE_ROW_SOURCE_TABLE.to_string(),
+                schema: None,
                 alias: None,
             }
         };
@@ -1843,6 +2815,8 @@ impl Parser {
         } else {
             None
         };
+        let named_windows = self.parse_optional_named_windows()?;
+        columns = self.resolve_named_window_select_items(columns, &named_windows)?;
         Ok(SelectStatement {
             with,
             distinct,
@@ -1857,6 +2831,217 @@ impl Parser {
             limit: None,
             offset: None,
         })
+    }
+
+    fn parse_optional_named_windows(&mut self) -> Result<Vec<NamedWindowSpec>> {
+        if !self.parse_optional_identifier_keyword_if("WINDOW") {
+            return Ok(Vec::new());
+        }
+        let mut windows = Vec::new();
+        loop {
+            let name = self.parse_simple_identifier()?;
+            self.expect_keyword(TokenKind::As)?;
+            self.expect_symbol(TokenKind::LParen)?;
+            let (base_name, partition_by, order_by, frame, exclude) =
+                self.parse_window_definition_body()?;
+            self.expect_symbol(TokenKind::RParen)?;
+            windows.push(NamedWindowSpec {
+                name,
+                base_name,
+                partition_by,
+                order_by,
+                frame,
+                exclude,
+            });
+            if !self.matches(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(windows)
+    }
+
+    fn resolve_named_window_select_items(
+        &self,
+        items: Vec<SelectItem>,
+        windows: &[NamedWindowSpec],
+    ) -> Result<Vec<SelectItem>> {
+        items
+            .into_iter()
+            .map(|item| self.resolve_named_window_select_item(item, windows))
+            .collect()
+    }
+
+    fn resolve_named_window_select_item(
+        &self,
+        item: SelectItem,
+        windows: &[NamedWindowSpec],
+    ) -> Result<SelectItem> {
+        match item {
+            SelectItem::Expr { expr, alias } => Ok(SelectItem::Expr {
+                expr: self.resolve_named_window_scalar_expr(expr, windows)?,
+                alias,
+            }),
+            item => Ok(item),
+        }
+    }
+
+    fn resolve_named_window_scalar_expr(
+        &self,
+        expr: ScalarExpr,
+        windows: &[NamedWindowSpec],
+    ) -> Result<ScalarExpr> {
+        match expr {
+            ScalarExpr::WindowFunction {
+                func,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                exclude,
+                window_name: Some(name),
+                filter,
+            } => {
+                let (base_partition_by, base_order_by, base_frame, base_exclude) =
+                    self.resolve_named_window_spec(&name, windows)?;
+                if !partition_by.is_empty() {
+                    return Err(DbError::sql(
+                        "named window reference cannot override PARTITION BY",
+                    ));
+                }
+                if !base_order_by.is_empty() && !order_by.is_empty() {
+                    return Err(DbError::sql(format!(
+                        "cannot override ORDER BY clause of window: {name}"
+                    )));
+                }
+                if base_frame != WindowFrame::Default && frame != WindowFrame::Default {
+                    return Err(DbError::sql(format!(
+                        "cannot override frame specification of window: {name}"
+                    )));
+                }
+                if base_exclude != WindowExclude::NoOthers && exclude != WindowExclude::NoOthers {
+                    return Err(DbError::sql(format!(
+                        "cannot override frame specification of window: {name}"
+                    )));
+                }
+                Ok(ScalarExpr::WindowFunction {
+                    func,
+                    args,
+                    partition_by: base_partition_by,
+                    order_by: if order_by.is_empty() {
+                        base_order_by
+                    } else {
+                        order_by
+                    },
+                    frame: if frame == WindowFrame::Default {
+                        base_frame
+                    } else {
+                        frame
+                    },
+                    exclude: if exclude == WindowExclude::NoOthers {
+                        base_exclude
+                    } else {
+                        exclude
+                    },
+                    window_name: None,
+                    filter,
+                })
+            }
+            ScalarExpr::WindowFunction {
+                func,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                exclude,
+                window_name: None,
+                filter,
+            } => Ok(ScalarExpr::WindowFunction {
+                func,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                exclude,
+                window_name: None,
+                filter,
+            }),
+            expr => Ok(expr),
+        }
+    }
+
+    fn resolve_named_window_spec(
+        &self,
+        name: &str,
+        windows: &[NamedWindowSpec],
+    ) -> Result<(Vec<ScalarExpr>, Vec<OrderBy>, WindowFrame, WindowExclude)> {
+        let Some(window) = windows
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(name))
+        else {
+            return Err(DbError::sql(format!("unknown window name {name}")));
+        };
+        let (base_partition_by, base_order_by, base_frame, base_exclude) =
+            if let Some(base_name) = window.base_name.as_deref() {
+                self.resolve_named_window_spec(base_name, windows)?
+            } else {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    WindowFrame::Default,
+                    WindowExclude::NoOthers,
+                )
+            };
+        if window.base_name.is_some() && !window.partition_by.is_empty() {
+            return Err(DbError::sql(
+                "named window reference cannot override PARTITION BY",
+            ));
+        }
+        if window.base_name.is_some() && !base_order_by.is_empty() && !window.order_by.is_empty() {
+            return Err(DbError::sql(format!(
+                "cannot override ORDER BY clause of window: {}",
+                window.base_name.as_deref().unwrap_or_default()
+            )));
+        }
+        if window.base_name.is_some()
+            && base_frame != WindowFrame::Default
+            && window.frame != WindowFrame::Default
+        {
+            return Err(DbError::sql(format!(
+                "cannot override frame specification of window: {}",
+                window.base_name.as_deref().unwrap_or_default()
+            )));
+        }
+        if window.base_name.is_some()
+            && base_exclude != WindowExclude::NoOthers
+            && window.exclude != WindowExclude::NoOthers
+        {
+            return Err(DbError::sql(format!(
+                "cannot override frame specification of window: {}",
+                window.base_name.as_deref().unwrap_or_default()
+            )));
+        }
+        Ok((
+            if window.partition_by.is_empty() {
+                base_partition_by
+            } else {
+                window.partition_by.clone()
+            },
+            if window.order_by.is_empty() {
+                base_order_by
+            } else {
+                window.order_by.clone()
+            },
+            if window.frame == WindowFrame::Default {
+                base_frame
+            } else {
+                window.frame
+            },
+            if window.exclude == WindowExclude::NoOthers {
+                base_exclude
+            } else {
+                window.exclude
+            },
+        ))
     }
 
     fn parse_from_item(&mut self) -> Result<FromItem> {
@@ -1881,14 +3066,46 @@ impl Parser {
             });
         }
 
-        let name = self.parse_simple_identifier()?;
+        let (name, schema) = self.parse_schema_qualified_name_with_schema()?;
+        if is_pragma_table_function_name(&name)
+            && (matches!(self.peek_kind(), TokenKind::LParen)
+                || pragma_table_function_allows_no_argument(&name))
+        {
+            let argument = if self.matches(&TokenKind::LParen) {
+                let argument = if matches!(self.peek_kind(), TokenKind::RParen) {
+                    None
+                } else {
+                    Some(self.parse_pragma_name_argument()?)
+                };
+                self.expect_symbol(TokenKind::RParen)?;
+                argument
+            } else {
+                None
+            };
+            return Ok(FromItem::PragmaTableFunction {
+                name,
+                argument,
+                alias: self.parse_optional_table_alias()?,
+            });
+        }
         let alias = self.parse_optional_table_alias()?;
         match self.parse_optional_table_index_hint()? {
-            Some(ParsedTableIndexHint::IndexedBy(index)) => {
-                Ok(FromItem::TableIndexed { name, alias, index })
-            }
-            Some(ParsedTableIndexHint::NotIndexed) => Ok(FromItem::TableNotIndexed { name, alias }),
-            None => Ok(FromItem::Table { name, alias }),
+            Some(ParsedTableIndexHint::IndexedBy(index)) => Ok(FromItem::TableIndexed {
+                name,
+                schema,
+                alias,
+                index,
+            }),
+            Some(ParsedTableIndexHint::NotIndexed) => Ok(FromItem::TableNotIndexed {
+                name,
+                schema,
+                alias,
+            }),
+            None => Ok(FromItem::Table {
+                name,
+                schema,
+                alias,
+            }),
         }
     }
 
@@ -2176,21 +3393,40 @@ impl Parser {
     fn parse_scalar_pattern_suffix(&mut self, expr: ScalarExpr) -> Result<ScalarExpr> {
         if self.matches(&TokenKind::Not) {
             if self.matches(&TokenKind::Like) {
-                let pattern = self.parse_string_literal()?;
+                let pattern = self.parse_scalar_expr()?;
                 let escape = self.parse_optional_escape_clause()?;
                 return Ok(ScalarExpr::Like {
                     expr: Box::new(expr),
-                    pattern,
+                    pattern: Box::new(pattern),
                     escape,
                     negated: true,
                 });
             }
             if self.matches(&TokenKind::Glob) {
+                let pattern = self.parse_scalar_expr()?;
                 return Ok(ScalarExpr::Glob {
                     expr: Box::new(expr),
-                    pattern: self.parse_string_literal()?,
+                    pattern: Box::new(pattern),
                     negated: true,
                 });
+            }
+            if self.matches(&TokenKind::Regexp) {
+                let pattern = self.parse_scalar_expr()?;
+                return Ok(sqlite_binary_pattern_function(
+                    ScalarFunc::RegexpFunc,
+                    pattern,
+                    expr,
+                    true,
+                ));
+            }
+            if self.matches(&TokenKind::Match) {
+                let pattern = self.parse_scalar_expr()?;
+                return Ok(sqlite_binary_pattern_function(
+                    ScalarFunc::MatchFunc,
+                    pattern,
+                    expr,
+                    true,
+                ));
             }
             if self.matches(&TokenKind::Between) {
                 let low = self.parse_concat_expr()?;
@@ -2206,21 +3442,40 @@ impl Parser {
             self.index = self.index.saturating_sub(1);
         }
         if self.matches(&TokenKind::Like) {
-            let pattern = self.parse_string_literal()?;
+            let pattern = self.parse_scalar_expr()?;
             let escape = self.parse_optional_escape_clause()?;
             return Ok(ScalarExpr::Like {
                 expr: Box::new(expr),
-                pattern,
+                pattern: Box::new(pattern),
                 escape,
                 negated: false,
             });
         }
         if self.matches(&TokenKind::Glob) {
+            let pattern = self.parse_scalar_expr()?;
             return Ok(ScalarExpr::Glob {
                 expr: Box::new(expr),
-                pattern: self.parse_string_literal()?,
+                pattern: Box::new(pattern),
                 negated: false,
             });
+        }
+        if self.matches(&TokenKind::Regexp) {
+            let pattern = self.parse_scalar_expr()?;
+            return Ok(sqlite_binary_pattern_function(
+                ScalarFunc::RegexpFunc,
+                pattern,
+                expr,
+                false,
+            ));
+        }
+        if self.matches(&TokenKind::Match) {
+            let pattern = self.parse_scalar_expr()?;
+            return Ok(sqlite_binary_pattern_function(
+                ScalarFunc::MatchFunc,
+                pattern,
+                expr,
+                false,
+            ));
         }
         if self.matches(&TokenKind::Between) {
             let low = self.parse_concat_expr()?;
@@ -2236,11 +3491,11 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_optional_escape_clause(&mut self) -> Result<Option<String>> {
+    fn parse_optional_escape_clause(&mut self) -> Result<Option<Box<ScalarExpr>>> {
         if !self.matches(&TokenKind::Escape) {
             return Ok(None);
         }
-        Ok(Some(self.parse_string_literal()?))
+        Ok(Some(Box::new(self.parse_scalar_expr()?)))
     }
 
     fn parse_scalar_compare_suffix(&mut self, expr: ScalarExpr) -> Result<ScalarExpr> {
@@ -2376,15 +3631,24 @@ impl Parser {
             if !is_scalar_expr_start(self.peek_kind()) {
                 return Err(self.error_expected("numeric literal after +"));
             }
-            return self.parse_unary_scalar_expr();
+            return Ok(ScalarExpr::UnaryPlus(Box::new(
+                self.parse_unary_scalar_expr()?,
+            )));
         }
         if self.matches(&TokenKind::Minus) {
             if !is_scalar_expr_start(self.peek_kind()) {
                 return Err(self.error_expected("numeric literal after -"));
             }
-            return Ok(ScalarExpr::UnaryMinus(Box::new(
-                self.parse_unary_scalar_expr()?,
-            )));
+            let expr = self.parse_unary_scalar_expr()?;
+            return Ok(match expr {
+                ScalarExpr::Literal(Value::Integer(value)) if value == i64::MIN => {
+                    return Err(DbError::sql("integer overflow"));
+                }
+                ScalarExpr::Literal(Value::Real(value)) if value == 9_223_372_036_854_776_000.0 => {
+                    ScalarExpr::Literal(Value::Integer(i64::MIN))
+                }
+                expr => ScalarExpr::UnaryMinus(Box::new(expr)),
+            });
         }
         if self.matches(&TokenKind::Tilde) {
             if !is_scalar_expr_start(self.peek_kind()) {
@@ -2543,11 +3807,30 @@ impl Parser {
         lparen_index: usize,
     ) -> Result<ScalarExpr> {
         let function_name_upper = function_name.to_ascii_uppercase();
+        if let Some(window_func) = match function_name_upper.as_str() {
+            "ROW_NUMBER" => Some(WindowFunc::RowNumber),
+            "RANK" => Some(WindowFunc::Rank),
+            "DENSE_RANK" => Some(WindowFunc::DenseRank),
+            "LAG" => Some(WindowFunc::Lag),
+            "LEAD" => Some(WindowFunc::Lead),
+            "NTILE" => Some(WindowFunc::Ntile),
+            "PERCENT_RANK" => Some(WindowFunc::PercentRank),
+            "CUME_DIST" => Some(WindowFunc::CumeDist),
+            "FIRST_VALUE" => Some(WindowFunc::FirstValue),
+            "LAST_VALUE" => Some(WindowFunc::LastValue),
+            "NTH_VALUE" => Some(WindowFunc::NthValue),
+            _ => None,
+        } {
+            return self.parse_ranking_window_function(window_func);
+        }
         let looks_like_scalar_min_max = matches!(function_name_upper.as_str(), "MIN" | "MAX")
             && self.function_call_has_multiple_arguments(lparen_index)?;
         if is_aggregate_function_name(&function_name_upper) && !looks_like_scalar_min_max {
             let (func, arg, filter) =
                 self.parse_aggregate_call_after_lparen(&function_name_upper)?;
+            if self.parse_optional_identifier_keyword_if("OVER") {
+                return self.parse_aggregate_window_function(func, arg, filter);
+            }
             return Ok(ScalarExpr::Aggregate {
                 func,
                 arg: Box::new(arg),
@@ -2580,6 +3863,7 @@ impl Parser {
             "SQLITE_SOURCE_ID" => ScalarFunc::SqliteSourceId,
             "SQLITE_COMPILEOPTION_USED" => ScalarFunc::SqliteCompileOptionUsed,
             "SQLITE_COMPILEOPTION_GET" => ScalarFunc::SqliteCompileOptionGet,
+            "SQLITE_LOG" => ScalarFunc::SqliteLog,
             "SIGN" => ScalarFunc::Sign,
             "RANDOMBLOB" => ScalarFunc::RandomBlob,
             "RANDOM" => ScalarFunc::Random,
@@ -2623,6 +3907,8 @@ impl Parser {
             "REPLACE" => ScalarFunc::Replace,
             "LIKE" => ScalarFunc::LikeFunc,
             "GLOB" => ScalarFunc::GlobFunc,
+            "REGEXP" => ScalarFunc::RegexpFunc,
+            "MATCH" => ScalarFunc::MatchFunc,
             "QUOTE" => ScalarFunc::Quote,
             "UNICODE" => ScalarFunc::Unicode,
             "CHAR" => ScalarFunc::Char,
@@ -2637,21 +3923,31 @@ impl Parser {
             "COALESCE" => ScalarFunc::Coalesce,
             "IFNULL" => ScalarFunc::IfNull,
             "NULLIF" => ScalarFunc::NullIf,
+            "UNKNOWN" => ScalarFunc::Unknown,
             "JSON" => ScalarFunc::Json,
+            "JSONB" => ScalarFunc::Jsonb,
             "JSON_VALID" => ScalarFunc::JsonValid,
             "JSON_ERROR_POSITION" => ScalarFunc::JsonErrorPosition,
             "JSON_PRETTY" => ScalarFunc::JsonPretty,
             "JSON_QUOTE" => ScalarFunc::JsonQuote,
             "JSON_EXTRACT" => ScalarFunc::JsonExtract,
+            "JSONB_EXTRACT" => ScalarFunc::JsonbExtract,
             "JSON_TYPE" => ScalarFunc::JsonType,
             "JSON_ARRAY" => ScalarFunc::JsonArray,
+            "JSONB_ARRAY" => ScalarFunc::JsonbArray,
             "JSON_OBJECT" => ScalarFunc::JsonObject,
+            "JSONB_OBJECT" => ScalarFunc::JsonbObject,
             "JSON_ARRAY_LENGTH" => ScalarFunc::JsonArrayLength,
             "JSON_REMOVE" => ScalarFunc::JsonRemove,
+            "JSONB_REMOVE" => ScalarFunc::JsonbRemove,
             "JSON_SET" => ScalarFunc::JsonSet,
+            "JSONB_SET" => ScalarFunc::JsonbSet,
             "JSON_INSERT" => ScalarFunc::JsonInsert,
+            "JSONB_INSERT" => ScalarFunc::JsonbInsert,
             "JSON_REPLACE" => ScalarFunc::JsonReplace,
+            "JSONB_REPLACE" => ScalarFunc::JsonbReplace,
             "JSON_PATCH" => ScalarFunc::JsonPatch,
+            "JSONB_PATCH" => ScalarFunc::JsonbPatch,
             "LAST_INSERT_ROWID" => ScalarFunc::LastInsertRowId,
             _ => {
                 return Err(DbError::sql(format!(
@@ -2660,6 +3956,29 @@ impl Parser {
             }
         };
 
+        let mut args = Vec::new();
+        if !self.matches(&TokenKind::RParen) {
+            if matches!(func, ScalarFunc::MinScalar | ScalarFunc::MaxScalar) {
+                self.matches(&TokenKind::Distinct);
+            }
+            loop {
+                args.push(self.parse_scalar_expr()?);
+                if self.matches(&TokenKind::Comma) {
+                    continue;
+                }
+                self.expect_symbol(TokenKind::RParen)?;
+                break;
+            }
+        }
+
+        if matches!(func, ScalarFunc::Likelihood) {
+            validate_likelihood_probability_arg(&args)?;
+        }
+
+        Ok(ScalarExpr::Function { func, args })
+    }
+
+    fn parse_ranking_window_function(&mut self, func: WindowFunc) -> Result<ScalarExpr> {
         let mut args = Vec::new();
         if !self.matches(&TokenKind::RParen) {
             loop {
@@ -2671,8 +3990,517 @@ impl Parser {
                 break;
             }
         }
+        match func {
+            WindowFunc::RowNumber
+            | WindowFunc::Rank
+            | WindowFunc::DenseRank
+            | WindowFunc::PercentRank
+            | WindowFunc::CumeDist => {
+                if !args.is_empty() {
+                    return Err(DbError::sql("ranking window function expects no arguments"));
+                }
+            }
+            WindowFunc::Lag | WindowFunc::Lead => {
+                if !(1..=3).contains(&args.len()) {
+                    return Err(DbError::sql("LAG/LEAD expects 1 to 3 arguments"));
+                }
+            }
+            WindowFunc::Ntile => {
+                if args.len() != 1 {
+                    return Err(DbError::sql("NTILE expects exactly 1 argument"));
+                }
+            }
+            WindowFunc::FirstValue | WindowFunc::LastValue => {
+                if args.len() != 1 {
+                    return Err(DbError::sql(
+                        "FIRST_VALUE/LAST_VALUE expects exactly 1 argument",
+                    ));
+                }
+            }
+            WindowFunc::NthValue => {
+                if args.len() != 2 {
+                    return Err(DbError::sql("NTH_VALUE expects exactly 2 arguments"));
+                }
+            }
+            WindowFunc::Count
+            | WindowFunc::Sum
+            | WindowFunc::Avg
+            | WindowFunc::Total
+            | WindowFunc::Min
+            | WindowFunc::Max
+            | WindowFunc::GroupConcat
+            | WindowFunc::JsonGroupArray
+            | WindowFunc::JsonGroupObject => {}
+        }
+        if !self.parse_optional_identifier_keyword_if("OVER") {
+            return Err(DbError::sql(
+                "window ranking function requires an OVER clause",
+            ));
+        }
+        self.parse_window_function_over_clause(func, args, None)
+    }
 
-        Ok(ScalarExpr::Function { func, args })
+    fn parse_window_function_over_clause(
+        &mut self,
+        func: WindowFunc,
+        args: Vec<ScalarExpr>,
+        filter: Option<Box<Expr>>,
+    ) -> Result<ScalarExpr> {
+        if !matches!(self.peek_kind(), TokenKind::LParen) {
+            let window_name = self.parse_simple_identifier()?;
+            return Ok(ScalarExpr::WindowFunction {
+                func,
+                args,
+                partition_by: Vec::new(),
+                order_by: Vec::new(),
+                frame: WindowFrame::Default,
+                exclude: WindowExclude::NoOthers,
+                window_name: Some(window_name),
+                filter,
+            });
+        }
+        self.expect_symbol(TokenKind::LParen)?;
+        let (base_name, partition_by, order_by, frame, exclude) =
+            self.parse_window_definition_body()?;
+        self.expect_symbol(TokenKind::RParen)?;
+        Ok(ScalarExpr::WindowFunction {
+            func,
+            args,
+            partition_by,
+            order_by,
+            frame,
+            exclude,
+            window_name: base_name,
+            filter,
+        })
+    }
+
+    fn parse_window_definition_body(
+        &mut self,
+    ) -> Result<(
+        Option<String>,
+        Vec<ScalarExpr>,
+        Vec<OrderBy>,
+        WindowFrame,
+        WindowExclude,
+    )> {
+        let base_name = if let TokenKind::Identifier(name) = self.peek_kind()
+            && !name.eq_ignore_ascii_case("PARTITION")
+            && !name.eq_ignore_ascii_case("ORDER")
+            && !name.eq_ignore_ascii_case("ROWS")
+            && !name.eq_ignore_ascii_case("RANGE")
+            && !name.eq_ignore_ascii_case("GROUPS")
+        {
+            Some(self.parse_simple_identifier()?)
+        } else {
+            None
+        };
+        let mut partition_by = Vec::new();
+        if self.parse_optional_identifier_keyword_if("PARTITION") {
+            self.expect_keyword(TokenKind::By)?;
+            loop {
+                partition_by.push(self.parse_scalar_expr()?);
+                if !self.matches(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let order_by = if self.matches(&TokenKind::Order) {
+            self.expect_keyword(TokenKind::By)?;
+            self.parse_order_by_items(false)?
+        } else {
+            Vec::new()
+        };
+        let frame = self.parse_optional_window_frame()?;
+        let exclude = self.parse_optional_window_exclude()?;
+        Ok((base_name, partition_by, order_by, frame, exclude))
+    }
+
+    fn parse_optional_window_exclude(&mut self) -> Result<WindowExclude> {
+        if !self.parse_optional_identifier_keyword_if("EXCLUDE") {
+            return Ok(WindowExclude::NoOthers);
+        }
+        if self.parse_optional_identifier_keyword_if("CURRENT") {
+            self.expect_identifier_keyword("ROW")?;
+            return Ok(WindowExclude::CurrentRow);
+        }
+        if self.matches(&TokenKind::Group) || self.parse_optional_identifier_keyword_if("GROUP") {
+            return Ok(WindowExclude::Group);
+        }
+        if self.parse_optional_identifier_keyword_if("TIES") {
+            return Ok(WindowExclude::Ties);
+        }
+        self.expect_identifier_keyword("NO")?;
+        self.expect_identifier_keyword("OTHERS")?;
+        Ok(WindowExclude::NoOthers)
+    }
+
+    fn parse_optional_window_frame(&mut self) -> Result<WindowFrame> {
+        if self.parse_optional_identifier_keyword_if("RANGE") {
+            if !self.matches(&TokenKind::Between) {
+                if self.parse_optional_identifier_keyword_if("CURRENT") {
+                    self.expect_identifier_keyword("ROW")?;
+                    return Ok(WindowFrame::GroupsCurrentRow);
+                }
+                if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                    self.expect_identifier_keyword("PRECEDING")?;
+                    return Ok(WindowFrame::Default);
+                }
+                let preceding =
+                    self.parse_window_range_offset("CURRENT, UNBOUNDED, or non-negative number")?;
+                self.expect_identifier_keyword("PRECEDING")?;
+                return Ok(WindowFrame::RangePrecedingToCurrentRow(preceding));
+            }
+
+            let start = if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                (None, -1_i8)
+            } else if self.parse_optional_identifier_keyword_if("CURRENT") {
+                self.expect_identifier_keyword("ROW")?;
+                (None, 0_i8)
+            } else {
+                let value =
+                    self.parse_window_range_offset("UNBOUNDED, CURRENT, or non-negative number")?;
+                if self.parse_optional_identifier_keyword_if("PRECEDING") {
+                    (Some(value), -1_i8)
+                } else {
+                    self.expect_identifier_keyword("FOLLOWING")?;
+                    (Some(value), 1_i8)
+                }
+            };
+            if start.0.is_none() && start.1 == -1 {
+                self.expect_identifier_keyword("PRECEDING")?;
+            }
+            self.expect_keyword(TokenKind::And)?;
+            if self.parse_optional_identifier_keyword_if("CURRENT") {
+                self.expect_identifier_keyword("ROW")?;
+                return Ok(match start {
+                    (None, -1) => WindowFrame::Default,
+                    (None, 0) => WindowFrame::GroupsCurrentRow,
+                    (Some(value), -1) => WindowFrame::RangePrecedingToCurrentRow(value),
+                    _ => {
+                        return Err(DbError::sql(
+                            "numeric RANGE frame form is not supported yet",
+                        ));
+                    }
+                });
+            }
+            if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                self.expect_identifier_keyword("FOLLOWING")?;
+                return Ok(match start {
+                    (None, -1) => WindowFrame::GroupsUnboundedPrecedingAndFollowing,
+                    (None, 0) => WindowFrame::GroupsCurrentRowToUnboundedFollowing,
+                    (Some(value), -1) => WindowFrame::RangePrecedingToUnboundedFollowing(value),
+                    (Some(value), 1) => WindowFrame::RangeFollowingToUnboundedFollowing(value),
+                    _ => {
+                        return Err(DbError::sql(
+                            "numeric RANGE start cannot end at UNBOUNDED FOLLOWING yet",
+                        ));
+                    }
+                });
+            }
+            let end_value =
+                self.parse_window_range_offset("UNBOUNDED, CURRENT, or non-negative number")?;
+            let end_is_preceding = if self.parse_optional_identifier_keyword_if("PRECEDING") {
+                true
+            } else {
+                self.expect_identifier_keyword("FOLLOWING")?;
+                false
+            };
+            return Ok(if end_is_preceding {
+                match start {
+                    (None, -1) => WindowFrame::RangeUnboundedPrecedingToPreceding(end_value),
+                    (Some(start), -1) => WindowFrame::RangePrecedingToPreceding {
+                        start,
+                        end: end_value,
+                    },
+                    _ => {
+                        return Err(DbError::sql(
+                            "numeric RANGE frame form is not supported yet",
+                        ));
+                    }
+                }
+            } else {
+                match start {
+                    (None, -1) => WindowFrame::RangeUnboundedPrecedingToFollowing(end_value),
+                    (None, 0) => WindowFrame::RangeCurrentRowToFollowing(end_value),
+                    (Some(preceding), -1) => WindowFrame::RangePrecedingToFollowing {
+                        preceding,
+                        following: end_value,
+                    },
+                    (Some(start), 1) => WindowFrame::RangeFollowingToFollowing {
+                        start,
+                        end: end_value,
+                    },
+                    _ => {
+                        return Err(DbError::sql(
+                            "numeric RANGE frame form is not supported yet",
+                        ));
+                    }
+                }
+            });
+        }
+        if self.parse_optional_identifier_keyword_if("GROUPS") {
+            if !self.matches(&TokenKind::Between) {
+                if self.parse_optional_identifier_keyword_if("CURRENT") {
+                    self.expect_identifier_keyword("ROW")?;
+                    return Ok(WindowFrame::GroupsCurrentRow);
+                }
+                if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                    self.expect_identifier_keyword("PRECEDING")?;
+                    return Ok(WindowFrame::GroupsUnboundedPrecedingToCurrentRow);
+                }
+                let preceding =
+                    self.parse_window_frame_offset("CURRENT, UNBOUNDED, or non-negative integer")?;
+                self.expect_identifier_keyword("PRECEDING")?;
+                return Ok(WindowFrame::GroupsPrecedingToCurrentRow(preceding));
+            }
+            if self.parse_optional_identifier_keyword_if("CURRENT") {
+                self.expect_identifier_keyword("ROW")?;
+                self.expect_keyword(TokenKind::And)?;
+                if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                    self.expect_identifier_keyword("FOLLOWING")?;
+                    return Ok(WindowFrame::GroupsCurrentRowToUnboundedFollowing);
+                }
+                if self.parse_optional_identifier_keyword_if("CURRENT") {
+                    self.expect_identifier_keyword("ROW")?;
+                    return Ok(WindowFrame::GroupsCurrentRow);
+                }
+                let following = self.parse_window_frame_offset("non-negative integer")?;
+                self.expect_identifier_keyword("FOLLOWING")?;
+                return Ok(WindowFrame::GroupsCurrentRowToFollowing(following));
+            }
+            let start = if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                None
+            } else {
+                Some(self.parse_window_frame_offset("UNBOUNDED or non-negative integer")?)
+            };
+            let start_is_following = if start.is_some() {
+                if self.parse_optional_identifier_keyword_if("PRECEDING") {
+                    false
+                } else {
+                    self.expect_identifier_keyword("FOLLOWING")?;
+                    true
+                }
+            } else {
+                self.expect_identifier_keyword("PRECEDING")?;
+                false
+            };
+            self.expect_keyword(TokenKind::And)?;
+            if self.parse_optional_identifier_keyword_if("CURRENT") {
+                self.expect_identifier_keyword("ROW")?;
+                if start_is_following {
+                    return Err(DbError::sql(
+                        "FOLLOWING frame start cannot end at CURRENT ROW",
+                    ));
+                }
+                return Ok(match start {
+                    Some(value) => WindowFrame::GroupsPrecedingToCurrentRow(value),
+                    None => WindowFrame::GroupsUnboundedPrecedingToCurrentRow,
+                });
+            }
+            if let Some(start_value) = start {
+                if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                    self.expect_identifier_keyword("FOLLOWING")?;
+                    return Ok(if start_is_following {
+                        WindowFrame::GroupsFollowingToUnboundedFollowing(start_value)
+                    } else {
+                        WindowFrame::GroupsPrecedingToUnboundedFollowing(start_value)
+                    });
+                }
+                let end_value = self.parse_window_frame_offset("non-negative integer")?;
+                let end_is_preceding = if self.parse_optional_identifier_keyword_if("PRECEDING") {
+                    true
+                } else {
+                    self.expect_identifier_keyword("FOLLOWING")?;
+                    false
+                };
+                return Ok(if start_is_following {
+                    if end_is_preceding {
+                        return Err(DbError::sql(
+                            "FOLLOWING frame start cannot end at PRECEDING",
+                        ));
+                    }
+                    WindowFrame::GroupsFollowingToFollowing {
+                        start: start_value,
+                        end: end_value,
+                    }
+                } else if end_is_preceding {
+                    WindowFrame::GroupsPrecedingToPreceding {
+                        start: start_value,
+                        end: end_value,
+                    }
+                } else {
+                    WindowFrame::GroupsPrecedingToFollowing {
+                        preceding: start_value,
+                        following: end_value,
+                    }
+                });
+            }
+            self.expect_identifier_keyword("UNBOUNDED")?;
+            self.expect_identifier_keyword("FOLLOWING")?;
+            return Ok(WindowFrame::GroupsUnboundedPrecedingAndFollowing);
+        }
+        if !self.parse_optional_identifier_keyword_if("ROWS") {
+            return Ok(WindowFrame::Default);
+        }
+        if !self.matches(&TokenKind::Between) {
+            if self.parse_optional_identifier_keyword_if("CURRENT") {
+                self.expect_identifier_keyword("ROW")?;
+                return Ok(WindowFrame::RowsCurrentRow);
+            }
+            if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                self.expect_identifier_keyword("PRECEDING")?;
+                return Ok(WindowFrame::RowsUnboundedPrecedingToCurrentRow);
+            }
+            let preceding =
+                self.parse_window_frame_offset("CURRENT, UNBOUNDED, or non-negative integer")?;
+            self.expect_identifier_keyword("PRECEDING")?;
+            return Ok(WindowFrame::RowsPrecedingToCurrentRow(preceding));
+        }
+        if self.parse_optional_identifier_keyword_if("CURRENT") {
+            self.expect_identifier_keyword("ROW")?;
+            self.expect_keyword(TokenKind::And)?;
+            if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                self.expect_identifier_keyword("FOLLOWING")?;
+                return Ok(WindowFrame::RowsCurrentRowToUnboundedFollowing);
+            }
+            if self.parse_optional_identifier_keyword_if("CURRENT") {
+                self.expect_identifier_keyword("ROW")?;
+                return Ok(WindowFrame::RowsCurrentRow);
+            }
+            let following = self.parse_window_frame_offset("non-negative integer")?;
+            self.expect_identifier_keyword("FOLLOWING")?;
+            return Ok(WindowFrame::RowsCurrentRowToFollowing(following));
+        }
+        let start = if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+            None
+        } else {
+            Some(self.parse_window_frame_offset("UNBOUNDED or non-negative integer")?)
+        };
+        let start_is_following = if start.is_some() {
+            if self.parse_optional_identifier_keyword_if("PRECEDING") {
+                false
+            } else {
+                self.expect_identifier_keyword("FOLLOWING")?;
+                true
+            }
+        } else {
+            self.expect_identifier_keyword("PRECEDING")?;
+            false
+        };
+        self.expect_keyword(TokenKind::And)?;
+        if self.parse_optional_identifier_keyword_if("CURRENT") {
+            self.expect_identifier_keyword("ROW")?;
+            if start_is_following {
+                return Err(DbError::sql(
+                    "FOLLOWING frame start cannot end at CURRENT ROW",
+                ));
+            }
+            return Ok(match start {
+                Some(value) => WindowFrame::RowsPrecedingToCurrentRow(value),
+                None => WindowFrame::RowsUnboundedPrecedingToCurrentRow,
+            });
+        }
+        if let Some(start_value) = start {
+            if self.parse_optional_identifier_keyword_if("UNBOUNDED") {
+                self.expect_identifier_keyword("FOLLOWING")?;
+                return Ok(if start_is_following {
+                    WindowFrame::RowsFollowingToUnboundedFollowing(start_value)
+                } else {
+                    WindowFrame::RowsPrecedingToUnboundedFollowing(start_value)
+                });
+            }
+            let end_value = self.parse_window_frame_offset("non-negative integer")?;
+            let end_is_preceding = if self.parse_optional_identifier_keyword_if("PRECEDING") {
+                true
+            } else {
+                self.expect_identifier_keyword("FOLLOWING")?;
+                false
+            };
+            return Ok(if start_is_following {
+                if end_is_preceding {
+                    return Err(DbError::sql(
+                        "FOLLOWING frame start cannot end at PRECEDING",
+                    ));
+                }
+                WindowFrame::RowsFollowingToFollowing {
+                    start: start_value,
+                    end: end_value,
+                }
+            } else if end_is_preceding {
+                WindowFrame::RowsPrecedingToPreceding {
+                    start: start_value,
+                    end: end_value,
+                }
+            } else {
+                WindowFrame::RowsPrecedingToFollowing {
+                    preceding: start_value,
+                    following: end_value,
+                }
+            });
+        }
+        self.expect_identifier_keyword("UNBOUNDED")?;
+        self.expect_identifier_keyword("FOLLOWING")?;
+        Ok(WindowFrame::RowsUnboundedPrecedingAndFollowing)
+    }
+
+    fn parse_window_frame_offset(&mut self, expected: &str) -> Result<usize> {
+        let _ = self.matches(&TokenKind::Plus);
+        match self.peek_kind() {
+            TokenKind::Integer(value) if *value >= 0 => {
+                let value = usize::try_from(*value)
+                    .map_err(|_| DbError::sql("window frame offset is too large"))?;
+                self.advance();
+                Ok(value)
+            }
+            _ => {
+                let expr = self.parse_scalar_expr()?;
+                let Some(value) = constant_limit_value(&expr) else {
+                    return Err(DbError::sql(format!(
+                        "window frame offset must be a constant {expected}"
+                    )));
+                };
+                if value < 0.0 || value.fract() != 0.0 {
+                    return Err(DbError::sql(format!(
+                        "window frame offset must be a non-negative integer, got {value}"
+                    )));
+                }
+                if value > usize::MAX as f64 {
+                    return Err(DbError::sql("window frame offset is too large"));
+                }
+                Ok(value as usize)
+            }
+        }
+    }
+
+    fn parse_window_range_offset(&mut self, expected: &str) -> Result<WindowRangeOffset> {
+        let _ = self.matches(&TokenKind::Plus);
+        match self.peek_kind() {
+            TokenKind::Integer(value) if *value >= 0 => {
+                let value = *value as f64;
+                self.advance();
+                Ok(WindowRangeOffset::new(value))
+            }
+            TokenKind::Real(value) if *value >= 0.0 => {
+                let value = *value;
+                self.advance();
+                Ok(WindowRangeOffset::new(value))
+            }
+            _ => {
+                let expr = self.parse_scalar_expr()?;
+                let Some(value) = constant_limit_value(&expr) else {
+                    return Err(DbError::sql(format!(
+                        "window RANGE offset must be a constant {expected}"
+                    )));
+                };
+                if value < 0.0 {
+                    return Err(DbError::sql(format!(
+                        "window RANGE offset must be non-negative, got {value}"
+                    )));
+                }
+                Ok(WindowRangeOffset::new(value))
+            }
+        }
     }
 
     fn function_call_has_multiple_arguments(&self, lparen_index: usize) -> Result<bool> {
@@ -2699,6 +4527,12 @@ impl Parser {
         self.expect_symbol(TokenKind::LParen)?;
         let (func, arg, filter) =
             self.parse_aggregate_call_after_lparen(&function_name.to_ascii_uppercase())?;
+        if self.parse_optional_identifier_keyword_if("OVER") {
+            return Ok(SelectItem::Expr {
+                expr: self.parse_aggregate_window_function(func, arg, filter)?,
+                alias: None,
+            });
+        }
         Ok(SelectItem::Aggregate {
             func,
             arg,
@@ -2714,6 +4548,7 @@ impl Parser {
         let func = match function_name_upper {
             "COUNT" => AggregateFunc::Count,
             "SUM" => AggregateFunc::Sum,
+            "DECIMAL_SUM" => AggregateFunc::DecimalSum,
             "AVG" => AggregateFunc::Avg,
             "TOTAL" => AggregateFunc::Total,
             "MEDIAN" => AggregateFunc::Median,
@@ -2722,7 +4557,9 @@ impl Parser {
             "PERCENTILE_DISC" => AggregateFunc::PercentileDisc,
             "GROUP_CONCAT" | "STRING_AGG" => AggregateFunc::GroupConcat,
             "JSON_GROUP_ARRAY" => AggregateFunc::JsonGroupArray,
+            "JSONB_GROUP_ARRAY" => AggregateFunc::JsonbGroupArray,
             "JSON_GROUP_OBJECT" => AggregateFunc::JsonGroupObject,
+            "JSONB_GROUP_OBJECT" => AggregateFunc::JsonbGroupObject,
             "MIN" => AggregateFunc::Min,
             "MAX" => AggregateFunc::Max,
             _ => {
@@ -2755,7 +4592,7 @@ impl Parser {
             };
             let order_by = if self.matches(&TokenKind::Order) {
                 self.expect_keyword(TokenKind::By)?;
-                self.parse_order_by_items()?
+                self.parse_order_by_items(false)?
             } else {
                 Vec::new()
             };
@@ -2776,7 +4613,7 @@ impl Parser {
             let fraction = self.parse_scalar_expr()?;
             let order_by = if self.matches(&TokenKind::Order) {
                 self.expect_keyword(TokenKind::By)?;
-                self.parse_order_by_items()?
+                self.parse_order_by_items(false)?
             } else {
                 Vec::new()
             };
@@ -2785,13 +4622,16 @@ impl Parser {
                 fraction,
                 order_by,
             }
-        } else if matches!(func, AggregateFunc::JsonGroupObject) {
+        } else if matches!(
+            func,
+            AggregateFunc::JsonGroupObject | AggregateFunc::JsonbGroupObject
+        ) {
             let key = self.parse_scalar_expr()?;
             self.expect_symbol(TokenKind::Comma)?;
             let value = self.parse_scalar_expr()?;
             let order_by = if self.matches(&TokenKind::Order) {
                 self.expect_keyword(TokenKind::By)?;
-                self.parse_order_by_items()?
+                self.parse_order_by_items(false)?
             } else {
                 Vec::new()
             };
@@ -2808,7 +4648,7 @@ impl Parser {
             let expr = self.parse_scalar_expr()?;
             let order_by = if self.matches(&TokenKind::Order) {
                 self.expect_keyword(TokenKind::By)?;
-                self.parse_order_by_items()?
+                self.parse_order_by_items(false)?
             } else {
                 Vec::new()
             };
@@ -2835,6 +4675,179 @@ impl Parser {
             None
         };
         Ok((func, arg, filter))
+    }
+
+    fn parse_aggregate_window_function(
+        &mut self,
+        func: AggregateFunc,
+        arg: AggregateArg,
+        filter: Option<Expr>,
+    ) -> Result<ScalarExpr> {
+        if !matches!(
+            func,
+            AggregateFunc::Count
+                | AggregateFunc::Sum
+                | AggregateFunc::Avg
+                | AggregateFunc::Total
+                | AggregateFunc::Min
+                | AggregateFunc::Max
+                | AggregateFunc::GroupConcat
+                | AggregateFunc::JsonGroupArray
+                | AggregateFunc::JsonGroupObject
+        ) {
+            return Err(DbError::sql(
+                "only COUNT, SUM, AVG, TOTAL, MIN, MAX, GROUP_CONCAT, and JSON aggregate window functions are supported",
+            ));
+        }
+        let (window_func, args) = match (func, arg) {
+            (AggregateFunc::Count, AggregateArg::Wildcard) => (WindowFunc::Count, Vec::new()),
+            (
+                AggregateFunc::Count,
+                AggregateArg::Expr {
+                    expr,
+                    distinct,
+                    order_by,
+                },
+            ) => {
+                if distinct || !order_by.is_empty() {
+                    return Err(DbError::sql(
+                        "DISTINCT or ORDER BY aggregate window arguments are not supported yet",
+                    ));
+                }
+                (WindowFunc::Count, vec![expr])
+            }
+            (
+                AggregateFunc::Sum,
+                AggregateArg::Expr {
+                    expr,
+                    distinct,
+                    order_by,
+                },
+            ) => {
+                if distinct || !order_by.is_empty() {
+                    return Err(DbError::sql(
+                        "DISTINCT or ORDER BY aggregate window arguments are not supported yet",
+                    ));
+                }
+                (WindowFunc::Sum, vec![expr])
+            }
+            (
+                AggregateFunc::Avg,
+                AggregateArg::Expr {
+                    expr,
+                    distinct,
+                    order_by,
+                },
+            ) => {
+                if distinct || !order_by.is_empty() {
+                    return Err(DbError::sql(
+                        "DISTINCT or ORDER BY aggregate window arguments are not supported yet",
+                    ));
+                }
+                (WindowFunc::Avg, vec![expr])
+            }
+            (
+                AggregateFunc::Total,
+                AggregateArg::Expr {
+                    expr,
+                    distinct,
+                    order_by,
+                },
+            ) => {
+                if distinct || !order_by.is_empty() {
+                    return Err(DbError::sql(
+                        "DISTINCT or ORDER BY aggregate window arguments are not supported yet",
+                    ));
+                }
+                (WindowFunc::Total, vec![expr])
+            }
+            (
+                AggregateFunc::Min,
+                AggregateArg::Expr {
+                    expr,
+                    distinct,
+                    order_by,
+                },
+            ) => {
+                if distinct || !order_by.is_empty() {
+                    return Err(DbError::sql(
+                        "DISTINCT or ORDER BY aggregate window arguments are not supported yet",
+                    ));
+                }
+                (WindowFunc::Min, vec![expr])
+            }
+            (
+                AggregateFunc::Max,
+                AggregateArg::Expr {
+                    expr,
+                    distinct,
+                    order_by,
+                },
+            ) => {
+                if distinct || !order_by.is_empty() {
+                    return Err(DbError::sql(
+                        "DISTINCT or ORDER BY aggregate window arguments are not supported yet",
+                    ));
+                }
+                (WindowFunc::Max, vec![expr])
+            }
+            (
+                AggregateFunc::GroupConcat,
+                AggregateArg::GroupConcat {
+                    expr,
+                    separator,
+                    distinct,
+                    order_by,
+                },
+            ) => {
+                if distinct || !order_by.is_empty() {
+                    return Err(DbError::sql(
+                        "DISTINCT or ORDER BY aggregate window arguments are not supported yet",
+                    ));
+                }
+                let mut args = vec![expr];
+                if let Some(separator) = separator {
+                    args.push(separator);
+                }
+                (WindowFunc::GroupConcat, args)
+            }
+            (
+                AggregateFunc::JsonGroupArray,
+                AggregateArg::Expr {
+                    expr,
+                    distinct,
+                    order_by,
+                },
+            ) => {
+                if distinct || !order_by.is_empty() {
+                    return Err(DbError::sql(
+                        "DISTINCT or ORDER BY aggregate window arguments are not supported yet",
+                    ));
+                }
+                (WindowFunc::JsonGroupArray, vec![expr])
+            }
+            (
+                AggregateFunc::JsonGroupObject,
+                AggregateArg::JsonGroupObject {
+                    key,
+                    value,
+                    order_by,
+                },
+            ) => {
+                if !order_by.is_empty() {
+                    return Err(DbError::sql(
+                        "ORDER BY aggregate window arguments are not supported yet",
+                    ));
+                }
+                (WindowFunc::JsonGroupObject, vec![key, value])
+            }
+            _ => {
+                return Err(DbError::sql(
+                    "unsupported aggregate window function arguments",
+                ));
+            }
+        };
+        self.parse_window_function_over_clause(window_func, args, filter.map(Box::new))
     }
 
     fn parse_where_expr(&mut self) -> Result<Expr> {
@@ -3181,37 +5194,65 @@ impl Parser {
         }
         if self.matches(&TokenKind::Not) {
             if self.matches(&TokenKind::Like) {
-                let pattern = self.parse_string_literal()?;
+                let pattern = self.parse_scalar_expr()?;
                 let escape = self.parse_optional_escape_clause()?;
                 return match column {
                     Some(column) => Ok(Expr::Like {
                         column,
-                        pattern,
+                        pattern: Box::new(pattern),
                         escape,
                         negated: true,
                     }),
                     None => Ok(Expr::LikeScalar {
                         expr: left_expr,
-                        pattern,
+                        pattern: Box::new(pattern),
                         escape,
                         negated: true,
                     }),
                 };
             }
             if self.matches(&TokenKind::Glob) {
-                let pattern = self.parse_string_literal()?;
+                let pattern = self.parse_scalar_expr()?;
                 return match column {
                     Some(column) => Ok(Expr::Glob {
                         column,
-                        pattern,
+                        pattern: Box::new(pattern),
                         negated: true,
                     }),
                     None => Ok(Expr::GlobScalar {
                         expr: left_expr,
-                        pattern,
+                        pattern: Box::new(pattern),
                         negated: true,
                     }),
                 };
+            }
+            if self.matches(&TokenKind::Regexp) {
+                let pattern = self.parse_scalar_expr()?;
+                return Ok(Expr::IsBool {
+                    expr: sqlite_binary_pattern_function(
+                        ScalarFunc::RegexpFunc,
+                        pattern,
+                        left_expr,
+                        true,
+                    ),
+                    value: true,
+                    negated: false,
+                    explicit: false,
+                });
+            }
+            if self.matches(&TokenKind::Match) {
+                let pattern = self.parse_scalar_expr()?;
+                return Ok(Expr::IsBool {
+                    expr: sqlite_binary_pattern_function(
+                        ScalarFunc::MatchFunc,
+                        pattern,
+                        left_expr,
+                        true,
+                    ),
+                    value: true,
+                    negated: false,
+                    explicit: false,
+                });
             }
             if self.matches(&TokenKind::Between) {
                 let low = self.parse_scalar_expr()?;
@@ -3243,37 +5284,65 @@ impl Parser {
             return self.parse_in_rhs(left_expr, column, false);
         }
         if self.matches(&TokenKind::Like) {
-            let pattern = self.parse_string_literal()?;
+            let pattern = self.parse_scalar_expr()?;
             let escape = self.parse_optional_escape_clause()?;
             return match column {
                 Some(column) => Ok(Expr::Like {
                     column,
-                    pattern,
+                    pattern: Box::new(pattern),
                     escape,
                     negated: false,
                 }),
                 None => Ok(Expr::LikeScalar {
                     expr: left_expr,
-                    pattern,
+                    pattern: Box::new(pattern),
                     escape,
                     negated: false,
                 }),
             };
         }
         if self.matches(&TokenKind::Glob) {
-            let pattern = self.parse_string_literal()?;
+            let pattern = self.parse_scalar_expr()?;
             return match column {
                 Some(column) => Ok(Expr::Glob {
                     column,
-                    pattern,
+                    pattern: Box::new(pattern),
                     negated: false,
                 }),
                 None => Ok(Expr::GlobScalar {
                     expr: left_expr,
-                    pattern,
+                    pattern: Box::new(pattern),
                     negated: false,
                 }),
             };
+        }
+        if self.matches(&TokenKind::Regexp) {
+            let pattern = self.parse_scalar_expr()?;
+            return Ok(Expr::IsBool {
+                expr: sqlite_binary_pattern_function(
+                    ScalarFunc::RegexpFunc,
+                    pattern,
+                    left_expr,
+                    false,
+                ),
+                value: true,
+                negated: false,
+                explicit: false,
+            });
+        }
+        if self.matches(&TokenKind::Match) {
+            let pattern = self.parse_scalar_expr()?;
+            return Ok(Expr::IsBool {
+                expr: sqlite_binary_pattern_function(
+                    ScalarFunc::MatchFunc,
+                    pattern,
+                    left_expr,
+                    false,
+                ),
+                value: true,
+                negated: false,
+                explicit: false,
+            });
         }
         if self.matches(&TokenKind::Between) {
             let low = self.parse_scalar_expr()?;
@@ -3441,8 +5510,12 @@ impl Parser {
 
     fn parse_column_def(&mut self, table_name: Option<&str>) -> Result<ColumnDef> {
         let name = self.parse_simple_identifier()?;
-        let column_type = self.parse_optional_column_type().unwrap_or(ColumnType::Any);
-        let mut column = ColumnDef::new(name, column_type);
+        let mut column = match self.parse_optional_column_type() {
+            Some((column_type, declared_type)) => {
+                ColumnDef::new(name, column_type).declared_type(declared_type)
+            }
+            None => ColumnDef::new(name, ColumnType::Any),
+        };
         let mut pending_constraint_name = None;
 
         loop {
@@ -3969,10 +6042,11 @@ impl Parser {
     }
 
     fn parse_optional_identifier_keyword(&mut self) -> Option<String> {
-        let TokenKind::Identifier(word) = self.peek_kind() else {
-            return None;
+        let word = match self.peek_kind() {
+            TokenKind::Identifier(word) => word.clone(),
+            TokenKind::Match => "MATCH".to_string(),
+            _ => return None,
         };
-        let word = word.clone();
         self.advance();
         Some(word)
     }
@@ -3988,6 +6062,17 @@ impl Parser {
         false
     }
 
+    fn expect_identifier_keyword(&mut self, expected: &str) -> Result<()> {
+        if self.parse_optional_identifier_keyword_if(expected) {
+            Ok(())
+        } else {
+            Err(self.error_expected(&format!(
+                "{expected}, found {}",
+                display_token(self.peek_kind())
+            )))
+        }
+    }
+
     fn check_expr_from_expr(expr: Expr) -> Result<CheckExpr> {
         Ok(match expr {
             Expr::Compare { column, op, value } => CheckExpr::Compare {
@@ -3995,14 +6080,164 @@ impl Parser {
                 op: Self::check_op_from_compare_op(op),
                 value,
             },
+            Expr::CompareScalar { left, op, right } => match (left, scalar_expr_literal_value(&right)) {
+                (
+                    ScalarExpr::Binary {
+                        left,
+                        op: binary_op,
+                        right,
+                    },
+                    Some(value),
+                ) if matches!(
+                    binary_op,
+                    ScalarBinaryOp::Add
+                        | ScalarBinaryOp::Subtract
+                        | ScalarBinaryOp::Multiply
+                        | ScalarBinaryOp::Divide
+                        | ScalarBinaryOp::Modulo
+                ) =>
+                {
+                    Self::check_arithmetic_expr(
+                        *left,
+                        binary_op,
+                        *right,
+                        Self::check_op_from_compare_op(op),
+                        value,
+                    )?
+                }
+                (ScalarExpr::Function { func, args }, Some(value)) if !args.is_empty() => {
+                    Self::check_function_expr(func, args, Self::check_op_from_compare_op(op), value)?
+                }
+                (ScalarExpr::Cast { expr, ty }, Some(value)) => {
+                    let ScalarExpr::Column(column) = *expr else {
+                        return Err(DbError::sql("unsupported CHECK expression"));
+                    };
+                    CheckExpr::CastCompare {
+                        column,
+                        target_type: ty,
+                        op: Self::check_op_from_compare_op(op),
+                        value,
+                    }
+                }
+                (ScalarExpr::Collate { expr, collation }, Some(value))
+                    if matches!(
+                        collation.to_ascii_uppercase().as_str(),
+                        "NOCASE" | "RTRIM"
+                    ) =>
+                {
+                    let ScalarExpr::Column(column) = *expr else {
+                        return Err(DbError::sql("unsupported CHECK expression"));
+                    };
+                    CheckExpr::NoCaseCompare {
+                        column,
+                        collation,
+                        op: Self::check_op_from_compare_op(op),
+                        value,
+                    }
+                }
+                (ScalarExpr::Function { func, args }, None)
+                    if matches!(func, ScalarFunc::Replace | ScalarFunc::MinScalar | ScalarFunc::MaxScalar) =>
+                {
+                    let ScalarExpr::Column(right_column) = right else {
+                        return Err(DbError::sql("unsupported CHECK expression"));
+                    };
+                    if matches!(func, ScalarFunc::Replace) {
+                        Self::check_replace_column_expr(
+                            args,
+                            Self::check_op_from_compare_op(op),
+                            right_column,
+                        )?
+                    } else {
+                        Self::check_min_max_column_expr(
+                            args,
+                            matches!(func, ScalarFunc::MinScalar),
+                            Self::check_op_from_compare_op(op),
+                            right_column,
+                        )?
+                    }
+                }
+                (ScalarExpr::UnaryMinus(expr), Some(value)) => {
+                    Self::check_unary_expr(*expr, true, Self::check_op_from_compare_op(op), value)?
+                }
+                (ScalarExpr::UnaryPlus(expr), Some(value)) => {
+                    Self::check_unary_expr(*expr, false, Self::check_op_from_compare_op(op), value)?
+                }
+                (ScalarExpr::Literal(value), None) => {
+                    let reversed_op = Self::check_op_from_reversed_compare_op(op);
+                    match right {
+                        ScalarExpr::Column(column) => CheckExpr::Compare {
+                            column,
+                            op: reversed_op,
+                            value,
+                        },
+                        ScalarExpr::Collate { expr, collation }
+                            if matches!(
+                                collation.to_ascii_uppercase().as_str(),
+                                "NOCASE" | "RTRIM"
+                            ) =>
+                        {
+                            let ScalarExpr::Column(column) = *expr else {
+                                return Err(DbError::sql("unsupported CHECK expression"));
+                            };
+                            CheckExpr::NoCaseCompare {
+                                column,
+                                collation,
+                                op: reversed_op,
+                                value,
+                            }
+                        }
+                        ScalarExpr::Function { func, args } if !args.is_empty() => {
+                            Self::check_function_expr(func, args, reversed_op, value)?
+                        }
+                        ScalarExpr::UnaryMinus(expr) => {
+                            Self::check_unary_expr(*expr, true, reversed_op, value)?
+                        }
+                        ScalarExpr::UnaryPlus(expr) => {
+                            Self::check_unary_expr(*expr, false, reversed_op, value)?
+                        }
+                        ScalarExpr::Binary {
+                            left,
+                            op: binary_op,
+                            right,
+                        } if matches!(
+                            binary_op,
+                            ScalarBinaryOp::Add
+                                | ScalarBinaryOp::Subtract
+                                | ScalarBinaryOp::Multiply
+                                | ScalarBinaryOp::Divide
+                                | ScalarBinaryOp::Modulo
+                        ) =>
+                        {
+                            Self::check_arithmetic_expr(
+                                *left,
+                                binary_op,
+                                *right,
+                                reversed_op,
+                                value,
+                            )?
+                        }
+                        _ => return Err(DbError::sql("unsupported CHECK expression")),
+                    }
+                }
+                _ => return Err(DbError::sql("unsupported CHECK expression")),
+            },
             Expr::IsNull { column, negated } => CheckExpr::IsNull { column, negated },
+            Expr::IsNullScalar { expr, negated } => {
+                Self::check_scalar_is_null_expr(expr, negated)?
+            }
             Expr::Glob {
                 column,
                 pattern,
                 negated,
             } => CheckExpr::Glob {
                 column,
-                pattern,
+                pattern: scalar_expr_literal_value(&pattern)
+                    .map(|value| sqlite_literal_to_text_like(&value))
+                    .ok_or_else(|| {
+                        DbError::sql(
+                            "non-literal GLOB pattern expressions are not supported in CHECK constraints",
+                        )
+                    })?,
                 negated,
             },
             Expr::Like {
@@ -4012,8 +6247,25 @@ impl Parser {
                 negated,
             } => CheckExpr::Like {
                 column,
-                pattern,
-                escape,
+                pattern: scalar_expr_literal_value(&pattern)
+                    .map(|value| sqlite_literal_to_text_like(&value))
+                    .ok_or_else(|| {
+                        DbError::sql(
+                            "non-literal LIKE pattern expressions are not supported in CHECK constraints",
+                        )
+                    })?,
+                escape: escape
+                    .as_deref()
+                    .map(|expr| {
+                        scalar_expr_literal_value(expr)
+                            .map(|value| sqlite_literal_to_text_like(&value))
+                            .ok_or_else(|| {
+                                DbError::sql(
+                                    "non-literal ESCAPE expressions are not supported in CHECK constraints",
+                                )
+                            })
+                    })
+                    .transpose()?,
                 negated,
             },
             Expr::InList {
@@ -4055,6 +6307,26 @@ impl Parser {
                         CheckExpr::Not(Box::new(CheckExpr::Truthy { column }))
                     }
                 }
+                ScalarExpr::Function { func, args } if !explicit && value => {
+                    let truthy = Self::check_likelihood_truthy_expr(func, args)?;
+                    if negated {
+                        CheckExpr::Not(Box::new(truthy))
+                    } else {
+                        truthy
+                    }
+                }
+                ScalarExpr::Not(expr) if !explicit && value && !negated => {
+                    let ScalarExpr::Function { func, args } = *expr else {
+                        return Err(DbError::sql("unsupported CHECK expression"));
+                    };
+                    if !matches!(
+                        func,
+                        ScalarFunc::LikeFunc | ScalarFunc::GlobFunc | ScalarFunc::RegexpFunc
+                    ) {
+                        return Err(DbError::sql("unsupported CHECK expression"));
+                    }
+                    Self::check_pattern_function_expr(func, args, true)?
+                }
                 _ => return Err(DbError::sql("unsupported CHECK expression")),
             },
             Expr::Is {
@@ -4082,6 +6354,664 @@ impl Parser {
         })
     }
 
+    fn check_unary_expr(
+        expr: ScalarExpr,
+        negated: bool,
+        op: CheckOp,
+        value: Value,
+    ) -> Result<CheckExpr> {
+        let ScalarExpr::Column(column) = expr else {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        };
+        Ok(if negated {
+            CheckExpr::MultiplyCompare {
+                column,
+                factor: Value::Integer(-1),
+                op,
+                value,
+            }
+        } else {
+            CheckExpr::Compare { column, op, value }
+        })
+    }
+
+    fn check_scalar_is_null_expr(expr: ScalarExpr, negated: bool) -> Result<CheckExpr> {
+        match expr {
+            ScalarExpr::Function { func, mut args } => {
+                if matches!(func, ScalarFunc::Unicode) {
+                    if args.len() != 1 {
+                        return Err(DbError::sql("unsupported CHECK expression"));
+                    }
+                    let ScalarExpr::Column(column) = args.remove(0) else {
+                        return Err(DbError::sql("unsupported CHECK expression"));
+                    };
+                    Ok(CheckExpr::UnicodeIsNull { column, negated })
+                } else if matches!(func, ScalarFunc::NullIf) {
+                    if args.len() != 2 {
+                        return Err(DbError::sql("unsupported CHECK expression"));
+                    }
+                    let ScalarExpr::Column(column) = args.remove(0) else {
+                        return Err(DbError::sql("unsupported CHECK expression"));
+                    };
+                    let value = scalar_expr_literal_value(&args.remove(0))
+                        .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+                    Ok(CheckExpr::NullIfIsNull {
+                        column,
+                        value,
+                        negated,
+                    })
+                } else {
+                    Err(DbError::sql("unsupported CHECK expression"))
+                }
+            }
+            _ => Err(DbError::sql("unsupported CHECK expression")),
+        }
+    }
+
+    fn check_likelihood_truthy_expr(
+        func: ScalarFunc,
+        mut args: Vec<ScalarExpr>,
+    ) -> Result<CheckExpr> {
+        let expected_args = match func {
+            ScalarFunc::Likely | ScalarFunc::Unlikely => 1,
+            ScalarFunc::Likelihood => 2,
+            ScalarFunc::LikeFunc if matches!(args.len(), 2 | 3) => args.len(),
+            ScalarFunc::GlobFunc => 2,
+            ScalarFunc::RegexpFunc => 2,
+            ScalarFunc::JsonValid if matches!(args.len(), 1 | 2) => args.len(),
+            _ => return Err(DbError::sql("unsupported CHECK expression")),
+        };
+        if args.len() != expected_args {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        }
+        if matches!(func, ScalarFunc::JsonValid) {
+            let ScalarExpr::Column(column) = args.remove(0) else {
+                return Err(DbError::sql("unsupported CHECK expression"));
+            };
+            let flags = if args.is_empty() {
+                None
+            } else {
+                match scalar_expr_literal_value(&args[0]) {
+                    Some(Value::Integer(value)) if (1..=15).contains(&value) => Some(value),
+                    _ => return Err(DbError::sql("unsupported CHECK expression")),
+                }
+            };
+            return Ok(CheckExpr::JsonValidCompare {
+                column,
+                flags,
+                compare: None,
+            });
+        }
+        if matches!(
+            func,
+            ScalarFunc::LikeFunc | ScalarFunc::GlobFunc | ScalarFunc::RegexpFunc
+        ) {
+            return Self::check_pattern_function_expr(func, args, false);
+        }
+        let ScalarExpr::Column(column) = args.remove(0) else {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        };
+        if matches!(func, ScalarFunc::Likelihood) {
+            let Some(Value::Real(_) | Value::Integer(_)) = scalar_expr_literal_value(&args[0])
+            else {
+                return Err(DbError::sql("unsupported CHECK expression"));
+            };
+        }
+        Ok(CheckExpr::Truthy { column })
+    }
+
+    fn check_pattern_function_expr(
+        func: ScalarFunc,
+        mut args: Vec<ScalarExpr>,
+        negated: bool,
+    ) -> Result<CheckExpr> {
+        let pattern = scalar_expr_literal_value(&args.remove(0))
+            .map(|value| sqlite_literal_to_text_like(&value))
+            .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+        let ScalarExpr::Column(column) = args.remove(0) else {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        };
+        let escape = if matches!(func, ScalarFunc::LikeFunc) && !args.is_empty() {
+            Some(
+                scalar_expr_literal_value(&args.remove(0))
+                    .map(|value| sqlite_literal_to_text_like(&value))
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?,
+            )
+        } else {
+            None
+        };
+        Ok(match func {
+            ScalarFunc::LikeFunc => CheckExpr::Like {
+                column,
+                pattern,
+                escape,
+                negated,
+            },
+            ScalarFunc::GlobFunc => CheckExpr::Glob {
+                column,
+                pattern,
+                negated,
+            },
+            ScalarFunc::RegexpFunc => CheckExpr::Regexp {
+                column,
+                pattern,
+                negated,
+            },
+            _ => unreachable!("matched pattern function"),
+        })
+    }
+
+    fn check_arithmetic_expr(
+        left: ScalarExpr,
+        binary_op: ScalarBinaryOp,
+        right: ScalarExpr,
+        op: CheckOp,
+        value: Value,
+    ) -> Result<CheckExpr> {
+        let ScalarExpr::Column(column) = left else {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        };
+        let Some(mut addend) = scalar_expr_literal_value(&right) else {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        };
+        Ok(if matches!(binary_op, ScalarBinaryOp::Multiply) {
+            CheckExpr::MultiplyCompare {
+                column,
+                factor: addend,
+                op,
+                value,
+            }
+        } else if matches!(binary_op, ScalarBinaryOp::Divide) {
+            CheckExpr::DivideCompare {
+                column,
+                divisor: addend,
+                op,
+                value,
+            }
+        } else if matches!(binary_op, ScalarBinaryOp::Modulo) {
+            CheckExpr::ModuloCompare {
+                column,
+                divisor: addend,
+                op,
+                value,
+                function_form: false,
+            }
+        } else {
+            if matches!(binary_op, ScalarBinaryOp::Subtract) {
+                addend = negate_check_literal(addend)?;
+            }
+            CheckExpr::ArithmeticCompare {
+                column,
+                addend,
+                op,
+                value,
+            }
+        })
+    }
+
+    fn check_function_expr(
+        func: ScalarFunc,
+        mut args: Vec<ScalarExpr>,
+        op: CheckOp,
+        value: Value,
+    ) -> Result<CheckExpr> {
+        if matches!(func, ScalarFunc::ConcatWs) {
+            return Self::check_concat_ws_expr(args, op, value);
+        }
+
+        if matches!(func, ScalarFunc::Log) && args.len() == 2 {
+            if let (Some(argument), ScalarExpr::Column(column)) =
+                (scalar_expr_literal_value(&args[0]), &args[1])
+            {
+                return Ok(CheckExpr::BinaryMathCompare {
+                    column: column.clone(),
+                    func: BinaryMathFunc::Log,
+                    argument,
+                    column_is_second: true,
+                    op,
+                    value,
+                });
+            }
+        }
+
+        let ScalarExpr::Column(column) = args.remove(0) else {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        };
+        Ok(match func {
+            ScalarFunc::Length if args.is_empty() => CheckExpr::LengthCompare { column, op, value },
+            ScalarFunc::OctetLength if args.is_empty() => {
+                CheckExpr::OctetLengthCompare { column, op, value }
+            }
+            ScalarFunc::Unicode if args.is_empty() => {
+                CheckExpr::UnicodeCompare { column, op, value }
+            }
+            ScalarFunc::Sign if args.is_empty() => CheckExpr::SignCompare { column, op, value },
+            ScalarFunc::Hex if args.is_empty() => CheckExpr::HexCompare { column, op, value },
+            ScalarFunc::Quote if args.is_empty() => CheckExpr::QuoteCompare { column, op, value },
+            ScalarFunc::Replace if args.len() == 2 => {
+                let pattern = scalar_expr_literal_value(&args[0])
+                    .map(|value| sqlite_literal_to_text_like(&value))
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+                let replacement = scalar_expr_literal_value(&args[1])
+                    .map(|value| sqlite_literal_to_text_like(&value))
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+                CheckExpr::ReplaceCompare {
+                    column,
+                    pattern,
+                    replacement,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Round if args.len() <= 1 => {
+                let precision = if args.len() == 1 {
+                    match scalar_expr_literal_value(&args[0]) {
+                        Some(Value::Integer(value)) => Some(
+                            i32::try_from(value)
+                                .map_err(|_| DbError::sql("unsupported CHECK expression"))?,
+                        ),
+                        _ => return Err(DbError::sql("unsupported CHECK expression")),
+                    }
+                } else {
+                    None
+                };
+                CheckExpr::RoundCompare {
+                    column,
+                    precision,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Ceil | ScalarFunc::Ceiling | ScalarFunc::Floor | ScalarFunc::Trunc
+                if args.is_empty() =>
+            {
+                CheckExpr::RoundingCompare {
+                    column,
+                    func: match func {
+                        ScalarFunc::Ceil => RoundingFunc::Ceil,
+                        ScalarFunc::Ceiling => RoundingFunc::Ceiling,
+                        ScalarFunc::Floor => RoundingFunc::Floor,
+                        ScalarFunc::Trunc => RoundingFunc::Trunc,
+                        _ => unreachable!("matched rounding function"),
+                    },
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Concat if !args.is_empty() => {
+                let suffix = Self::check_literal_args(args)?;
+                CheckExpr::ConcatCompare {
+                    column,
+                    suffix,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::JsonValid if args.len() <= 1 => {
+                let flags = if args.len() == 1 {
+                    match scalar_expr_literal_value(&args[0]) {
+                        Some(Value::Integer(value)) if (1..=15).contains(&value) => Some(value),
+                        _ => return Err(DbError::sql("unsupported CHECK expression")),
+                    }
+                } else {
+                    None
+                };
+                CheckExpr::JsonValidCompare {
+                    column,
+                    flags,
+                    compare: Some((op, value)),
+                }
+            }
+            ScalarFunc::Abs if args.is_empty() => CheckExpr::AbsCompare { column, op, value },
+            ScalarFunc::Sqrt if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Sqrt,
+                op,
+                value,
+            },
+            ScalarFunc::Ln if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Ln,
+                op,
+                value,
+            },
+            ScalarFunc::Log10 if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Log10,
+                op,
+                value,
+            },
+            ScalarFunc::Log if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Log10,
+                op,
+                value,
+            },
+            ScalarFunc::Log2 if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Log2,
+                op,
+                value,
+            },
+            ScalarFunc::Exp if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Exp,
+                op,
+                value,
+            },
+            ScalarFunc::Sin if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Sin,
+                op,
+                value,
+            },
+            ScalarFunc::Cos if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Cos,
+                op,
+                value,
+            },
+            ScalarFunc::Tan if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Tan,
+                op,
+                value,
+            },
+            ScalarFunc::Sinh if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Sinh,
+                op,
+                value,
+            },
+            ScalarFunc::Cosh if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Cosh,
+                op,
+                value,
+            },
+            ScalarFunc::Tanh if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Tanh,
+                op,
+                value,
+            },
+            ScalarFunc::Atan if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Atan,
+                op,
+                value,
+            },
+            ScalarFunc::Acos if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Acos,
+                op,
+                value,
+            },
+            ScalarFunc::Asin if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Asin,
+                op,
+                value,
+            },
+            ScalarFunc::Acosh if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Acosh,
+                op,
+                value,
+            },
+            ScalarFunc::Asinh if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Asinh,
+                op,
+                value,
+            },
+            ScalarFunc::Atanh if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Atanh,
+                op,
+                value,
+            },
+            ScalarFunc::Degrees if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Degrees,
+                op,
+                value,
+            },
+            ScalarFunc::Radians if args.is_empty() => CheckExpr::UnaryMathCompare {
+                column,
+                func: UnaryMathFunc::Radians,
+                op,
+                value,
+            },
+            ScalarFunc::Power if args.len() == 1 => {
+                let argument = scalar_expr_literal_value(&args[0])
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+                CheckExpr::BinaryMathCompare {
+                    column,
+                    func: BinaryMathFunc::Power,
+                    argument,
+                    column_is_second: false,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Atan2 if args.len() == 1 => {
+                let argument = scalar_expr_literal_value(&args[0])
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+                CheckExpr::BinaryMathCompare {
+                    column,
+                    func: BinaryMathFunc::Atan2,
+                    argument,
+                    column_is_second: false,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Log if args.len() == 1 => {
+                let argument = scalar_expr_literal_value(&args[0])
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+                CheckExpr::BinaryMathCompare {
+                    column,
+                    func: BinaryMathFunc::Log,
+                    argument,
+                    column_is_second: false,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::TypeOf if args.is_empty() => CheckExpr::TypeOfCompare { column, op, value },
+            ScalarFunc::Lower | ScalarFunc::Upper if args.is_empty() => {
+                CheckExpr::CaseFoldCompare {
+                    column,
+                    upper: matches!(func, ScalarFunc::Upper),
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Trim | ScalarFunc::LTrim | ScalarFunc::RTrim if args.len() <= 1 => {
+                let characters = if args.len() == 1 {
+                    Some(
+                        scalar_expr_literal_value(&args[0])
+                            .map(|value| sqlite_literal_to_text_like(&value))
+                            .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?,
+                    )
+                } else {
+                    None
+                };
+                CheckExpr::TrimCompare {
+                    column,
+                    side: match func {
+                        ScalarFunc::Trim => TrimSide::Both,
+                        ScalarFunc::LTrim => TrimSide::Start,
+                        ScalarFunc::RTrim => TrimSide::End,
+                        _ => unreachable!("matched trim family function"),
+                    },
+                    characters,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Coalesce if !args.is_empty() => {
+                let fallbacks = args
+                    .iter()
+                    .map(|arg| {
+                        scalar_expr_literal_value(arg)
+                            .ok_or_else(|| DbError::sql("unsupported CHECK expression"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                CheckExpr::CoalesceCompare {
+                    column,
+                    fallbacks,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::IfNull if args.len() == 1 => {
+                let fallback = scalar_expr_literal_value(&args[0])
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+                CheckExpr::CoalesceCompare {
+                    column,
+                    fallbacks: vec![fallback],
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Instr if args.len() == 1 => {
+                let needle = scalar_expr_literal_value(&args[0])
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+                CheckExpr::InstrCompare {
+                    column,
+                    needle,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Substr if matches!(args.len(), 1 | 2) => {
+                let start = match scalar_expr_literal_value(&args[0]) {
+                    Some(Value::Integer(value)) => value,
+                    _ => return Err(DbError::sql("unsupported CHECK expression")),
+                };
+                let length = if args.len() == 2 {
+                    match scalar_expr_literal_value(&args[1]) {
+                        Some(Value::Integer(value)) => Some(value),
+                        _ => return Err(DbError::sql("unsupported CHECK expression")),
+                    }
+                } else {
+                    None
+                };
+                CheckExpr::SubstrCompare {
+                    column,
+                    start,
+                    length,
+                    op,
+                    value,
+                }
+            }
+            ScalarFunc::Mod if args.len() == 1 => {
+                let divisor = scalar_expr_literal_value(&args[0])
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+                CheckExpr::ModuloCompare {
+                    column,
+                    divisor,
+                    op,
+                    value,
+                    function_form: true,
+                }
+            }
+            _ => return Err(DbError::sql("unsupported CHECK expression")),
+        })
+    }
+
+    fn check_concat_ws_expr(
+        mut args: Vec<ScalarExpr>,
+        op: CheckOp,
+        value: Value,
+    ) -> Result<CheckExpr> {
+        if args.len() < 2 {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        }
+        let separator = scalar_expr_literal_value(&args.remove(0))
+            .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+        let separator = if matches!(separator, Value::Null) {
+            None
+        } else {
+            Some(sqlite_literal_to_text_like(&separator))
+        };
+        let ScalarExpr::Column(column) = args.remove(0) else {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        };
+        let suffix = Self::check_literal_args(args)?;
+        Ok(CheckExpr::ConcatWsCompare {
+            column,
+            separator,
+            suffix,
+            op,
+            value,
+        })
+    }
+
+    fn check_literal_args(args: Vec<ScalarExpr>) -> Result<Vec<Value>> {
+        args.iter()
+            .map(|arg| {
+                scalar_expr_literal_value(arg)
+                    .ok_or_else(|| DbError::sql("unsupported CHECK expression"))
+            })
+            .collect()
+    }
+
+    fn check_replace_column_expr(
+        mut args: Vec<ScalarExpr>,
+        op: CheckOp,
+        right_column: String,
+    ) -> Result<CheckExpr> {
+        if args.len() != 3 {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        }
+        let ScalarExpr::Column(column) = args.remove(0) else {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        };
+        if column != right_column {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        }
+        let pattern = scalar_expr_literal_value(&args[0])
+            .map(|value| sqlite_literal_to_text_like(&value))
+            .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+        let replacement = scalar_expr_literal_value(&args[1])
+            .map(|value| sqlite_literal_to_text_like(&value))
+            .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+        Ok(CheckExpr::ReplaceColumnCompare {
+            column,
+            pattern,
+            replacement,
+            op,
+        })
+    }
+
+    fn check_min_max_column_expr(
+        mut args: Vec<ScalarExpr>,
+        min: bool,
+        op: CheckOp,
+        right_column: String,
+    ) -> Result<CheckExpr> {
+        if args.len() != 2 {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        }
+        let ScalarExpr::Column(column) = args.remove(0) else {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        };
+        if column != right_column {
+            return Err(DbError::sql("unsupported CHECK expression"));
+        }
+        let limit = scalar_expr_literal_value(&args.remove(0))
+            .ok_or_else(|| DbError::sql("unsupported CHECK expression"))?;
+        Ok(CheckExpr::MinMaxColumnCompare {
+            column,
+            limit,
+            min,
+            op,
+        })
+    }
+
     fn check_op_from_compare_op(op: CompareOp) -> CheckOp {
         match op {
             CompareOp::Eq => CheckOp::Eq,
@@ -4093,7 +7023,18 @@ impl Parser {
         }
     }
 
-    fn parse_optional_column_type(&mut self) -> Option<ColumnType> {
+    fn check_op_from_reversed_compare_op(op: CompareOp) -> CheckOp {
+        match op {
+            CompareOp::Eq => CheckOp::Eq,
+            CompareOp::Ne => CheckOp::Ne,
+            CompareOp::Gt => CheckOp::Lt,
+            CompareOp::Gte => CheckOp::Lte,
+            CompareOp::Lt => CheckOp::Gt,
+            CompareOp::Lte => CheckOp::Gte,
+        }
+    }
+
+    fn parse_optional_column_type(&mut self) -> Option<(ColumnType, String)> {
         let start = self.index;
         let mut declared_type = vec![self.parse_optional_declared_type_word()?];
 
@@ -4106,9 +7047,15 @@ impl Parser {
             return None;
         }
 
+        let declared_type_sql = join_declared_type_fragments(
+            &self.tokens[start..self.index]
+                .iter()
+                .map(token_sql_fragment)
+                .collect::<Vec<_>>(),
+        );
         let declared_type = declared_type.join(" ");
         match sqlite_declared_type_affinity(&declared_type) {
-            Some(column_type) => Some(column_type),
+            Some(column_type) => Some((column_type, declared_type_sql)),
             None => {
                 self.index = start;
                 None
@@ -4130,6 +7077,9 @@ impl Parser {
         }
 
         let declared_type = declared_type.join(" ");
+        if declared_type.trim().eq_ignore_ascii_case("BOOLEAN") {
+            return Some(ColumnType::Numeric);
+        }
         if sqlite_declared_type_is_numeric(&declared_type) {
             return Some(ColumnType::Numeric);
         }
@@ -4252,6 +7202,63 @@ impl Parser {
     fn parse_assignments(&mut self) -> Result<Vec<Assignment>> {
         let mut assignments = Vec::new();
         loop {
+            if self.matches(&TokenKind::LParen) {
+                let mut columns = vec![self.parse_simple_identifier()?];
+                while self.matches(&TokenKind::Comma) {
+                    columns.push(self.parse_simple_identifier()?);
+                }
+                self.expect_symbol(TokenKind::RParen)?;
+                self.expect_symbol(TokenKind::Eq)?;
+                let value = self.parse_scalar_expr()?;
+                match value {
+                    ScalarExpr::Tuple(values) => {
+                        if columns.len() != values.len() {
+                            return Err(DbError::sql(format!(
+                                "{} columns assigned {} values",
+                                columns.len(),
+                                values.len()
+                            )));
+                        }
+                        assignments.extend(
+                            columns
+                                .into_iter()
+                                .zip(values.into_iter())
+                                .map(|(column, value)| Assignment { column, value }),
+                        );
+                    }
+                    ScalarExpr::Subquery { query } => {
+                        if columns.len() != query.columns.len() {
+                            return Err(DbError::sql(format!(
+                                "{} columns assigned {} values",
+                                columns.len(),
+                                query.columns.len()
+                            )));
+                        }
+                        assignments.extend(columns.into_iter().enumerate().map(
+                            |(index, column)| {
+                                let mut query = query.as_ref().clone();
+                                query.columns = vec![query.columns[index].clone()];
+                                Assignment {
+                                    column,
+                                    value: ScalarExpr::Subquery {
+                                        query: Box::new(query),
+                                    },
+                                }
+                            },
+                        ));
+                    }
+                    _ => {
+                        return Err(DbError::sql(
+                            "row value assignment requires row value expression",
+                        ));
+                    }
+                }
+                if !self.matches(&TokenKind::Comma) {
+                    break;
+                }
+                continue;
+            }
+
             let column = self.parse_simple_identifier()?;
             self.expect_symbol(TokenKind::Eq)?;
             let value = self.parse_scalar_expr()?;
@@ -4263,25 +7270,12 @@ impl Parser {
         Ok(assignments)
     }
 
-    fn parse_order_by_items(&mut self) -> Result<Vec<OrderBy>> {
+    fn parse_order_by_items(&mut self, allow_result_positions: bool) -> Result<Vec<OrderBy>> {
         let mut items = Vec::new();
         loop {
-            let expr = if let TokenKind::Integer(value) = self.peek_kind()
-                && *value > 0
-                && matches!(
-                    self.tokens.get(self.index + 1).map(|token| &token.kind),
-                    Some(
-                        TokenKind::Asc
-                            | TokenKind::Desc
-                            | TokenKind::Nulls
-                            | TokenKind::Comma
-                            | TokenKind::Semicolon
-                            | TokenKind::Eof
-                    )
-                ) {
-                let position = usize::try_from(*value)
-                    .map_err(|_| DbError::sql("ORDER BY position is too large"))?;
-                self.advance();
+            let expr = if allow_result_positions
+                && let Some(position) = self.parse_order_by_position_if_bare()?
+            {
                 OrderByExpr::Position(position)
             } else {
                 let expr = self.parse_scalar_expr()?;
@@ -4352,6 +7346,68 @@ impl Parser {
             }
         }
         Ok(items)
+    }
+
+    fn parse_order_by_position_if_bare(&mut self) -> Result<Option<usize>> {
+        if let Some(position) = self.parse_signed_order_by_integer_position_if_bare()? {
+            return Ok(Some(position));
+        }
+
+        let start = self.index;
+        if self.matches(&TokenKind::LParen) {
+            if let Some(position) = self.parse_signed_order_by_integer_position_if_bare()?
+                && self.matches(&TokenKind::RParen)
+                && self.is_order_by_term_boundary_at(self.index)
+            {
+                return Ok(Some(position));
+            }
+            self.index = start;
+        }
+
+        Ok(None)
+    }
+
+    fn parse_signed_order_by_integer_position_if_bare(&mut self) -> Result<Option<usize>> {
+        if let TokenKind::Integer(value) = self.peek_kind()
+            && self.is_order_by_term_boundary_at(self.index + 1)
+        {
+            let position = usize::try_from(*value).unwrap_or(0);
+            self.advance();
+            return Ok(Some(position));
+        }
+
+        let start = self.index;
+        let negative = if self.matches(&TokenKind::Minus) {
+            true
+        } else if self.matches(&TokenKind::Plus) {
+            false
+        } else {
+            return Ok(None);
+        };
+        if matches!(self.peek_kind(), TokenKind::Integer(_))
+            && self.is_order_by_term_boundary_at(self.index + 1)
+        {
+            self.advance();
+            return Ok(Some(if negative { 0 } else { 1 }));
+        }
+        self.index = start;
+        Ok(None)
+    }
+
+    fn is_order_by_term_boundary_at(&self, index: usize) -> bool {
+        matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(
+                TokenKind::Asc
+                    | TokenKind::Desc
+                    | TokenKind::Collate
+                    | TokenKind::Nulls
+                    | TokenKind::Comma
+                    | TokenKind::Semicolon
+                    | TokenKind::Eof
+                    | TokenKind::RParen
+            )
+        )
     }
 
     fn parse_group_by_items(&mut self) -> Result<Vec<ScalarExpr>> {
@@ -4503,38 +7559,17 @@ impl Parser {
     }
 
     fn parse_limit_value(&mut self) -> Result<i64> {
-        let negative = self.matches(&TokenKind::Minus);
-        match self.peek_kind() {
-            TokenKind::Integer(value) => {
-                let mut value = *value;
-                self.advance();
-                if negative {
-                    value = value
-                        .checked_neg()
-                        .ok_or_else(|| DbError::sql("LIMIT/OFFSET literal is out of range"))?;
-                }
-                Ok(value)
-            }
-            TokenKind::Real(value) => {
-                let mut value = *value;
-                self.advance();
-                if negative {
-                    value = -value;
-                }
-                if !value.is_finite()
-                    || value.fract() != 0.0
-                    || value < i64::MIN as f64
-                    || value > i64::MAX as f64
-                {
-                    return Err(DbError::sql("LIMIT/OFFSET literal is out of range"));
-                }
-                Ok(value as i64)
-            }
-            token => {
-                Err(self
-                    .error_expected(&format!("numeric literal, found {}", display_token(token))))
-            }
+        let expr = self.parse_scalar_expr()?;
+        let value = constant_limit_value(&expr)
+            .ok_or_else(|| DbError::sql("LIMIT/OFFSET expression must be a constant integer"))?;
+        if !value.is_finite()
+            || value.fract() != 0.0
+            || value < i64::MIN as f64
+            || value > i64::MAX as f64
+        {
+            return Err(DbError::sql("LIMIT/OFFSET literal is out of range"));
         }
+        Ok(value as i64)
     }
 
     fn parse_parenthesized_scalar_exprs(&mut self) -> Result<Vec<ScalarExpr>> {
@@ -4574,11 +7609,17 @@ impl Parser {
                 TokenKind::Integer(value) => {
                     let value = *value;
                     self.advance();
-                    return Ok(Value::Integer(-value));
+                    let value = value
+                        .checked_neg()
+                        .ok_or_else(|| DbError::sql("integer overflow"))?;
+                    return Ok(Value::Integer(value));
                 }
                 TokenKind::Real(value) => {
                     let value = *value;
                     self.advance();
+                    if value == 9_223_372_036_854_776_000.0 {
+                        return Ok(Value::Integer(i64::MIN));
+                    }
                     return Ok(Value::Real(-value));
                 }
                 _ => return Err(self.error_expected("numeric literal after -")),
@@ -4668,16 +7709,6 @@ impl Parser {
         Ok(ColumnDefault::Literal(self.parse_literal()?))
     }
 
-    fn parse_string_literal(&mut self) -> Result<String> {
-        match self.parse_literal()? {
-            Value::Text(value) => Ok(value),
-            value => Err(DbError::sql(format!(
-                "expected string literal, found {}",
-                value.type_name()
-            ))),
-        }
-    }
-
     fn parse_identifier(&mut self) -> Result<String> {
         let mut identifier = self.parse_simple_identifier()?;
         while self.matches(&TokenKind::Dot) {
@@ -4686,6 +7717,24 @@ impl Parser {
             identifier.push_str(&segment);
         }
         Ok(identifier)
+    }
+
+    fn parse_schema_qualified_name(&mut self) -> Result<String> {
+        self.parse_schema_qualified_name_with_schema()
+            .map(|(name, _)| name)
+    }
+
+    fn parse_schema_qualified_name_with_schema(&mut self) -> Result<(String, Option<String>)> {
+        let name = self.parse_simple_identifier()?;
+        if !self.matches(&TokenKind::Dot) {
+            return Ok((name, None));
+        }
+
+        if !name.eq_ignore_ascii_case("main") && !name.eq_ignore_ascii_case("temp") {
+            return Err(DbError::sql(format!("unknown database {name}")));
+        }
+        let identifier = self.parse_simple_identifier()?;
+        Ok((identifier, Some(name)))
     }
 
     fn parse_simple_identifier(&mut self) -> Result<String> {
@@ -4735,6 +7784,14 @@ impl Parser {
                 self.advance();
                 Ok("replace".to_string())
             }
+            TokenKind::Savepoint => {
+                self.advance();
+                Ok("savepoint".to_string())
+            }
+            TokenKind::Release => {
+                self.advance();
+                Ok("release".to_string())
+            }
             token => {
                 Err(self.error_expected(&format!("identifier, found {}", display_token(token))))
             }
@@ -4746,6 +7803,30 @@ impl Parser {
             return Ok(Some(self.parse_simple_identifier()?));
         }
         if self.is_table_index_hint_start() {
+            return Ok(None);
+        }
+        if matches!(self.peek_kind(), TokenKind::Identifier(name) if name.eq_ignore_ascii_case("WINDOW"))
+        {
+            return Ok(None);
+        }
+        if is_identifier_token(self.peek_kind()) {
+            return Ok(Some(self.parse_simple_identifier()?));
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_insert_target_alias(&mut self) -> Result<Option<String>> {
+        if self.matches(&TokenKind::As) {
+            return Ok(Some(self.parse_simple_identifier()?));
+        }
+        if matches!(
+            self.peek_kind(),
+            TokenKind::Default
+                | TokenKind::Select
+                | TokenKind::Values
+                | TokenKind::With
+                | TokenKind::LParen
+        ) {
             return Ok(None);
         }
         if is_identifier_token(self.peek_kind()) {
@@ -4829,6 +7910,8 @@ fn is_identifier_token(token: &TokenKind) -> bool {
             | TokenKind::Committed
             | TokenKind::Repeatable
             | TokenKind::Serializable
+            | TokenKind::Savepoint
+            | TokenKind::Release
     )
 }
 
@@ -4841,6 +7924,46 @@ fn is_select_alias_token(token: &TokenKind) -> bool {
             | TokenKind::Begin
             | TokenKind::Rollback
     ) || is_identifier_token(token)
+}
+
+fn constant_limit_value(expr: &ScalarExpr) -> Option<f64> {
+    match expr {
+        ScalarExpr::Literal(Value::Integer(value)) => Some(*value as f64),
+        ScalarExpr::Literal(Value::Real(value)) => Some(*value),
+        ScalarExpr::UnaryPlus(expr) => constant_limit_value(expr),
+        ScalarExpr::UnaryMinus(expr) => constant_limit_value(expr).map(|value| -value),
+        ScalarExpr::Cast { expr, ty } => {
+            let value = constant_limit_value(expr)?;
+            match ty {
+                ColumnType::Integer => Some(value.trunc()),
+                ColumnType::Numeric | ColumnType::Real => Some(value),
+                ColumnType::Any | ColumnType::Boolean | ColumnType::Blob | ColumnType::Text => None,
+            }
+        }
+        ScalarExpr::Function {
+            func: ScalarFunc::Abs,
+            args,
+        } if args.len() == 1 => constant_limit_value(&args[0]).map(f64::abs),
+        ScalarExpr::Binary { left, op, right } => {
+            let left = constant_limit_value(left)?;
+            let right = constant_limit_value(right)?;
+            match op {
+                ScalarBinaryOp::Add => Some(left + right),
+                ScalarBinaryOp::Subtract => Some(left - right),
+                ScalarBinaryOp::Multiply => Some(left * right),
+                ScalarBinaryOp::Divide => Some(left / right),
+                ScalarBinaryOp::Modulo => Some(left % right),
+                ScalarBinaryOp::BitAnd
+                | ScalarBinaryOp::BitOr
+                | ScalarBinaryOp::ShiftLeft
+                | ScalarBinaryOp::ShiftRight
+                | ScalarBinaryOp::Concat
+                | ScalarBinaryOp::JsonExtract
+                | ScalarBinaryOp::JsonExtractText => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn sqlite_limit_value(value: i64) -> Option<usize> {
@@ -4858,8 +7981,11 @@ fn is_scalar_expr_start(token: &TokenKind) -> bool {
             TokenKind::LParen
                 | TokenKind::Case
                 | TokenKind::Not
+                | TokenKind::Plus
                 | TokenKind::Minus
                 | TokenKind::Replace
+                | TokenKind::Like
+                | TokenKind::Glob
                 | TokenKind::Integer(_)
                 | TokenKind::Real(_)
                 | TokenKind::BlobLiteral(_)
@@ -4928,15 +8054,76 @@ fn sqlite_declared_type_is_numeric(declared_type: &str) -> bool {
         || normalized.starts_with("DECIMAL(")
 }
 
+fn sqlite_binary_pattern_function(
+    func: ScalarFunc,
+    pattern: ScalarExpr,
+    value: ScalarExpr,
+    negated: bool,
+) -> ScalarExpr {
+    let expr = ScalarExpr::Function {
+        func,
+        args: vec![pattern, value],
+    };
+    if negated {
+        ScalarExpr::Not(Box::new(expr))
+    } else {
+        expr
+    }
+}
+
 fn scalar_expr_literal_value(expr: &ScalarExpr) -> Option<Value> {
     match expr {
         ScalarExpr::Literal(value) => Some(value.clone()),
         ScalarExpr::UnaryMinus(expr) => match expr.as_ref() {
-            ScalarExpr::Literal(Value::Integer(value)) => Some(Value::Integer(-value)),
+            ScalarExpr::Literal(Value::Integer(value)) => value.checked_neg().map(Value::Integer),
+            ScalarExpr::Literal(Value::Real(value)) if *value == 9_223_372_036_854_776_000.0 => {
+                Some(Value::Integer(i64::MIN))
+            }
             ScalarExpr::Literal(Value::Real(value)) => Some(Value::Real(-value)),
             _ => None,
         },
+        ScalarExpr::Binary {
+            left,
+            op: ScalarBinaryOp::Concat,
+            right,
+        } => {
+            let left = scalar_expr_literal_value(left)?;
+            let right = scalar_expr_literal_value(right)?;
+            Some(Value::Text(format!(
+                "{}{}",
+                sqlite_literal_to_text_like(&left),
+                sqlite_literal_to_text_like(&right)
+            )))
+        }
         _ => None,
+    }
+}
+
+fn negate_check_literal(value: Value) -> Result<Value> {
+    match value {
+        Value::Integer(value) => value
+            .checked_neg()
+            .map(Value::Integer)
+            .ok_or_else(|| DbError::sql("unsupported CHECK expression")),
+        Value::Real(value) => Ok(Value::Real(-value)),
+        _ => Err(DbError::sql("unsupported CHECK expression")),
+    }
+}
+
+fn sqlite_literal_to_text_like(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Boolean(value) => {
+            if *value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        Value::Integer(value) => value.to_string(),
+        Value::Real(value) => value.to_string(),
+        Value::Blob(value) => String::from_utf8_lossy(value).into_owned(),
+        Value::Text(value) => value.clone(),
     }
 }
 
@@ -5011,14 +8198,27 @@ fn scalar_expr_nested_aggregate_name(expr: &ScalarExpr) -> Option<&'static str> 
     match expr {
         ScalarExpr::Aggregate { func, .. } => Some(aggregate_function_name(*func)),
         ScalarExpr::Tuple(values) => values.iter().find_map(scalar_expr_nested_aggregate_name),
-        ScalarExpr::UnaryMinus(expr)
+        ScalarExpr::UnaryPlus(expr)
+        | ScalarExpr::UnaryMinus(expr)
         | ScalarExpr::BitNot(expr)
         | ScalarExpr::Not(expr)
         | ScalarExpr::Cast { expr, .. }
         | ScalarExpr::Collate { expr, .. }
-        | ScalarExpr::IsBool { expr, .. }
-        | ScalarExpr::Like { expr, .. }
-        | ScalarExpr::Glob { expr, .. } => scalar_expr_nested_aggregate_name(expr),
+        | ScalarExpr::IsBool { expr, .. } => scalar_expr_nested_aggregate_name(expr),
+        ScalarExpr::Glob { expr, pattern, .. } => scalar_expr_nested_aggregate_name(expr)
+            .or_else(|| scalar_expr_nested_aggregate_name(pattern)),
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => scalar_expr_nested_aggregate_name(expr).or_else(|| {
+            scalar_expr_nested_aggregate_name(pattern).or_else(|| {
+                escape
+                    .as_deref()
+                    .and_then(scalar_expr_nested_aggregate_name)
+            })
+        }),
         ScalarExpr::Is { left, right, .. }
         | ScalarExpr::Compare { left, right, .. }
         | ScalarExpr::Binary { left, right, .. } => scalar_expr_nested_aggregate_name(left)
@@ -5055,6 +8255,21 @@ fn scalar_expr_nested_aggregate_name(expr: &ScalarExpr) -> Option<&'static str> 
         ScalarExpr::Function { args, .. } => {
             args.iter().find_map(scalar_expr_nested_aggregate_name)
         }
+        ScalarExpr::WindowFunction {
+            func: _,
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => args
+            .iter()
+            .find_map(scalar_expr_nested_aggregate_name)
+            .or_else(|| {
+                partition_by
+                    .iter()
+                    .find_map(scalar_expr_nested_aggregate_name)
+            })
+            .or_else(|| order_by_nested_aggregate_name(order_by)),
         ScalarExpr::Literal(_) | ScalarExpr::Column(_) => None,
     }
 }
@@ -5063,6 +8278,7 @@ fn aggregate_function_name(func: AggregateFunc) -> &'static str {
     match func {
         AggregateFunc::Count => "COUNT",
         AggregateFunc::Sum => "SUM",
+        AggregateFunc::DecimalSum => "DECIMAL_SUM",
         AggregateFunc::Avg => "AVG",
         AggregateFunc::Total => "TOTAL",
         AggregateFunc::Median => "MEDIAN",
@@ -5071,7 +8287,9 @@ fn aggregate_function_name(func: AggregateFunc) -> &'static str {
         AggregateFunc::PercentileDisc => "PERCENTILE_DISC",
         AggregateFunc::GroupConcat => "GROUP_CONCAT",
         AggregateFunc::JsonGroupArray => "JSON_GROUP_ARRAY",
+        AggregateFunc::JsonbGroupArray => "JSONB_GROUP_ARRAY",
         AggregateFunc::JsonGroupObject => "JSON_GROUP_OBJECT",
+        AggregateFunc::JsonbGroupObject => "JSONB_GROUP_OBJECT",
         AggregateFunc::Min => "MIN",
         AggregateFunc::Max => "MAX",
     }
@@ -5082,6 +8300,7 @@ fn is_aggregate_function_name(name: &str) -> bool {
         name.to_ascii_uppercase().as_str(),
         "COUNT"
             | "SUM"
+            | "DECIMAL_SUM"
             | "AVG"
             | "TOTAL"
             | "MEDIAN"
@@ -5091,7 +8310,9 @@ fn is_aggregate_function_name(name: &str) -> bool {
             | "GROUP_CONCAT"
             | "STRING_AGG"
             | "JSON_GROUP_ARRAY"
+            | "JSONB_GROUP_ARRAY"
             | "JSON_GROUP_OBJECT"
+            | "JSONB_GROUP_OBJECT"
             | "MIN"
             | "MAX"
     )
@@ -5100,6 +8321,9 @@ fn is_aggregate_function_name(name: &str) -> bool {
 fn sqlite_declared_type_affinity(declared_type: &str) -> Option<ColumnType> {
     let normalized = declared_type.trim().to_ascii_uppercase();
 
+    if normalized == "ANY" {
+        return Some(ColumnType::Any);
+    }
     if normalized.contains("INT") {
         return Some(ColumnType::Integer);
     }
@@ -5120,29 +8344,49 @@ fn sqlite_declared_type_affinity(declared_type: &str) -> Option<ColumnType> {
     }
     if matches!(
         normalized.as_str(),
-        "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "DATE" | "DATETIME"
+        "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT"
     ) {
         return Some(ColumnType::Real);
     }
-    if matches!(normalized.as_str(), "NUMERIC" | "DECIMAL")
+    if matches!(normalized.as_str(), "NONE" | "NUM" | "NUMERIC" | "DECIMAL")
         || normalized.starts_with("NUMERIC(")
         || normalized.starts_with("DECIMAL(")
     {
-        return Some(ColumnType::Real);
+        return Some(ColumnType::Numeric);
     }
 
-    None
+    Some(ColumnType::Numeric)
+}
+
+fn validate_strict_table_declared_types(table: &str, columns: &[ColumnDef]) -> Result<()> {
+    for column in columns {
+        let declared_type = column.pragma_declared_type();
+        let normalized = declared_type.trim().to_ascii_uppercase();
+        if !matches!(
+            normalized.as_str(),
+            "INT" | "INTEGER" | "REAL" | "TEXT" | "BLOB" | "ANY"
+        ) {
+            return Err(DbError::sql(format!(
+                "unknown datatype for {table}.{}: \"{}\"",
+                column.name, declared_type
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn from_item_qualifier(from: &FromItem) -> Option<String> {
     match from {
-        FromItem::Table { name, alias }
+        FromItem::Table { name, alias, .. }
         | FromItem::TableIndexed { name, alias, .. }
-        | FromItem::TableNotIndexed { name, alias } => {
+        | FromItem::TableNotIndexed { name, alias, .. } => {
             Some(alias.clone().unwrap_or_else(|| name.clone()))
         }
         FromItem::Subquery { alias, .. } => (!alias.is_empty()).then(|| alias.clone()),
         FromItem::Values { alias, .. } => alias.clone(),
+        FromItem::PragmaTableFunction { name, alias, .. } => {
+            Some(alias.clone().unwrap_or_else(|| name.clone()))
+        }
     }
 }
 
@@ -5217,6 +8461,8 @@ fn display_token(token: &TokenKind) -> String {
         TokenKind::Or => "OR".to_string(),
         TokenKind::Like => "LIKE".to_string(),
         TokenKind::Glob => "GLOB".to_string(),
+        TokenKind::Regexp => "REGEXP".to_string(),
+        TokenKind::Match => "MATCH".to_string(),
         TokenKind::Escape => "ESCAPE".to_string(),
         TokenKind::Between => "BETWEEN".to_string(),
         TokenKind::Begin => "BEGIN".to_string(),
@@ -5230,6 +8476,8 @@ fn display_token(token: &TokenKind) -> String {
         TokenKind::Serializable => "SERIALIZABLE".to_string(),
         TokenKind::Commit => "COMMIT".to_string(),
         TokenKind::Rollback => "ROLLBACK".to_string(),
+        TokenKind::Savepoint => "SAVEPOINT".to_string(),
+        TokenKind::Release => "RELEASE".to_string(),
         TokenKind::Case => "CASE".to_string(),
         TokenKind::When => "WHEN".to_string(),
         TokenKind::Then => "THEN".to_string(),
@@ -5373,6 +8621,8 @@ fn token_sql_fragment(token: &Token) -> String {
         TokenKind::Or => "OR".to_string(),
         TokenKind::Like => "LIKE".to_string(),
         TokenKind::Glob => "GLOB".to_string(),
+        TokenKind::Regexp => "REGEXP".to_string(),
+        TokenKind::Match => "MATCH".to_string(),
         TokenKind::Escape => "ESCAPE".to_string(),
         TokenKind::Between => "BETWEEN".to_string(),
         TokenKind::Begin => "BEGIN".to_string(),
@@ -5386,6 +8636,8 @@ fn token_sql_fragment(token: &Token) -> String {
         TokenKind::Serializable => "SERIALIZABLE".to_string(),
         TokenKind::Commit => "COMMIT".to_string(),
         TokenKind::Rollback => "ROLLBACK".to_string(),
+        TokenKind::Savepoint => "SAVEPOINT".to_string(),
+        TokenKind::Release => "RELEASE".to_string(),
         TokenKind::Case => "CASE".to_string(),
         TokenKind::When => "WHEN".to_string(),
         TokenKind::Then => "THEN".to_string(),
@@ -5479,4 +8731,206 @@ fn join_sql_fragments(fragments: &[String]) -> String {
         sql.push_str(fragment);
     }
     sql
+}
+
+fn join_declared_type_fragments(fragments: &[String]) -> String {
+    let mut sql = String::new();
+    for fragment in fragments {
+        let needs_space_before = !sql.is_empty()
+            && !matches!(fragment.as_str(), "(" | ")" | "," | ";" | ".")
+            && !matches!(sql.chars().last(), Some('(' | ',' | '.' | ' '));
+        if needs_space_before {
+            sql.push(' ');
+        }
+        sql.push_str(fragment);
+    }
+    sql
+}
+
+fn sqlite_pragma_boolean_string(value: &str) -> bool {
+    if value.eq_ignore_ascii_case("on")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("true")
+    {
+        return true;
+    }
+    if value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("no")
+        || value.eq_ignore_ascii_case("false")
+    {
+        return false;
+    }
+    value.parse::<i64>().is_ok_and(|number| number != 0)
+}
+
+fn sqlite_pragma_string_integer_prefix(value: &str) -> i64 {
+    let trimmed = value.trim_start();
+    let mut chars = trimmed.char_indices();
+    let mut end = 0;
+
+    if let Some((index, '+' | '-')) = chars.next() {
+        end = index + 1;
+    } else {
+        chars = trimmed.char_indices();
+    }
+
+    let mut saw_digit = false;
+    for (index, ch) in chars {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            end = index + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    if !saw_digit {
+        return 0;
+    }
+
+    trimmed[..end].parse::<i64>().unwrap_or_else(|_| {
+        if trimmed.starts_with('-') {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
+    })
+}
+
+fn is_pragma_table_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pragma_table_info"
+            | "pragma_table_xinfo"
+            | "pragma_index_list"
+            | "pragma_index_info"
+            | "pragma_index_xinfo"
+            | "pragma_foreign_key_list"
+            | "pragma_foreign_key_check"
+            | "pragma_table_list"
+            | "pragma_database_list"
+            | "pragma_pragma_list"
+            | "pragma_function_list"
+            | "pragma_compile_options"
+            | "pragma_collation_list"
+            | "pragma_module_list"
+            | "pragma_optimize"
+            | "pragma_quick_check"
+            | "pragma_encoding"
+            | "pragma_integrity_check"
+            | "pragma_page_size"
+            | "pragma_page_count"
+            | "pragma_max_page_count"
+            | "pragma_freelist_count"
+            | "pragma_user_version"
+            | "pragma_application_id"
+            | "pragma_schema_version"
+            | "pragma_data_version"
+            | "pragma_journal_mode"
+            | "pragma_synchronous"
+            | "pragma_cache_size"
+            | "pragma_cache_spill"
+            | "pragma_temp_store"
+            | "pragma_locking_mode"
+            | "pragma_auto_vacuum"
+            | "pragma_busy_timeout"
+            | "pragma_analysis_limit"
+            | "pragma_journal_size_limit"
+            | "pragma_foreign_keys"
+            | "pragma_defer_foreign_keys"
+            | "pragma_read_uncommitted"
+            | "pragma_query_only"
+            | "pragma_count_changes"
+            | "pragma_recursive_triggers"
+            | "pragma_trusted_schema"
+            | "pragma_ignore_check_constraints"
+            | "pragma_automatic_index"
+            | "pragma_cell_size_check"
+            | "pragma_secure_delete"
+            | "pragma_threads"
+            | "pragma_soft_heap_limit"
+            | "pragma_hard_heap_limit"
+            | "pragma_full_column_names"
+            | "pragma_short_column_names"
+            | "pragma_fullfsync"
+            | "pragma_checkpoint_fullfsync"
+            | "pragma_empty_result_callbacks"
+            | "pragma_reverse_unordered_selects"
+    )
+}
+
+fn pragma_table_function_allows_no_argument(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pragma_table_list"
+            | "pragma_foreign_key_check"
+            | "pragma_database_list"
+            | "pragma_pragma_list"
+            | "pragma_function_list"
+            | "pragma_compile_options"
+            | "pragma_collation_list"
+            | "pragma_module_list"
+            | "pragma_optimize"
+            | "pragma_quick_check"
+            | "pragma_encoding"
+            | "pragma_integrity_check"
+            | "pragma_page_size"
+            | "pragma_page_count"
+            | "pragma_max_page_count"
+            | "pragma_freelist_count"
+            | "pragma_user_version"
+            | "pragma_application_id"
+            | "pragma_schema_version"
+            | "pragma_data_version"
+            | "pragma_journal_mode"
+            | "pragma_synchronous"
+            | "pragma_cache_size"
+            | "pragma_cache_spill"
+            | "pragma_temp_store"
+            | "pragma_locking_mode"
+            | "pragma_auto_vacuum"
+            | "pragma_busy_timeout"
+            | "pragma_analysis_limit"
+            | "pragma_journal_size_limit"
+            | "pragma_foreign_keys"
+            | "pragma_defer_foreign_keys"
+            | "pragma_read_uncommitted"
+            | "pragma_query_only"
+            | "pragma_count_changes"
+            | "pragma_recursive_triggers"
+            | "pragma_trusted_schema"
+            | "pragma_ignore_check_constraints"
+            | "pragma_automatic_index"
+            | "pragma_cell_size_check"
+            | "pragma_secure_delete"
+            | "pragma_threads"
+            | "pragma_soft_heap_limit"
+            | "pragma_hard_heap_limit"
+            | "pragma_full_column_names"
+            | "pragma_short_column_names"
+            | "pragma_fullfsync"
+            | "pragma_checkpoint_fullfsync"
+            | "pragma_empty_result_callbacks"
+            | "pragma_reverse_unordered_selects"
+    )
+}
+
+fn validate_likelihood_probability_arg(args: &[ScalarExpr]) -> Result<()> {
+    if args.len() != 2 {
+        return Ok(());
+    }
+    let valid = matches!(
+        args,
+        [
+            _,
+            ScalarExpr::Literal(Value::Real(value))
+        ] if (0.0..=1.0).contains(value)
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(DbError::sql(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0",
+        ))
+    }
 }

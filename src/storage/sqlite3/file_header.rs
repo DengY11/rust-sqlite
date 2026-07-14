@@ -8,6 +8,7 @@ pub struct DatabaseHeader {
     pub freelist_count: u32,
     pub schema_version: u32,
     pub schema_format: u32,
+    pub text_encoding: u32,
     pub user_version: u32,
     pub application_id: u32,
 }
@@ -28,6 +29,7 @@ impl DatabaseHeader {
         let freelist_count = u32::from_be_bytes(bytes[36..40].try_into().unwrap());
         let schema_version = u32::from_be_bytes(bytes[40..44].try_into().unwrap());
         let schema_format = u32::from_be_bytes(bytes[44..48].try_into().unwrap());
+        let text_encoding = u32::from_be_bytes(bytes[56..60].try_into().unwrap());
         let user_version = u32::from_be_bytes(bytes[60..64].try_into().unwrap());
         let application_id = u32::from_be_bytes(bytes[68..72].try_into().unwrap());
 
@@ -38,6 +40,7 @@ impl DatabaseHeader {
             freelist_count,
             schema_version,
             schema_format,
+            text_encoding,
             user_version,
             application_id,
         })

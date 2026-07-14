@@ -20,6 +20,7 @@ fn select_statement(columns: Vec<SelectItem>, table: &str, filter: Option<Expr>)
         columns,
         from: FromItem::Table {
             name: table.to_string(),
+            schema: None,
             alias: None,
         },
         joins: vec![],
@@ -1123,6 +1124,7 @@ fn plans_create_insert_and_txn_statements() {
                 strict: false,
                 without_rowid: false,
                 if_not_exists: false,
+                temporary: false,
             },
             &context,
         )
@@ -1131,6 +1133,7 @@ fn plans_create_insert_and_txn_statements() {
         .plan_statement(
             &Statement::CreateIndex {
                 name: "idx_users_id".to_string(),
+                schema: None,
                 table: "users".to_string(),
                 columns: vec!["id".to_string()],
                 decorated_columns: None,
@@ -1166,6 +1169,30 @@ fn plans_create_insert_and_txn_statements() {
     let rollback = planner
         .plan_statement(&Statement::Rollback, &context)
         .unwrap();
+    let savepoint = planner
+        .plan_statement(
+            &Statement::Savepoint {
+                name: "sp".to_string(),
+            },
+            &context,
+        )
+        .unwrap();
+    let rollback_to = planner
+        .plan_statement(
+            &Statement::RollbackTo {
+                name: "sp".to_string(),
+            },
+            &context,
+        )
+        .unwrap();
+    let release = planner
+        .plan_statement(
+            &Statement::Release {
+                name: "sp".to_string(),
+            },
+            &context,
+        )
+        .unwrap();
 
     assert_eq!(
         create_table,
@@ -1179,6 +1206,7 @@ fn plans_create_insert_and_txn_statements() {
             strict: false,
             without_rowid: false,
             if_not_exists: false,
+            temporary: false,
         }
     );
     assert_eq!(
@@ -1209,6 +1237,24 @@ fn plans_create_insert_and_txn_statements() {
     );
     assert_eq!(commit, Plan::CommitTxn);
     assert_eq!(rollback, Plan::RollbackTxn);
+    assert_eq!(
+        savepoint,
+        Plan::Savepoint {
+            name: "sp".to_string(),
+        }
+    );
+    assert_eq!(
+        rollback_to,
+        Plan::RollbackTo {
+            name: "sp".to_string(),
+        }
+    );
+    assert_eq!(
+        release,
+        Plan::Release {
+            name: "sp".to_string(),
+        }
+    );
 }
 
 #[test]
@@ -1297,6 +1343,7 @@ fn planner_plans_insert_select_statement() {
                     ],
                     from: FromItem::Table {
                         name: "users".to_string(),
+                        schema: None,
                         alias: None,
                     },
                     joins: vec![],
@@ -1387,6 +1434,7 @@ fn planner_plans_insert_select_statement_with_explicit_column_list() {
                     ],
                     from: FromItem::Table {
                         name: "users".to_string(),
+                        schema: None,
                         alias: None,
                     },
                     joins: vec![],
@@ -1566,6 +1614,7 @@ fn planner_plans_insert_select_on_conflict_target_do_nothing_statement() {
                     ],
                     from: FromItem::Table {
                         name: "users".to_string(),
+                        schema: None,
                         alias: None,
                     },
                     joins: vec![],
@@ -2080,6 +2129,7 @@ fn plans_create_table_with_defaults_checks_and_foreign_keys() {
         strict: false,
         without_rowid: false,
         if_not_exists: false,
+        temporary: false,
     };
 
     assert!(matches!(
@@ -2108,6 +2158,7 @@ fn planner_plans_alter_table_variants() {
         .plan_statement(
             &Statement::AlterTable {
                 table: "users".to_string(),
+                schema: None,
                 action: AlterTableAction::AddColumn(ColumnDef::new("age", ColumnType::Integer)),
             },
             &context,
@@ -2125,6 +2176,7 @@ fn planner_plans_alter_table_variants() {
         .plan_statement(
             &Statement::AlterTable {
                 table: "users".to_string(),
+                schema: None,
                 action: AlterTableAction::RenameTable {
                     new_name: "customers".to_string(),
                 },
@@ -2146,6 +2198,7 @@ fn planner_plans_alter_table_variants() {
         .plan_statement(
             &Statement::AlterTable {
                 table: "users".to_string(),
+                schema: None,
                 action: AlterTableAction::RenameColumn {
                     old_name: "name".to_string(),
                     new_name: "full_name".to_string(),
@@ -2169,6 +2222,7 @@ fn planner_plans_alter_table_variants() {
         .plan_statement(
             &Statement::AlterTable {
                 table: "users".to_string(),
+                schema: None,
                 action: AlterTableAction::DropColumn {
                     old_name: "name".to_string(),
                 },
@@ -2190,6 +2244,7 @@ fn planner_plans_alter_table_variants() {
         .plan_statement(
             &Statement::AlterTable {
                 table: "users".to_string(),
+                schema: None,
                 action: AlterTableAction::AddColumn(ColumnDef::new("name", ColumnType::Text)),
             },
             &context,
@@ -2205,6 +2260,7 @@ fn planner_plans_alter_table_variants() {
         .plan_statement(
             &Statement::AlterTable {
                 table: "users".to_string(),
+                schema: None,
                 action: AlterTableAction::RenameColumn {
                     old_name: "missing".to_string(),
                     new_name: "full_name".to_string(),
@@ -2219,6 +2275,7 @@ fn planner_plans_alter_table_variants() {
         .plan_statement(
             &Statement::AlterTable {
                 table: "users".to_string(),
+                schema: None,
                 action: AlterTableAction::RenameColumn {
                     old_name: "name".to_string(),
                     new_name: "id".to_string(),
@@ -2237,6 +2294,7 @@ fn planner_plans_alter_table_variants() {
         .plan_statement(
             &Statement::AlterTable {
                 table: "users".to_string(),
+                schema: None,
                 action: AlterTableAction::RenameTable {
                     new_name: "orders".to_string(),
                 },
@@ -2269,6 +2327,7 @@ fn plans_multi_column_create_index_statement() {
         .plan_statement(
             &Statement::CreateIndex {
                 name: "idx_users_name_email".to_string(),
+                schema: None,
                 table: "users".to_string(),
                 columns: vec!["name".to_string(), "email".to_string()],
                 decorated_columns: None,
@@ -2303,6 +2362,7 @@ fn plans_create_unique_index_statement() {
         .plan_statement(
             &Statement::CreateIndex {
                 name: "idx_users_name".to_string(),
+                schema: None,
                 table: "users".to_string(),
                 columns: vec!["name".to_string()],
                 decorated_columns: None,
@@ -2336,6 +2396,7 @@ fn planner_rejects_duplicate_columns_in_create_index() {
         .plan_statement(
             &Statement::CreateIndex {
                 name: "idx_users_bad".to_string(),
+                schema: None,
                 table: "users".to_string(),
                 columns: vec!["name".to_string(), "name".to_string()],
                 decorated_columns: None,
@@ -2359,6 +2420,7 @@ fn planner_lowers_drop_if_exists_for_missing_objects_to_noop() {
         .plan_statement(
             &Statement::DropTable {
                 name: "missing".to_string(),
+                schema: None,
                 if_exists: true,
             },
             &context,
@@ -2368,6 +2430,7 @@ fn planner_lowers_drop_if_exists_for_missing_objects_to_noop() {
         .plan_statement(
             &Statement::DropIndex {
                 name: "missing_idx".to_string(),
+                schema: None,
                 if_exists: true,
             },
             &context,
@@ -2408,6 +2471,7 @@ fn plans_group_by_aggregate_as_aggregate_plan() {
         ],
         from: FromItem::Table {
             name: "users".to_string(),
+            schema: None,
             alias: None,
         },
         joins: vec![],
@@ -2498,6 +2562,7 @@ fn plans_aggregate_scalar_expression_arguments() {
         }],
         from: FromItem::Table {
             name: "users".to_string(),
+            schema: None,
             alias: None,
         },
         joins: vec![],
@@ -2550,7 +2615,7 @@ fn plans_aggregate_scalar_expression_arguments() {
 }
 
 #[test]
-fn planner_rejects_having_reference_to_ungrouped_source_column() {
+fn planner_allows_having_reference_to_bare_source_column_like_sqlite() {
     let planner = Planner::new();
     let context = PlanningContext::new(
         HashMap::from([(
@@ -2576,6 +2641,7 @@ fn planner_rejects_having_reference_to_ungrouped_source_column() {
         }],
         from: FromItem::Table {
             name: "users".to_string(),
+            schema: None,
             alias: None,
         },
         joins: vec![],
@@ -2593,16 +2659,42 @@ fn planner_rejects_having_reference_to_ungrouped_source_column() {
         }),
     });
 
-    let error = planner.plan_statement(&statement, &context).unwrap_err();
+    let plan = planner.plan_statement(&statement, &context).unwrap();
 
-    assert!(
-        error.to_string().contains("age"),
-        "unexpected error: {error}"
+    assert_eq!(
+        plan,
+        Plan::Aggregate {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                distinct: false,
+            }),
+            columns: vec![SelectItem::Aggregate {
+                func: AggregateFunc::Count,
+                arg: AggregateArg::Wildcard,
+                filter: None,
+                alias: Some("total".to_string()),
+            }],
+            group_by: vec![],
+            having: Some(Expr::Compare {
+                column: "age".to_string(),
+                op: CompareOp::Gt,
+                value: Value::Integer(20),
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        }
     );
 }
 
 #[test]
-fn planner_rejects_order_by_ungrouped_source_column_in_grouped_projection() {
+fn planner_allows_order_by_bare_source_column_in_grouped_projection_like_sqlite() {
     let planner = Planner::new();
     let context = PlanningContext::new(
         HashMap::from([(
@@ -2622,6 +2714,7 @@ fn planner_rejects_order_by_ungrouped_source_column_in_grouped_projection() {
         columns: vec![SelectItem::Column("age".to_string())],
         from: FromItem::Table {
             name: "users".to_string(),
+            schema: None,
             alias: None,
         },
         joins: vec![],
@@ -2640,11 +2733,33 @@ fn planner_rejects_order_by_ungrouped_source_column_in_grouped_projection() {
         having: None,
     });
 
-    let error = planner.plan_statement(&statement, &context).unwrap_err();
+    let plan = planner.plan_statement(&statement, &context).unwrap();
 
-    assert!(
-        error.to_string().contains("id"),
-        "unexpected error: {error}"
+    assert_eq!(
+        plan,
+        Plan::Aggregate {
+            source: Box::new(Plan::SeqScan {
+                table: "users".to_string(),
+                table_alias: None,
+                columns: vec![SelectItem::Wildcard],
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                distinct: false,
+            }),
+            columns: vec![SelectItem::Column("age".to_string())],
+            group_by: vec![ScalarExpr::Column("age".to_string())],
+            having: None,
+            order_by: vec![OrderBy {
+                expr: OrderByExpr::Column("id".to_string()),
+                collation: None,
+                descending: true,
+                nulls: None,
+            }],
+            limit: None,
+            offset: None,
+        }
     );
 }
 
@@ -2682,6 +2797,7 @@ fn planner_allows_sum_non_integer_scalar_expression_argument_like_sqlite() {
         }],
         from: FromItem::Table {
             name: "users".to_string(),
+            schema: None,
             alias: None,
         },
         joins: vec![],
@@ -2761,11 +2877,13 @@ fn plans_join_query_as_nested_loop_join() {
         ],
         from: FromItem::Table {
             name: "users".to_string(),
+            schema: None,
             alias: Some("u".to_string()),
         },
         joins: vec![JoinClause {
             source: FromItem::Table {
                 name: "orders".to_string(),
+                schema: None,
                 alias: Some("o".to_string()),
             },
             on: Expr::CompareColumns {
@@ -3466,6 +3584,7 @@ fn plans_aggregate_query_with_scalar_group_by_and_order_by_expression() {
         ],
         from: FromItem::Table {
             name: "users".to_string(),
+            schema: None,
             alias: None,
         },
         joins: vec![],
@@ -3577,6 +3696,7 @@ fn planner_rejects_unknown_qualified_column_in_correlated_subquery() {
         columns: vec![SelectItem::Column("u.name".to_string())],
         from: FromItem::Table {
             name: "users".to_string(),
+            schema: None,
             alias: Some("u".to_string()),
         },
         joins: vec![],
@@ -3586,6 +3706,7 @@ fn planner_rejects_unknown_qualified_column_in_correlated_subquery() {
                 columns: vec![SelectItem::Column("id".to_string())],
                 from: FromItem::Table {
                     name: "orders".to_string(),
+                    schema: None,
                     alias: Some("o".to_string()),
                 },
                 joins: vec![],
@@ -3652,12 +3773,14 @@ fn planner_rejects_join_condition_reference_to_future_join_alias() {
         columns: vec![SelectItem::Column("u.name".to_string())],
         from: FromItem::Table {
             name: "users".to_string(),
+            schema: None,
             alias: Some("u".to_string()),
         },
         joins: vec![
             JoinClause {
                 source: FromItem::Table {
                     name: "orders".to_string(),
+                    schema: None,
                     alias: Some("o".to_string()),
                 },
                 on: Expr::CompareScalar {
@@ -3672,6 +3795,7 @@ fn planner_rejects_join_condition_reference_to_future_join_alias() {
             JoinClause {
                 source: FromItem::Table {
                     name: "payments".to_string(),
+                    schema: None,
                     alias: Some("p".to_string()),
                 },
                 on: Expr::CompareScalar {
